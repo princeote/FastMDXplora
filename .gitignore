@@ -1,5 +1,7 @@
 # Build artifacts
 build/
+docs/build/
+docs/source/_build/
 
 # Packaging metadata
 FastMDAnalysis.egg-info/

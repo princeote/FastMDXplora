@@ -14,4 +14,4 @@ python:
     - requirements: docs/requirements.txt
 
 formats:
-  - html
+  - pdf

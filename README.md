@@ -57,9 +57,15 @@ fastmda = FastMDAnalysis("traj.dcd", "top.pdb")
 # Run RMSD analysis 
 rmsd_analysis = fastmda.rmsd()
 
+```
+
+```python
 # Optionally retrieve rmsd data 
 print("RMSD Data:", rmsd_analysis.data)
 
+```
+
+```python
 # Optionally customize rmsd plot
 rmsd_analysis.plot()
 
@@ -75,11 +81,14 @@ After installation, you can run FastMDAnalysis from the command line using the f
 ```bash
 fastmda rmsd -traj traj.dcd -top top.pdb 
 ```
+## Documentation
+
+Full documentation with extensive usage examples can be found at https://fastmdanalysis.readthedocs.io
+
 
 ## License
 
 FastMDAnalysis is licensed under the MIT License. 
-
 
 
 ## Acknowledgements

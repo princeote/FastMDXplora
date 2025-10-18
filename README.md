@@ -75,10 +75,10 @@ rmsd_analysis.plot()
 ### Command-Line Interface (CLI)
 After installation, you can run FastMDAnalysis from the command line using the fastmda command. Global options allow you to specify the trajectory, topology, frame selection, and atom selection.
 
-#### RMSD Analysis:
+#### RMSF Analysis:
 
 ```bash
-fastmda rmsd -traj traj.dcd -top top.pdb 
+fastmda rmsf -traj traj.dcd -top top.pdb 
 ```
 
 

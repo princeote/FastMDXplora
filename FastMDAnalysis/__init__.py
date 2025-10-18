@@ -1,4 +1,8 @@
 """
+FastMDAnalysis – automated MD trajectory analysis.
+
+Documentation: https://fastmdanalysis.readthedocs.io/en/latest/
+
 FastMDAnalysis Package Initialization
 
 This version of FastMDAnalysis allows you to instantiate a single object by providing

@@ -1,4 +1,4 @@
-# FastMDAnalysis: Software for automated MD trajectory analysis
+## FastMDAnalysis: Software for automated MD trajectory analysis
 
 # Description
 FastMDAnalysis is a software for fast and automated analysis of molecular dynamics (MD) trajectories. It provides a unified Python API as well as a command‐line interface (CLI) for performing a variety of MD analyses. This package is designed to simplify your workflow by allowing you to load a trajectory once (with options for frame and atom selection) and then run multiple analyses without repeating input file details.

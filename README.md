@@ -10,13 +10,19 @@ FastMDAnalysis is a software for fast and automated analysis of molecular dynami
 - **rmsf**: Compute per-atom Root-Mean-Square Fluctuation.
 - **rg**: Determine the Radius of Gyration for each frame.
 - **hbonds**: Detect and count hydrogen bonds using the Baker-Hubbard algorithm.
-- **cluster**: Perform clustering (DBSCAN and/or KMeans) on trajectory frames.
 - **ss**: Compute Secondary Structure (SS) assignments using DSSP with a discrete heatmap.
+- **cluster**: Perform clustering on trajectory frames:
+  - KMeans
+  - DBSCAN
+  - Hierarchical
 - **sasa**: Compute Solvent Accessible Surface Area (SASA) in multiple ways:
   - Total SASA vs. frame.
   - Per-residue SASA vs. frame (heatmap).
   - Average per-residue SASA (bar plot).
-- **dimred**: Perform dimensionality reduction (PCA, MDS, t-SNE) to project high-dimensional data into 2D.
+- **dimred**: Perform dimensionality reduction to project high-dimensional data into 2D:
+  - PCA
+  - MDS
+  - t-SNE
 
 ## Installation
 

@@ -1,14 +1,15 @@
-# FastMDAnalysis
+# FastMDAnalysis: Software for automated MD trajectory analysis
 
+# Description
 FastMDAnalysis is a software for fast and automated analysis of molecular dynamics (MD) trajectories. It provides a unified Python API as well as a command‐line interface (CLI) for performing a variety of MD analyses. This package is designed to simplify your workflow by allowing you to load a trajectory once (with options for frame and atom selection) and then run multiple analyses without repeating input file details.
 
-## Documentation
+# Documentation
 
 Full documentation with extensive usage examples can be found at https://fastmdanalysis.readthedocs.io
 
 [![Docs](https://img.shields.io/badge/docs-latest-brightgreen.svg)](https://fastmdanalysis.readthedocs.io/en/latest/)
 
-## Features
+# Features
 
 - **rmsd**: Calculate Root-Mean-Square Deviation relative to a reference frame.
 - **rmsf**: Compute per-atom Root-Mean-Square Fluctuation.
@@ -28,7 +29,7 @@ Full documentation with extensive usage examples can be found at https://fastmda
   - MDS
   - t-SNE
 
-## Installation
+# Installation
 
 Navigate to the root directory of the package (the directory containing `setup.py`).
 
@@ -42,13 +43,13 @@ For development (editable) mode, run:
 pip install -e .
 ```
 
-## Usage
+# Usage
 
-### Python API
+## Python API
 
 Instantiate a FastMDAnalysis object with your trajectory and topology file paths. Optionally, specify frame selection and atom selection. Frame selection is provided as a tuple (start, stop, stride). Negative indices (e.g., -1 for the last frame) are supported. If no options are provided, the entire trajectory and all atoms are used by default.
 
-#### RMSD Analysis:
+### RMSD Analysis:
 
 ```python
 from FastMDAnalysis import FastMDAnalysis
@@ -72,22 +73,25 @@ rmsd_analysis.plot()
 
 ```
 
-### Command-Line Interface (CLI)
+## Command-Line Interface (CLI)
 After installation, you can run FastMDAnalysis from the command line using the fastmda command. Global options allow you to specify the trajectory, topology, frame selection, and atom selection.
 
-#### RMSF Analysis:
+### RMSF Analysis:
 
 ```bash
 fastmda rmsf -traj traj.dcd -top top.pdb 
 ```
 
+# Citation
+If you use FastMDAnalysis in a publication, please cite:
 
+Adekunle Aina (2025). FastMDAnalysis: Software for automated MD trajectory analysis. https://fastmdanalysis.readthedocs.io
 
-## License
+# License
 
 FastMDAnalysis is licensed under the MIT License. 
 
 
-## Acknowledgements
+# Acknowledgements
 
 FastMDAnalysis leverages MDTraj for trajectory analysis. It also relies on popular Python libraries such as NumPy, scikit-learn, and Matplotlib for data processing and visualization. Special thanks to the community for their continuous support and contributions.

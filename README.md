@@ -85,7 +85,7 @@ fastmda rmsf -traj traj.dcd -top top.pdb
 # Citation
 If you use FastMDAnalysis in a publication, please cite:
 
-Adekunle Aina (2025), FastMDAnalysis: Software for Automated Molecular Dynamics Trajectory Analysis, https://fastmdanalysis.readthedocs.io
+Adekunle Aina (2025), FastMDAnalysis: Software for Automated Molecular Dynamics Trajectory Analysis, https://github.com/aai-research-lab/FastMDAnalysis
 
 # License
 

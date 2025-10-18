@@ -40,7 +40,8 @@ def add_file_args(subparser):
 
 # Main parser.
 parser = argparse.ArgumentParser(
-    description="FastMDAnalysis: Fast Automated MD Trajectory Analysis Using MDTraj",
+    description="FastMDAnalysis: Fast Automated MD Trajectory Analysis",
+    epilog="Docs: https://fastmdanalysis.readthedocs.io/en/latest/" 
     parents=[common_parser]
 )
 subparsers = parser.add_subparsers(dest="command", help="Analysis type", required=True)

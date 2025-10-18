@@ -44,10 +44,7 @@ pip install -e .
 
 Instantiate a FastMDAnalysis object with your trajectory and topology file paths. Optionally, specify frame selection and atom selection. Frame selection is provided as a tuple (start, stop, stride). Negative indices (e.g., -1 for the last frame) are supported. If no options are provided, the entire trajectory and all atoms are used by default.
 
-#### Examples:
-
-
-- **RMSD Analysis:**
+#### RMSD Analysis:
 
 ```python
 from FastMDAnalysis import FastMDAnalysis
@@ -74,9 +71,7 @@ rmsd_analysis.plot()
 ### Command-Line Interface (CLI)
 After installation, you can run FastMDAnalysis from the command line using the fastmda command. Global options allow you to specify the trajectory, topology, frame selection, and atom selection.
 
-#### Examples:
-
-- **RMSD Analysis:**
+#### RMSD Analysis:
 
 ```bash
 fastmda rmsd -traj traj.dcd -top top.pdb 

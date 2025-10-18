@@ -82,6 +82,9 @@ After installation, you can run FastMDAnalysis from the command line using the f
 fastmda rmsf -traj traj.dcd -top top.pdb 
 ```
 
+# Contributing
+Contributions are welcome. Please submit a Pull Request. 
+
 # Citation
 If you use FastMDAnalysis in a publication, please cite:
 

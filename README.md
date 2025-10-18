@@ -1,11 +1,11 @@
-# Software for Automated MD Trajectory Analysis
-
 # FastMDAnalysis
-FastMDAnalysis allows you to perform a variety of molecular dynamics (MD) analyses in a single line of code.
+Software for Automated Molecular Dynamics Trajectory Analysis
 
-It is designed to simplify your workflow by allowing you to load a trajectory once (with options for frame and atom selection) and then run multiple analyses without repeating input file details. 
+FastMDAnalysis allows you to perform a variety of MD analyses in a single line of code.
 
-Publication-ready figures are automatically generated (with options for customization).
+FastMDAnalysis is designed to simplify your workflow by allowing you to load a trajectory once (with options for frame and atom selection) and then run multiple analyses without repeating input file details. 
+
+FastMDAnalysis automatically generates publication-ready figures (with options for customization).
 
 FastMDAnalysis provides a unified Python API as well as a command‐line interface (CLI). 
 

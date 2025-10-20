@@ -68,17 +68,7 @@ rmsd_analysis = fastmda.rmsd()
 
 ```
 
-```python
-# Optionally retrieve rmsd data 
-print("RMSD Data:", rmsd_analysis.data)
 
-```
-
-```python
-# Optionally customize rmsd plot
-rmsd_analysis.plot()
-
-```
 
 ## Command-Line Interface (CLI)
 After installation, you can run FastMDAnalysis from the command line using the fastmda command. Global options allow you to specify the trajectory, topology, frame selection, and atom selection.

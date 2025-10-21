@@ -2,7 +2,7 @@
 
 **A FastMDAnalysis Tutorial**
 
-This tutorial demonstrates how to use FastMDAnalysis for analyzing multiple molecular dynamics trajectories to identify conformational states across different replicates.
+This Case Study demonstrates how to use FastMDAnalysis for analyzing multiple molecular dynamics trajectories to identify conformational states across different replicates.
 
 ## Learning Objectives
 

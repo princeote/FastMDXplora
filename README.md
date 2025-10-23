@@ -1,5 +1,5 @@
 # FastMDAnalysis
-Software for Automated Molecular Dynamics Trajectory Analysis
+Fully Automated System for Molecular Dynamics Trajectory Analysis
 
 FastMDAnalysis allows you to perform a variety of MD analyses in a single line of code.
 

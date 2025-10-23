@@ -85,7 +85,7 @@ Contributions are welcome. Please submit a Pull Request.
 # Citation
 If you use **FastMDAnalysis** in your work, please cite:
 
-Adekunle Aina (2025). *FastMDAnalysis: Software for Automated Molecular Dynamics Trajectory Analysis.* GitHub. https://github.com/aai-research-lab/FastMDAnalysis
+Adekunle Aina (2025). *FastMDAnalysis: Software for Automated Molecular Dynamics Trajectory Analysis.* GitHub. https://github.com/aai-research-lab/fastmdanalysis
 
 ```bibtex
 @software{FastMDAnalysis,
@@ -93,7 +93,7 @@ Adekunle Aina (2025). *FastMDAnalysis: Software for Automated Molecular Dynamics
   title        = {FastMDAnalysis: Software for Automated Molecular Dynamics Trajectory Analysis},
   year         = {2025},
   publisher    = {GitHub},
-  url          = {https://github.com/aai-research-lab/FastMDAnalysis}
+  url          = {https://github.com/aai-research-lab/fastmdanalysis}
 }
 ```
 

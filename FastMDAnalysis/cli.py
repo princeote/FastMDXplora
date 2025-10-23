@@ -47,28 +47,24 @@ parser = argparse.ArgumentParser(
 subparsers = parser.add_subparsers(dest="command", help="Analysis type", required=True)
 
 # Subcommand: RMSD.
-parser_rmsd = subparsers.add_parser("rmsd", parents=[common_parser], help="RMSD analysis")
+parser_rmsd = subparsers.add_parser("rmsd", parents=[common_parser], help="RMSD analysis", conflict_handler="resolve")
 add_file_args(parser_rmsd)
 parser_rmsd.add_argument("--ref", type=int, default=0, help="Reference frame index for RMSD analysis")
-parser_rmsd.add_argument("--selection", type=str, default=None,
-                         help="Atom selection for RMSD analysis (overrides global --atoms)")
 
 # Subcommand: RMSF.
-parser_rmsf = subparsers.add_parser("rmsf", parents=[common_parser], help="RMSF analysis")
+parser_rmsf = subparsers.add_parser("rmsf", parents=[common_parser], help="RMSF analysis", conflict_handler="resolve")
 add_file_args(parser_rmsf)
-parser_rmsf.add_argument("--selection", type=str, default=None,
-                         help="Atom selection for RMSF analysis (overrides global --atoms)")
 
 # Subcommand: RG.
-parser_rg = subparsers.add_parser("rg", parents=[common_parser], help="Radius of gyration analysis")
+parser_rg = subparsers.add_parser("rg", parents=[common_parser], help="Radius of gyration analysis", conflict_handler="resolve")
 add_file_args(parser_rg)
 
 # Subcommand: HBonds.
-parser_hbonds = subparsers.add_parser("hbonds", parents=[common_parser], help="Hydrogen bonds analysis")
+parser_hbonds = subparsers.add_parser("hbonds", parents=[common_parser], help="Hydrogen bonds analysis", conflict_handler="resolve")
 add_file_args(parser_hbonds)
 
 # Subcommand: Cluster.
-parser_cluster = subparsers.add_parser("cluster", parents=[common_parser], help="Clustering analysis")
+parser_cluster = subparsers.add_parser("cluster", parents=[common_parser], help="Clustering analysis", conflict_handler="resolve")
 add_file_args(parser_cluster)
 parser_cluster.add_argument("--eps", type=float, default=0.5, help="DBSCAN: Maximum distance between samples")
 parser_cluster.add_argument("--min_samples", type=int, default=5, help="DBSCAN: Minimum samples in a neighborhood")
@@ -77,21 +73,19 @@ parser_cluster.add_argument("--methods", type=str, nargs='+', default=["dbscan"]
 parser_cluster.add_argument("--n_clusters", type=int, default=None, help="For KMeans/Hierarchical: number of clusters")
 
 # Subcommand: SS.
-parser_ss = subparsers.add_parser("ss", parents=[common_parser], help="Secondary structure (SS) analysis")
+parser_ss = subparsers.add_parser("ss", parents=[common_parser], help="Secondary structure (SS) analysis", conflict_handler="resolve")
 add_file_args(parser_ss)
 
 # Subcommand: SASA.
-parser_sasa = subparsers.add_parser("sasa", parents=[common_parser], help="Solvent accessible surface area (SASA) analysis")
+parser_sasa = subparsers.add_parser("sasa", parents=[common_parser], help="Solvent accessible surface area (SASA) analysis", conflict_handler="resolve")
 add_file_args(parser_sasa)
 parser_sasa.add_argument("--probe_radius", type=float, default=0.14, help="Probe radius (in nm) for SASA calculation")
 
 # Subcommand: Dimensionality Reduction.
-parser_dimred = subparsers.add_parser("dimred", parents=[common_parser], help="Dimensionality reduction analysis")
+parser_dimred = subparsers.add_parser("dimred", parents=[common_parser], help="Dimensionality reduction analysis", conflict_handler="resolve")
 add_file_args(parser_dimred)
 parser_dimred.add_argument("--methods", type=str, nargs='+', default=["all"],
                            help="Dimensionality reduction methods (e.g., 'pca', 'mds', 'tsne'). 'all' uses all methods.")
-parser_dimred.add_argument("--atom_selection", type=str, default=None,
-                           help="Atom selection for constructing the feature matrix (overrides global --atoms)")
 
 def main():
     args = parser.parse_args()
@@ -126,7 +120,7 @@ def main():
             sys.exit(1)
 
     # Global atom selection.
-    atoms = args.atoms
+    atoms = getattr(args, "atoms", None)
 
     # Initialize FastMDAnalysis instance (do not pass output here).
     try:
@@ -139,23 +133,23 @@ def main():
     # Dispatch to appropriate analysis.
     try:
         if args.command == "rmsd":
-            analysis = fastmda.rmsd(ref=args.ref, atoms=args.selection, output=args.output)
+            analysis = fastmda.rmsd(ref=args.ref, atoms=atoms, output=args.output)
         elif args.command == "rmsf":
-            analysis = fastmda.rmsf(atoms=args.selection, output=args.output)
+            analysis = fastmda.rmsf(atoms=atoms, output=args.output)
         elif args.command == "rg":
-            analysis = fastmda.rg(output=args.output)
+            analysis = fastmda.rg(atoms=atoms, output=args.output)
         elif args.command == "hbonds":
-            analysis = fastmda.hbonds(output=args.output)
+            analysis = fastmda.hbonds(atoms=atoms, output=args.output)
         elif args.command == "cluster":
             analysis = fastmda.cluster(methods=args.methods, eps=args.eps,
                                        min_samples=args.min_samples, n_clusters=args.n_clusters,
-                                       output=args.output)
+                                       atoms=atoms, output=args.output)
         elif args.command == "ss":
-            analysis = fastmda.ss(output=args.output)
+            analysis = fastmda.ss(atoms=atoms, output=args.output)
         elif args.command == "sasa":
-            analysis = fastmda.sasa(probe_radius=args.probe_radius, output=args.output)
+            analysis = fastmda.sasa(probe_radius=args.probe_radius, atoms=atoms, output=args.output)
         elif args.command == "dimred":
-            analysis = fastmda.dimred(methods=args.methods, atom_selection=args.atom_selection, output=args.output)
+            analysis = fastmda.dimred(methods=args.methods, atoms=atoms, output=args.output)
         else:
             logger.error("Unknown command: %s", args.command)
             sys.exit(1)

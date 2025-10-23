@@ -13,6 +13,7 @@ import mdtraj as md
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 from .base import BaseAnalysis, AnalysisError
 
@@ -61,6 +62,7 @@ class HBondsAnalysis(BaseAnalysis):
             else:
                 subtraj = self.traj
 
+            subtraj.topology.create_standard_bonds()
             # Use the Baker-Hubbard algorithm to detect hydrogen bonds.
             hbonds = md.baker_hubbard(subtraj, periodic=False)
             counts = np.zeros(self.traj.n_frames, dtype=int)
@@ -108,15 +110,20 @@ class HBondsAnalysis(BaseAnalysis):
         title = kwargs.get("title", "Hydrogen Bonds per Frame")
         xlabel = kwargs.get("xlabel", "Frame")
         ylabel = kwargs.get("ylabel", "Number of H-Bonds")
-        color = kwargs.get("color", None)
+        color = kwargs.get("color")
         linestyle = kwargs.get("linestyle", "-")
 
         fig = plt.figure(figsize=(10, 6))
-        plt.plot(frames, data.flatten(), marker="o", linestyle=linestyle, color=color)
+        plot_kwargs = {"marker": "o", "linestyle": linestyle}
+        if color is not None:
+            plot_kwargs["color"] = color
+        plt.plot(frames, data.flatten(), **plot_kwargs)
         plt.title(title)
         plt.xlabel(xlabel)
         plt.ylabel(ylabel)
         plt.grid(alpha=0.3)
+        ax = plt.gca()
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
         plot_path = self._save_plot(fig, "hbonds")
         plt.close(fig)
         return plot_path

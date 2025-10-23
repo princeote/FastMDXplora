@@ -102,19 +102,27 @@ class RMSFAnalysis(BaseAnalysis):
         if data is None:
             raise AnalysisError("No RMSF data available to plot. Please run the analysis first.")
 
-        # Prepare the x-axis (atom index)
-        x = np.arange(len(data))
+        # Prepare the x-axis (atom index, 1-based for readability)
+        x = np.arange(1, len(data) + 1)
         title = kwargs.get("title", "RMSF per Atom")
         xlabel = kwargs.get("xlabel", "Atom Index")
         ylabel = kwargs.get("ylabel", "RMSF (nm)")
-        color = kwargs.get("color", None)
+        color = kwargs.get("color")
+        tick_step = kwargs.get("tick_step", 5)
 
         fig = plt.figure(figsize=(10, 6))
-        plt.bar(x, data.flatten(), color=color)
+        bar_kwargs = {}
+        if color is not None:
+            bar_kwargs["color"] = color
+        plt.bar(x, data.flatten(), **bar_kwargs)
         plt.title(title)
         plt.xlabel(xlabel)
         plt.ylabel(ylabel)
         plt.grid(alpha=0.3)
+        ticks = np.arange(tick_step, len(data) + 1, tick_step)
+        if ticks.size == 0:
+            ticks = np.arange(1, len(data) + 1)
+        plt.xticks(ticks)
         plot_path = self._save_plot(fig, "rmsf")
         plt.close(fig)
         return plot_path

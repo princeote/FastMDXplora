@@ -7,6 +7,7 @@ The analysis computes the fluctuations relative to the average structure, saves 
 and automatically generates a default bar plot of RMSF per atom.
 Users may replot the data with customizable plotting options.
 """
+from __future__ import annotations
 
 import numpy as np
 import mdtraj as md

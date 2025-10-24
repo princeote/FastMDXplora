@@ -7,6 +7,7 @@ The analysis computes the number of hydrogen bonds for each frame, saves the res
 and automatically generates a default plot of hydrogen bonds versus frame.
 Users can later replot the data with customizable plotting options.
 """
+from __future__ import annotations
 
 import numpy as np
 import mdtraj as md

@@ -14,6 +14,7 @@ Usage:
     analysis.run()         # Computes SS and generates default plots and README file.
     analysis.plot()        # Replot if needed with customization options.
 """
+from __future__ import annotations
 
 import numpy as np
 import mdtraj as md

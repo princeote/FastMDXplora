@@ -6,6 +6,7 @@ This analysis supports an optional atom selection so that RMSD can be computed o
 The module automatically saves the RMSD data and generates a default plot of RMSD vs. frame number.
 Users can optionally replot the data with customized plotting options.
 """
+from __future__ import annotations
 
 import numpy as np
 import mdtraj as md

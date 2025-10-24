@@ -24,6 +24,7 @@ It then generates:
 
 All computed data and plots are saved, and their file paths are stored in the results dictionary.
 """
+from __future__ import annotations
 
 import logging
 from pathlib import Path

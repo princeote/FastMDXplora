@@ -7,6 +7,7 @@ of atoms. If no atom selection is provided, the calculation is done on the entir
 The computed RG values are saved to a file and a default plot of RG vs. frame is automatically generated.
 Users can replot the data with customizable plotting options.
 """
+from __future__ import annotations
 
 import numpy as np
 import mdtraj as md

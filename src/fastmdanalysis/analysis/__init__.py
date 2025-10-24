@@ -1,6 +1,7 @@
 """
 Exports all analysis modules.
 """
+from __future__ import annotations
 
 from .rmsd import RMSDAnalysis
 from .rmsf import RMSFAnalysis

@@ -14,6 +14,7 @@ only those atoms are used for the analysis. Otherwise, the entire trajectory is 
 The computed data are saved to files and default plots are generated automatically.
 Users may later replot individual outputs with customizable options.
 """
+from __future__ import annotations
 
 import numpy as np
 import mdtraj as md

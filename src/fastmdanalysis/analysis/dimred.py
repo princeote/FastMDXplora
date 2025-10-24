@@ -23,6 +23,7 @@ Usage Example (API):
                                  ylabel="Y Component", marker="s", cmap="plasma")
     print("Scatter plots generated for:", custom_plots)
 """
+from __future__ import annotations
 
 import numpy as np
 

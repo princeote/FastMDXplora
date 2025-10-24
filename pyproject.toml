@@ -3,7 +3,7 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "FastMDAnalysis"
+name = "fastmdanalysis"
 version = "0.1.0"
 description = "Software for automated MD trajectory analysis"
 readme = "README.md"
@@ -12,7 +12,7 @@ license = { file = "LICENSE" }
 authors = [
 { name = "Adekunle Aina", email = "kunleaina@gmail.com" }
 ]
-keywords = ["molecular dynamics", "trajectory analysis", "mdtraj"]
+keywords = ["molecular dynamics", "trajectory analysis"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",
@@ -29,21 +29,21 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/aai-research-lab/FastMDAnalysis"
+Homepage = "https://github.com/aai-research-lab/fastmdanalysis"
 Documentation = "https://fastmdanalysis.readthedocs.io"
-Issues = "https://github.com/aai-research-lab/FastMDAnalysis/issues"
+Issues = "https://github.com/aai-research-lab/fastmdanalysis/issues"
 
 [project.scripts]
 fastmda = "FastMDAnalysis.cli:main"
 
 # Package top-level directory
 [tool.hatch.build.targets.wheel]
-packages = ["FastMDAnalysis"]
+packages = ["src/fastmdanalysis"]
 
 # Include non-.py assets (datasets, examples, etc.) in wheels & sdists
 [tool.hatch.build]
 include = [
-  "FastMDAnalysis/**",
+  "src/fastmdanalysis/**",
   "README.md",
   "LICENSE"
 ]

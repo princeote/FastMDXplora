@@ -12,7 +12,7 @@ OUTPUT_PPTX = ROOT / "slides" / "FastMDAnalysis_demo_slides.pptx"
 COMMANDS = {
     "rmsd": (
     'fastmda rmsd -traj data/trp_cage.dcd -top data/trp_cage.pdb '
-    '--ref 0 --atoms "protein and name CA" --frames 0,-1,10 -o demos/rmsd'
+    '--reference-frame 0 --atoms "protein and name CA" --frames 0,-1,10 -o demos/rmsd'
     ),
     "rmsf": (
     'fastmda rmsf -traj data/trp_cage.dcd -top data/trp_cage.pdb '

@@ -77,7 +77,7 @@ class BaseAnalysis:
         fig.savefig(plot_path, bbox_inches="tight")
         return plot_path
 
-    def _save_data(self, data, filename: str) -> Path:
+    def _save_data(self, data, filename: str, header: str | None = None, fmt: str | None = None) -> Path:
         """
         Save data (typically a numpy array) to a .dat file in the output directory.
 
@@ -95,9 +95,24 @@ class BaseAnalysis:
         """
         data_path = self.outdir / f"{filename}.dat"
         if isinstance(data, np.ndarray):
-            # If data is two-dimensional, add a header for each column.
-            header = " ".join([f"col{i}" for i in range(data.shape[1])]) if data.ndim == 2 else "data"
-            np.savetxt(data_path, data, header=header)
+            if header is None:
+                if data.ndim == 2:
+                    header = " ".join([f"col{i}" for i in range(data.shape[1])])
+                else:
+                    header = "data"
+            if fmt is None:
+                try:
+                    if np.issubdtype(data.dtype, np.integer):
+                        fmt = "%d"
+                    elif np.issubdtype(data.dtype, np.floating):
+                        fmt = "%.6f"
+                except TypeError:
+                    fmt = None
+
+            savetxt_kwargs = {"header": header}
+            if fmt is not None:
+                savetxt_kwargs["fmt"] = fmt
+            np.savetxt(data_path, data, **savetxt_kwargs)
         else:
             with open(data_path, "w") as f:
                 f.write(str(data))

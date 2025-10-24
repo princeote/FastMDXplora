@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 from .base import BaseAnalysis, AnalysisError
 
 class RMSDAnalysis(BaseAnalysis):
-    def __init__(self, trajectory, ref_frame: int = 0, atoms: str = None, **kwargs):
+    def __init__(self, trajectory, reference_frame: int = 0, atoms: str | None = None, **kwargs):
         """
         Initialize RMSD analysis.
 
@@ -24,7 +24,7 @@ class RMSDAnalysis(BaseAnalysis):
         ----------
         trajectory : mdtraj.Trajectory
             The MD trajectory to analyze.
-        ref_frame : int, optional
+        reference_frame : int, optional
             The index of the reference frame to which the RMSD is computed (default: 0).
         atoms : str, optional
             MDTraj atom selection string specifying which atoms to use.
@@ -33,7 +33,9 @@ class RMSDAnalysis(BaseAnalysis):
             Additional keyword arguments passed to the BaseAnalysis class.
         """
         super().__init__(trajectory, **kwargs)
-        self.ref_frame = ref_frame
+        if reference_frame is None:
+            reference_frame = 0
+        self.reference_frame = reference_frame
         self.atoms = atoms  # Optional atom selection string.
         self.data = None
 
@@ -50,7 +52,7 @@ class RMSDAnalysis(BaseAnalysis):
         """
         try:
             # Extract the reference frame.
-            ref = self.traj[self.ref_frame]
+            ref = self.traj[self.reference_frame]
             # Determine the atom indices, if an atom selection is provided.
             if self.atoms is not None:
                 atom_indices = self.traj.topology.select(self.atoms)
@@ -82,7 +84,7 @@ class RMSDAnalysis(BaseAnalysis):
             RMSD data to plot. If None, uses the data computed by run().
         kwargs : dict
             Matplotlib-style keyword arguments to customize the plot, e.g.:
-            - title: plot title (default: "RMSD vs Frame (Reference Frame: ref_frame)").
+            - title: plot title (default: "RMSD vs Frame (Reference Frame: reference_frame)").
             - xlabel: x-axis label (default: "Frame").
             - ylabel: y-axis label (default: "RMSD (nm)").
             - color: line color.
@@ -99,7 +101,7 @@ class RMSDAnalysis(BaseAnalysis):
             raise AnalysisError("No RMSD data available to plot. Please run the analysis first.")
 
         frames = np.arange(len(data))
-        title = kwargs.get("title", f"RMSD vs Frame (Reference Frame: {self.ref_frame})")
+        title = kwargs.get("title", f"RMSD vs Frame (Reference Frame: {self.reference_frame})")
         xlabel = kwargs.get("xlabel", "Frame")
         ylabel = kwargs.get("ylabel", "RMSD (nm)")
         color = kwargs.get("color")

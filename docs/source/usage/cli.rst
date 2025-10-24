@@ -41,7 +41,7 @@ Quick-reference table
 ================  =========================================  ===============================
 Subcommand        Highlights                                   Extra options
 ================  =========================================  ===============================
-``rmsd``          Reference frame alignment, RMSD vs. time     ``--ref`` ``--atoms``
+``rmsd``          Reference frame alignment, RMSD vs. time     ``--reference-frame`` ``--atoms``
 ``rmsf``          Per-atom/per-residue flexibility             ``--atoms``
 ``rg``            Radius of gyration timeseries                ``--atoms``
 ``hbonds``        Baker–Hubbard hydrogen bonds                 ``--atoms``
@@ -61,7 +61,7 @@ Example session
 			--topology data/trp_cage.pdb \
 			--frames 0,-1,10 \
 			--atoms "protein" \
-			--ref 0 \
+			--reference-frame 0 \
 			--output results/trp_rmsd
 
 	Inspect ``results/trp_rmsd/rmsd.dat`` and ``results/trp_rmsd/rmsd.png`` and

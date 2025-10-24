@@ -33,7 +33,7 @@ returns the populated instance. Example:
 
 .. code-block:: python
 
-	rmsd = fastmda.rmsd(ref=0)
+	rmsd = fastmda.rmsd(reference_frame=0)
 	rg = fastmda.rg()
 	hb = fastmda.hbonds()
 
@@ -74,7 +74,7 @@ Because the trajectory is cached, sequential runs avoid reloads:
 .. code-block:: python
 
 	analyses = {
-		 "rmsd": fastmda.rmsd(ref=0),
+		 "rmsd": fastmda.rmsd(reference_frame=0),
 		 "rmsf": fastmda.rmsf(atoms="protein"),
 		 "sasa": fastmda.sasa(probe_radius=0.14),
 	}

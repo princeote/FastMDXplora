@@ -317,7 +317,21 @@ class ClusterAnalysis(BaseAnalysis):
                     labels = dbscan.fit_predict(distances)
                     labels = adjust_labels(labels)
                     logger.info("DBSCAN produced %d labels.", len(labels))
+                    frame_indices = np.arange(len(labels), dtype=int)
+                    label_table = np.column_stack((frame_indices, labels))
                     method_res = {"labels": labels, "distance_matrix": distances}
+                    method_res["labels_file"] = self._save_data(
+                        label_table,
+                        "dbscan_labels",
+                        header="frame cluster",
+                        fmt="%d",
+                    )
+                    method_res["distance_matrix_file"] = self._save_data(
+                        distances,
+                        "dbscan_distance_matrix",
+                        header="RMSD distance matrix",
+                        fmt="%.6f",
+                    )
                     method_res["pop_plot"] = self._plot_population(labels, "dbscan_pop")
                     method_res["trajectory_histogram"] = self._plot_cluster_trajectory_histogram(labels, "dbscan_traj_hist")
                     method_res["trajectory_scatter"] = self._plot_cluster_trajectory_scatter(labels, "dbscan_traj_scatter")
@@ -330,7 +344,21 @@ class ClusterAnalysis(BaseAnalysis):
                     labels = kmeans.fit_predict(X_flat)
                     labels = adjust_labels(labels)
                     logger.info("KMeans produced %d labels.", len(labels))
+                    frame_indices = np.arange(len(labels), dtype=int)
+                    label_table = np.column_stack((frame_indices, labels))
                     method_res = {"labels": labels, "coordinates": X_flat}
+                    method_res["labels_file"] = self._save_data(
+                        label_table,
+                        "kmeans_labels",
+                        header="frame cluster",
+                        fmt="%d",
+                    )
+                    method_res["coordinates_file"] = self._save_data(
+                        X_flat,
+                        "kmeans_coordinates",
+                        header="Flattened coordinates",
+                        fmt="%.6f",
+                    )
                     method_res["pop_plot"] = self._plot_population(labels, "kmeans_pop")
                     method_res["trajectory_histogram"] = self._plot_cluster_trajectory_histogram(labels, "kmeans_traj_hist")
                     method_res["trajectory_scatter"] = self._plot_cluster_trajectory_scatter(labels, "kmeans_traj_scatter")
@@ -346,7 +374,21 @@ class ClusterAnalysis(BaseAnalysis):
                     logger.info("Hierarchical clustering produced %d labels.", len(labels))
                     if len(labels) != self.traj.n_frames:
                         logger.warning("Mismatch: number of labels (%d) != number of frames (%d)", len(labels), self.traj.n_frames)
+                    frame_indices = np.arange(len(labels), dtype=int)
+                    label_table = np.column_stack((frame_indices, labels))
                     method_res = {"labels": labels, "linkage": linkage_matrix}
+                    method_res["labels_file"] = self._save_data(
+                        label_table,
+                        "hierarchical_labels",
+                        header="frame cluster",
+                        fmt="%d",
+                    )
+                    method_res["linkage_file"] = self._save_data(
+                        linkage_matrix,
+                        "hierarchical_linkage",
+                        header="cluster1 cluster2 distance sample_count",
+                        fmt="%.6f",
+                    )
                     method_res["pop_plot"] = self._plot_population(labels, "hierarchical_pop")
                     method_res["trajectory_histogram"] = self._plot_cluster_trajectory_histogram(labels, "hierarchical_traj_hist")
                     method_res["trajectory_scatter"] = self._plot_cluster_trajectory_scatter(labels, "hierarchical_traj_scatter")

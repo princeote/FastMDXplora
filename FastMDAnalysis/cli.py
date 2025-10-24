@@ -41,7 +41,7 @@ def add_file_args(subparser):
 # Main parser.
 parser = argparse.ArgumentParser(
     description="FastMDAnalysis: Fast Automated MD Trajectory Analysis",
-    epilog="Docs: https://fastmdanalysis.readthedocs.io/en/latest/" 
+    epilog="Docs: https://fastmdanalysis.readthedocs.io/en/latest/",
     parents=[common_parser]
 )
 subparsers = parser.add_subparsers(dest="command", help="Analysis type", required=True)
@@ -49,7 +49,13 @@ subparsers = parser.add_subparsers(dest="command", help="Analysis type", require
 # Subcommand: RMSD.
 parser_rmsd = subparsers.add_parser("rmsd", parents=[common_parser], help="RMSD analysis", conflict_handler="resolve")
 add_file_args(parser_rmsd)
-parser_rmsd.add_argument("--ref", type=int, default=0, help="Reference frame index for RMSD analysis")
+parser_rmsd.add_argument(
+    "--reference-frame",
+    dest="reference_frame",
+    type=int,
+    default=0,
+    help="Reference frame index for RMSD analysis",
+)
 
 # Subcommand: RMSF.
 parser_rmsf = subparsers.add_parser("rmsf", parents=[common_parser], help="RMSF analysis", conflict_handler="resolve")
@@ -133,7 +139,7 @@ def main():
     # Dispatch to appropriate analysis.
     try:
         if args.command == "rmsd":
-            analysis = fastmda.rmsd(ref=args.ref, atoms=atoms, output=args.output)
+            analysis = fastmda.rmsd(reference_frame=args.reference_frame, atoms=atoms, output=args.output)
         elif args.command == "rmsf":
             analysis = fastmda.rmsf(atoms=atoms, output=args.output)
         elif args.command == "rg":

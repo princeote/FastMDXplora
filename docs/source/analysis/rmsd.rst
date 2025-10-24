@@ -45,7 +45,7 @@ Usage
    from FastMDAnalysis import FastMDAnalysis
 
    fastmda = FastMDAnalysis("traj.dcd", "top.pdb", frames=(0, -1, 5))
-   rmsd = fastmda.rmsd(ref=0, atoms="protein and name CA", output="analysis/rmsd")
+   rmsd = fastmda.rmsd(reference_frame=0, atoms="protein and name CA", output="analysis/rmsd")
    results = rmsd.run()
    png_path = rmsd.plot(title="Backbone RMSD")
 
@@ -53,7 +53,7 @@ Usage
 
 .. code-block:: bash
 
-   fastmda rmsd -traj traj.dcd -top top.pdb --ref 0 --atoms "protein and name CA" \
+   fastmda rmsd -traj traj.dcd -top top.pdb --reference-frame 0 --atoms "protein and name CA" \
       --frames 0,-1,5 -o analysis/rmsd
 
 Outputs

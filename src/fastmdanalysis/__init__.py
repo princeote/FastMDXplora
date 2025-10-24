@@ -56,7 +56,7 @@ class FastMDAnalysis:
     >>> from fastmdanalysis import FastMDAnalysis
     >>> # Load a trajectory, selecting every 10th frame from the start to the end, and using only protein atoms.
     >>> fastmda = FastMDAnalysis("trajectory.dcd", "topology.pdb", frames=(-10, -1, 1), atoms="protein")
-    >>> rmsd_analysis = fastmda.rmsd(ref=0)
+    >>> rmsd_analysis = fastmda.rmsd(reference_frame=0)
     """
 
     def __init__(self, traj_file, top_file, frames=None, atoms=None):
@@ -109,13 +109,13 @@ class FastMDAnalysis:
         """
         return specific_atoms if specific_atoms is not None else self.default_atoms
 
-    def rmsd(self, ref=0, atoms=None, **kwargs):
+    def rmsd(self, reference_frame=0, atoms=None, **kwargs):
         """
         Run RMSD analysis on the stored trajectory.
 
         Parameters
         ----------
-        ref : int, optional
+        reference_frame : int, optional
             Reference frame index for RMSD calculations (default is 0).
         atoms : str, optional
             Atom selection string for this analysis. If not provided, uses the default atom selection.
@@ -128,7 +128,8 @@ class FastMDAnalysis:
             An RMSDAnalysis instance containing the computed results.
         """
         a = self._get_atoms(atoms)
-        analysis = RMSDAnalysis(self.traj, ref_frame=ref, atoms=a, **kwargs)
+
+        analysis = RMSDAnalysis(self.traj, reference_frame=reference_frame, atoms=a, **kwargs)
         analysis.run()
         return analysis
 

@@ -26,7 +26,7 @@ class TestFastMDAnalysis(unittest.TestCase):
         self.fastmda = FastMDAnalysis(traj_path, top_path, frames=None, atoms="protein")
 
     def test_rmsd(self):
-        analysis = self.fastmda.rmsd(ref=0)
+        analysis = self.fastmda.rmsd(reference_frame=0)
         self.assertTrue(hasattr(analysis, "data"), "RMSD analysis missing data attribute.")
         self.assertIsInstance(analysis.data, np.ndarray)
 
@@ -74,7 +74,7 @@ class TestFastMDAnalysis(unittest.TestCase):
 
     def test_plotting(self):
         # Test that the plot() method returns output file paths.
-        analysis = self.fastmda.rmsd(ref=0)
+        analysis = self.fastmda.rmsd(reference_frame=0)
         plot_result = analysis.plot()
         self.assertTrue(isinstance(plot_result, dict) or isinstance(plot_result, Path),
                         "Plot method must return a dict or a Path.")

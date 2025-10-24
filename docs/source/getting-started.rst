@@ -77,7 +77,7 @@ Quick start (Python API)
 
    fastmda = FastMDAnalysis(trp_cage.traj, trp_cage.top,
                              frames=(0, -1, 10), atoms="protein")
-   rmsd = fastmda.rmsd(ref=0)
+   rmsd = fastmda.rmsd(reference_frame=0)
    print(rmsd.data[:5])  
 
 The call caches the trajectory (honouring the frame stride and atom selection),
@@ -95,7 +95,7 @@ command mirrors the API example above::
       --topology "data/trp_cage.pdb" \
       --frames "0,-1,10" \
       --atoms "protein" \
-      --ref 0
+      --reference-frame 0
 
 Logs land in ``rmsd_output/rmsd.log`` and document the parameter set, library
 versions, and timing – part of the reproducibility focus highlighted in the

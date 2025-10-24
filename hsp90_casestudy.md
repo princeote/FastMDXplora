@@ -98,7 +98,7 @@ def analyze_single_replicate(traj_data, replicate_id, output_dir):
     
     # 3.1 Calculate basic structural metrics
     print(" Calculating structural metrics...")
-    rmsd_result = fmda.rmsd(ref=0)
+    rmsd_result = fmda.rmsd(reference_frame=0)
     rg_result = fmda.rg()
     rmsf_result = fmda.rmsf()
     

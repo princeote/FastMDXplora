@@ -30,20 +30,16 @@ From source (development)
 
 Clone the repository and choose one of the following installation modes:
 
-**Standard install** (locks files in ``site-packages``):
-
 .. code-block:: bash
 
-   pip install .
+   git clone https://github.com/aai-research-lab/FastMDAnalysis
+   cd FastMDAnalysis
+   pip install .          # Standard install
+   # or
+   pip install -e .       # Editable install (development)
 
-**Editable install** (preferred during development):
-
-.. code-block:: bash
-
-   pip install -e .
-
-The editable mode mirrors the workflow used in the manuscript: it keeps the
-package importable while allowing you to modify source files in-place.
+**Standard install** - installs the package to site-packages (like PyPI packages)
+**Editable install** - links to your source code, so changes are immediately available (ideal for development)
 
 
 Optional dependencies

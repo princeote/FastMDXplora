@@ -38,7 +38,7 @@ test = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/aai-research-lab/fastmdanalysis"
+Repository = "https://github.com/aai-research-lab/fastmdanalysis"
 Documentation = "https://fastmdanalysis.readthedocs.io"
 Issues = "https://github.com/aai-research-lab/fastmdanalysis/issues"
 

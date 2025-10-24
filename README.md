@@ -1,43 +1,42 @@
 # FastMDAnalysis
-Fully Automated System for Molecular Dynamics Trajectory Analysis
+[![Tests](https://github.com/aai-research-lab/FastMDAnalysis/actions/workflows/test.yml/badge.svg)](https://github.com/aai-research-lab/FastMDAnalysis/actions)
+[![codecov](https://codecov.io/gh/aai-research-lab/FastMDAnalysis/branch/main/graph/badge.svg)](https://codecov.io/gh/aai-research-lab/FastMDAnalysis)
+[![Docs](https://img.shields.io/badge/docs-latest-brightgreen.svg)](https://fastmdanalysis.readthedocs.io/en/latest/)
+[![Documentation](https://readthedocs.org/projects/fastmdanalysis/badge/?version=latest)](https://fastmdanalysis.readthedocs.io)
+[![PyPI](https://img.shields.io/pypi/v/fastmdanalysis)](https://pypi.org/project/fastmdanalysis/)
+[![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Perform a variety of MD analyses in a single line of code.
+**Fully Automated System for Molecular Dynamics Trajectory Analysis**
 
+- Perform a variety of MD analyses in a single line of code.
 <!-- Simplify your workflow by loading a trajectory once (with options for frame and atom selection) and then performing multiple analyses without repeating input file details. --> 
+- Automatically generate publication-ready figures (with options for customization).
 
-Automatically generate publication-ready figures (with options for customization).
-
-Use the Python API or the command‐line interface (CLI). 
+- Use the Python API or the Command‐Line Interface (CLI). 
 
 
 # Documentation
+The documentation (with extensive usage examples) is available at https://fastmdanalysis.readthedocs.io
 
-Full documentation with extensive usage examples at https://fastmdanalysis.readthedocs.io
 
-[![Docs](https://img.shields.io/badge/docs-latest-brightgreen.svg)](https://fastmdanalysis.readthedocs.io/en/latest/)
 
-# Features
 
-- `rmsd`: Calculate Root-Mean-Square Deviation relative to a reference frame.
-- `rmsf`: Compute per-atom Root-Mean-Square Fluctuation.
-- `rg`: Determine the Radius of Gyration for each frame.
-- `hbonds`: Detect and count hydrogen bonds using the Baker-Hubbard algorithm.
-- `ss`: Compute Secondary Structure assignments using DSSP.
-- `cluster`: Perform clustering on trajectory frames:
-  - KMeans
-  - DBSCAN
-  - Hierarchical
-- `sasa`: Compute Solvent Accessible Surface Area in multiple ways:
-  - Total SASA vs. frame.
-  - Per-residue SASA vs. frame (heatmap).
-  - Average per-residue SASA (bar plot).
-- `dimred`: Perform dimensionality reduction to project high-dimensional data into 2D:
-  - PCA
-  - MDS
-  - t-SNE
+# Analysis Modules
+| Analysis | Description |
+|----------|-------------|
+| ``rmsd`` | Root-Mean-Square Deviation relative to a reference frame |
+| ``rmsf`` | Per-atom Root-Mean-Square Fluctuation |
+| ``rg`` | Radius of Gyration for molecular compactness |
+| ``hbonds`` | Hydrogen bond detection and count using Baker-Hubbard algorithm |
+| ``ss`` | Secondary Structure assignments using DSSP |
+| ``cluster`` | Trajectory clustering using KMeans, DBSCAN, and Hierarchical methods |
+| ``sasa`` | Solvent Accessible Surface Area with total, per-residue, and average per-residue |
+| ``dimred`` | Dimensionality reduction using PCA, MDS, and t-SNE methods |
+
+
 
 # Installation
-
 <!-- ## From PyPI (Recommended for users) -->
 ```bash
 pip install fastmdanalysis
@@ -45,13 +44,10 @@ pip install fastmdanalysis
 
 
 # Usage
-
 ## Python API
-
 Instantiate a `FastMDAnalysis` object with your trajectory and topology file paths. Optionally, specify frame selection and atom selection. Frame selection is provided as a tuple (start, stop, stride). Negative indices (e.g., -1 for the last frame) are supported. If no options are provided, the entire trajectory and all atoms are used by default.
 
-### RMSD Analysis:
-
+**RMSD Analysis:**
 ```python
 from fastmdanalysis import FastMDAnalysis
 fastmda = FastMDAnalysis("traj.dcd", "top.pdb")
@@ -59,12 +55,10 @@ fastmda.rmsd()
 ```
 
 
-
-## Command-Line Interface (CLI)
+## Command-Line Interface (CLI) 
 After installation, you can run ``FastMDAnalysis`` from the command line using the `fastmda` command. Global options allow you to specify the trajectory, topology, frame selection, and atom selection.
 
-### RMSF Analysis:
-
+**RMSF Analysis:**
 ```bash
 fastmda rmsf -traj traj.dcd -top top.pdb 
 ```

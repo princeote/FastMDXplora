@@ -14,8 +14,8 @@ jobs:
         with: { python-version: "3.11" }
       - run: python -m pip install --upgrade build
       - run: python -m build
-      - name: Publish to TestPyPI
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         # for TestPyPI:
-        with: { repository-url: https://test.pypi.org/legacy/ }
+        # with: { repository-url: https://test.pypi.org/legacy/ }
 

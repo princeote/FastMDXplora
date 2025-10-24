@@ -39,7 +39,7 @@ Usage
 .. code-block:: python
 
    import mdtraj as md
-   from FastMDAnalysis import FastMDAnalysis
+   from fastmdanalysis import FastMDAnalysis
 
    traj = md.load("traj.dcd", top="top.pdb")
    traj.topology.create_standard_bonds()

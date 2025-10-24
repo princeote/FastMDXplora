@@ -41,7 +41,7 @@ def add_file_args(subparser):
 # Main parser.
 parser = argparse.ArgumentParser(
     description="FastMDAnalysis: Fast Automated MD Trajectory Analysis",
-    epilog="Docs: https://fastmdanalysis.readthedocs.io/en/latest/" 
+    epilog="Docs: https://fastmdanalysis.readthedocs.io/en/latest/", 
     parents=[common_parser]
 )
 subparsers = parser.add_subparsers(dest="command", help="Analysis type", required=True)
@@ -124,7 +124,7 @@ def main():
 
     # Initialize FastMDAnalysis instance (do not pass output here).
     try:
-        from FastMDAnalysis import FastMDAnalysis
+        from fastmdanalysis import FastMDAnalysis
         fastmda = FastMDAnalysis(args.trajectory, args.topology, frames=frames, atoms=atoms)
     except Exception as e:
         logger.error("Error initializing FastMDAnalysis: %s", e)

@@ -1,19 +1,48 @@
+# Virtual environments
+.venv/
+venv/
+env/
+test_env/
+test_env2/
+
 # Build artifacts
 build/
+dist/
+*.egg-info/
 docs/build/
 docs/source/_build/
 
 # Packaging metadata
-FastMDAnalysis.egg-info/
+*.egg-info/
 
 # Python cache
 __pycache__/
 *.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
 
 # Output files
 *_output/
 demos/
 slides/FastMDAnalysis_demo_slides.pptx
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test/backup files
+*.bak
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Note
 NOTE

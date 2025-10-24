@@ -13,26 +13,51 @@ FastMDAnalysis targets Python 3.8 or newer and depends on
 documentation toolchain requires Sphinx and the Read the Docs theme. GPU
 hardware is **not** required; all analyses run on a standard laptop.
 
+
 Installation
 ------------
 
-From a cloned repository, choose one of the following modes:
+From PyPI (recommended for users)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-**Standard install** (locks files in ``site-packages``)::
+.. code-block:: bash
 
-   python -m pip install .
+   pip install fastmdanalysis
 
-**Editable install** (preferred during development)::
 
-   python -m pip install -e .
+From source (development)
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Clone the repository and choose one of the following installation modes:
+
+**Standard install** (locks files in ``site-packages``):
+
+.. code-block:: bash
+
+   pip install .
+
+**Editable install** (preferred during development):
+
+.. code-block:: bash
+
+   pip install -e .
 
 The editable mode mirrors the workflow used in the manuscript: it keeps the
 package importable while allowing you to modify source files in-place.
 
-Optional documentation dependencies – useful if you want to rebuild the Read
-the Docs site locally – live in ``docs/requirements.txt``::
 
-   python -m pip install -r docs/requirements.txt
+Optional dependencies
+~~~~~~~~~~~~~~~~~~~~~
+
+Documentation dependencies – useful if you want to rebuild the Read the Docs
+site locally – live in ``docs/requirements.txt``:
+
+.. code-block:: bash
+
+   pip install -r docs/requirements.txt
+
+
+
 
 Sample data
 -----------
@@ -47,8 +72,8 @@ Quick start (Python API)
 
 .. code-block:: python
 
-   from FastMDAnalysis import FastMDAnalysis
-   from FastMDAnalysis.datasets import trp_cage
+   from fastmdanalysis import FastMDAnalysis
+   from fastmdanalysis.datasets import trp_cage
 
    fastmda = FastMDAnalysis(trp_cage.traj, trp_cage.top,
                              frames=(0, -1, 10), atoms="protein")

@@ -43,7 +43,7 @@ Usage
 
 .. code-block:: python
 
-   from FastMDAnalysis import FastMDAnalysis
+   from fastmdanalysis import FastMDAnalysis
 
    fastmda = FastMDAnalysis("traj.dcd", "top.pdb", atoms="protein and name CA")
    cluster = fastmda.cluster(methods=["dbscan", "kmeans"], eps=0.45, min_samples=10, n_clusters=4)

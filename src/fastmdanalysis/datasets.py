@@ -9,15 +9,46 @@ as well as additional attributes describing simulation conditions such as:
   - integrator: the integration algorithm used
   - temperature: the simulation temperature (in Kelvin)
   - pressure: the simulation pressure (in atm or bar as defined)
-  - rtc: a string representing the run-time, creation date, or other relevant tag
 
-The data directory is assumed to be located in the parent of the FastMDAnalysis package directory.
+The data directory is located within the fastmdanalysis package.
 """
 
+import os
 from pathlib import Path
 
-# Set the data directory to be the grandparent of this file joined with "data".
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+def _get_data_path(filename):
+    """Get path to data file using multiple fallback methods."""
+    try:
+        # Method 1: Try importlib.resources first (works with Hatchling)
+        from importlib.resources import files
+        resource_path = files('fastmdanalysis.data') / filename
+        # Try to access the path - this will raise FileNotFoundError if it doesn't exist
+        # but we need to check if the resource system is working
+        if hasattr(resource_path, 'is_file') and resource_path.is_file():
+            return str(resource_path)
+        # If we get here, the file might not exist but the package structure is correct
+        return str(resource_path)
+    except (ImportError, AttributeError, TypeError, FileNotFoundError):
+        pass
+    
+    # Method 2: Fallback to package directory detection
+    try:
+        import fastmdanalysis
+        package_dir = Path(fastmdanalysis.__file__).parent
+        data_path = package_dir / 'data' / filename
+        if data_path.exists():
+            return str(data_path)
+    except:
+        pass
+    
+    # Method 3: Development fallback - relative to current file
+    current_file_dir = Path(__file__).parent
+    dev_data_path = current_file_dir / 'data' / filename
+    if dev_data_path.exists():
+        return str(dev_data_path)
+    
+    # Final fallback - just return the expected relative path
+    return f"data/{filename}"
 
 class Ubiquitin:
     """
@@ -26,9 +57,9 @@ class Ubiquitin:
     Attributes
     ----------
     traj : str
-        Absolute path to the ubiquitin trajectory file.
+        Path to the ubiquitin trajectory file.
     top : str
-        Absolute path to the ubiquitin topology file.
+        Path to the ubiquitin topology file.
     time_step : float
         Time step used in the simulation (picoseconds).
     force_field : str
@@ -40,10 +71,10 @@ class Ubiquitin:
     pressure : float
         Simulation pressure (e.g., in atm or bar).
     md_engine : str
-        molecular dynamics simulation engine.
+        Molecular dynamics simulation engine.
     """
-    traj = str((DATA_DIR / "ubiquitin.dcd").resolve())
-    top = str((DATA_DIR / "ubiquitin.pdb").resolve())
+    traj = _get_data_path("ubiquitin.dcd")
+    top = _get_data_path("ubiquitin.pdb")
     time_step = 0.002
     force_field = "CHARMM36m"
     integrator = "Legenvin"
@@ -58,9 +89,9 @@ class TrpCage:
     Attributes
     ----------
     traj : str
-        Absolute path to the trp-cage trajectory file.
+        Path to the trp-cage trajectory file.
     top : str
-        Absolute path to the trp-cage topology file.
+        Path to the trp-cage topology file.
     time_step : float
         Time step used in the simulation (picoseconds).
     force_field : str
@@ -72,10 +103,10 @@ class TrpCage:
     pressure : float
         Simulation pressure.
     md_engine : str
-        molecular dynamics simulation engine.
+        Molecular dynamics simulation engine.
     """
-    traj = str((DATA_DIR / "trp_cage.dcd").resolve())
-    top = str((DATA_DIR / "trp_cage.pdb").resolve())
+    traj = _get_data_path("trp_cage.dcd")
+    top = _get_data_path("trp_cage.pdb")
     time_step = 0.002
     force_field = "CHARMM36m"
     integrator = "LegenvinMiddleIntegrator"
@@ -86,4 +117,3 @@ class TrpCage:
 # Convenience shortcuts for easy import.
 ubiquitin = Ubiquitin
 trp_cage = TrpCage
-

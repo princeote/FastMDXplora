@@ -33,7 +33,7 @@ Usage
 
 .. code-block:: python
 
-   from FastMDAnalysis import FastMDAnalysis
+   from fastmdanalysis import FastMDAnalysis
 
    fastmda = FastMDAnalysis("traj.dcd", "top.pdb")
    ss = fastmda.ss()

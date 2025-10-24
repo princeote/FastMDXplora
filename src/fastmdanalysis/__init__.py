@@ -53,7 +53,7 @@ class FastMDAnalysis:
 
     Examples
     --------
-    >>> from FastMDAnalysis import FastMDAnalysis
+    >>> from fastmdanalysis import FastMDAnalysis
     >>> # Load a trajectory, selecting every 10th frame from the start to the end, and using only protein atoms.
     >>> fastmda = FastMDAnalysis("trajectory.dcd", "topology.pdb", frames=(-10, -1, 1), atoms="protein")
     >>> rmsd_analysis = fastmda.rmsd(ref=0)

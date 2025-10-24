@@ -37,7 +37,7 @@ Usage
 
 .. code-block:: python
 
-   from FastMDAnalysis import FastMDAnalysis
+   from fastmdanalysis import FastMDAnalysis
 
   fastmda = FastMDAnalysis("traj.dcd", "top.pdb")
   rmsf = fastmda.rmsf(atoms="protein and name CA")

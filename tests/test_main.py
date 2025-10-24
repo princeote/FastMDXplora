@@ -10,9 +10,9 @@ import numpy as np
 import mdtraj as md
 from pathlib import Path
 
-from FastMDAnalysis import FastMDAnalysis
-from FastMDAnalysis.datasets import trp_cage
-from FastMDAnalysis.utils import load_trajectory
+from fastmdanalysis import FastMDAnalysis
+from fastmdanalysis.datasets import trp_cage
+from fastmdanalysis.utils import load_trajectory
 
 class TestFastMDAnalysis(unittest.TestCase):
     def setUp(self):

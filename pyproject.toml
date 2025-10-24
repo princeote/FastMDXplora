@@ -28,13 +28,22 @@ dependencies = [
   "scipy>=1.10"
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0"
+]
+
+test = [
+    "pytest>=7.0"
+]
+
 [project.urls]
 Homepage = "https://github.com/aai-research-lab/fastmdanalysis"
 Documentation = "https://fastmdanalysis.readthedocs.io"
 Issues = "https://github.com/aai-research-lab/fastmdanalysis/issues"
 
 [project.scripts]
-fastmda = "FastMDAnalysis.cli:main"
+fastmda = "fastmdanalysis.cli:main"
 
 # Package top-level directory
 [tool.hatch.build.targets.wheel]
@@ -47,3 +56,8 @@ include = [
   "README.md",
   "LICENSE"
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+

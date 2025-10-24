@@ -17,7 +17,7 @@ Ubiquitin
 
 Example usage::
 
-	 from FastMDAnalysis.datasets import ubiquitin
+	 from fastmdanalysis.datasets import ubiquitin
 	 print(ubiquitin.traj)
 	 print(ubiquitin.top)
 
@@ -33,7 +33,7 @@ Trp-cage
 The helper attributes ``trp_cage.traj`` and ``trp_cage.top`` resolve to absolute
 paths, making it easy to run tutorials from any working directory::
 
-	 from FastMDAnalysis.datasets import trp_cage
+	 from fastmdanalysis.datasets import trp_cage
 	 fastmda = FastMDAnalysis(trp_cage.traj, trp_cage.top)
 
 Best practices

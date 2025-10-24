@@ -12,7 +12,7 @@ is computed, the embedding data are saved, and a scatter plot is generated where
 are colored by frame index.
 
 Usage Example (API):
-    from FastMDAnalysis import FastMDAnalysis
+    from fastmdanalysis import FastMDAnalysis
 
     fastmda = FastMDAnalysis()
     # Run dimensionality reduction using all available methods.

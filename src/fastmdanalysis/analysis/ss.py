@@ -9,7 +9,7 @@ The residue index axis is labeled with whole numbers starting at 1.
 An ss_README.md file and companion PNG are also generated to explain the SS letter codes.
 
 Usage:
-    from FastMDAnalysis import SSAnalysis
+    from fastmdanalysis import SSAnalysis
     analysis = SSAnalysis(trajectory, atoms="protein")
     analysis.run()         # Computes SS and generates default plots and README file.
     analysis.plot()        # Replot if needed with customization options.

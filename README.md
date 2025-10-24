@@ -59,7 +59,7 @@ Instantiate a FastMDAnalysis object with your trajectory and topology file paths
 ### RMSD Analysis:
 
 ```python
-from FastMDAnalysis import FastMDAnalysis
+from fastmdanalysis import FastMDAnalysis
 
 fastmda = FastMDAnalysis("traj.dcd", "top.pdb")
 

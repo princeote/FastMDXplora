@@ -10,8 +10,8 @@ analyses that return self-contained result objects.
 
 .. code-block:: python
 
-	from FastMDAnalysis import FastMDAnalysis
-	from FastMDAnalysis.datasets import ubiquitin
+	from fastmdanalysis import FastMDAnalysis
+	from fastmdanalysis.datasets import ubiquitin
 
 	fastmda = FastMDAnalysis(
 		 ubiquitin.traj,

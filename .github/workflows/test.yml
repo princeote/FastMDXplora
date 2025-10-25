@@ -11,13 +11,18 @@ jobs:
       - uses: actions/setup-python@v5
         with: 
           python-version: ${{ matrix.python-version }}
-      - run: pip install -U build pytest
+      
+      # Install dependencies
+      - run: pip install -U build pytest pytest-cov
       - run: python -m build
       - run: pip install dist/*.whl
+      
+      # Run tests with coverage
       - run: pytest -q --cov=fastmdanalysis --cov-report=xml
+      
+      # Upload to Codecov
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3
         with:
           file: ./coverage.xml
-          flags: unittests
-          name: codecov-umbrella
+          fail_ci_if_error: true

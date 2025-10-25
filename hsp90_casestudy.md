@@ -510,7 +510,7 @@ FastMDAnalysis automatically generates detailed logs for reproducibility.
 def demonstrate_reproducibility():
     """Demonstrate the reproducibility features of FastMDAnalysis"""
     
-    print("\n🔒 REPRODUCIBILITY FEATURES")
+    print("\n REPRODUCIBILITY FEATURES")
     print("=" * 50)
     
     # Check for generated log files

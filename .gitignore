@@ -46,5 +46,7 @@ Thumbs.db
 .coverage
 htmlcov/
 
+# Working files
+hsp90_casestudy.md
 # Note
 NOTE

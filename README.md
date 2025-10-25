@@ -10,9 +10,8 @@
 
 
 
-# FastMDAnalysis
-**Fully Automated System for Molecular Dynamics Trajectory Analysis**
-
+# FastMDAnalysis: Fully Automated System for MD Trajectory Analysis
+---
 - Perform a variety of MD analyses in a single line of code.
 <!-- Simplify your workflow by loading a trajectory once (with options for frame and atom selection) and then performing multiple analyses without repeating input file details. --> 
 - Automatically generate publication-quality figures (with options for customization).

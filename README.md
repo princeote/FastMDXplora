@@ -1,6 +1,5 @@
-![FastMDAnalysis Banner](assets/FastMDAnalysis_Banner.png)
+![FastMDAnalysis Banner](assets/fastmdanalysis_banner.png)
 
-# Software for Automated Molecular Trajectory Analysis
 [![Tests](https://github.com/aai-research-lab/FastMDAnalysis/actions/workflows/test.yml/badge.svg)](https://github.com/aai-research-lab/FastMDAnalysis/actions)
 [![codecov](https://codecov.io/gh/aai-research-lab/FastMDAnalysis/branch/main/graph/badge.svg)](https://codecov.io/gh/aai-research-lab/FastMDAnalysis)
 [![Docs](https://img.shields.io/badge/docs-latest-brightgreen.svg)](https://fastmdanalysis.readthedocs.io/en/latest/)

@@ -53,37 +53,6 @@ def load_trajectory(traj_input, top):
     else:
         raise TypeError("traj_input must be a string, list, or tuple")
 
-def create_dummy_trajectory(n_frames: int = 5, n_atoms: int = 10) -> md.Trajectory:
-    """
-    Create a dummy MDTraj Trajectory for testing purposes.
 
-    Builds a topology with one chain; each residue contains one CA atom.
-    Proper element information is provided via mdtraj.core.element.get_by_symbol.
-    
-    Parameters
-    ----------
-    n_frames : int, optional
-        Number of frames in the dummy trajectory (default: 5).
-    n_atoms : int, optional
-        Number of atoms (residues) per frame (default: 10).
-
-    Returns
-    -------
-    md.Trajectory
-        A dummy trajectory object.
-    """
-    # Create random coordinates: shape (n_frames, n_atoms, 3)
-    xyz = np.random.rand(n_frames, n_atoms, 3)
-    
-    # Create a simple topology.
-    from mdtraj.core.topology import Topology
-    top = Topology()
-    chain = top.add_chain()
-    element_C = get_by_symbol("C")  # Obtain element instance for Carbon.
-    for i in range(n_atoms):
-        residue = top.add_residue("GLY", chain)
-        top.add_atom("CA", element_C, residue)
-    
-    traj = md.Trajectory(xyz, top)
     return traj
 

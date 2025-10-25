@@ -9,15 +9,20 @@
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ---
-- **Perform a variety of MD analyses in a single line of code.**
-<!-- Simplify your workflow by loading a trajectory once (with options for frame and atom selection) and then performing multiple analyses without repeating input file details. --> 
-- **Automatically generate publication-quality figures (with options for customization).**
+# Highlights
+- Perform complex **molecular dynamics analyses** with intuitive, **single-line commands**
+- Automatically generate **publication-quality figures** with customizable styling for immediate use  
+- Seamlessly switch between **Python API** for advanced workflows and **CLI** for rapid batch processing
+- **Scalable workflows** that handle everything from quick exploratory analysis to large-scale production runs
 
-- **Use the Python API or the Command‐Line Interface (CLI).** 
+<!-- Perform a variety of MD trajectory analyses with a single line of code -->
+<!-- Simplify your workflow by loading a trajectory once (with options for frame and atom selection) and then performing multiple analyses without repeating input file details. --> 
+<!--  Automatically generate publication-quality figures (with options for customization) -->
+<!--  Use the Python API or the Command‐Line Interface (CLI) -->
 
 
 # Documentation
-The documentation (with extensive usage examples) is available at https://fastmdanalysis.readthedocs.io
+The documentation (with an extensive usage guide) is available [here](https://fastmdanalysis.readthedocs.io).
 
 
 
@@ -63,17 +68,20 @@ After installation, you can run ``FastMDAnalysis`` from the command line using t
 fastmda rmsf -traj traj.dcd -top top.pdb 
 ```
 
+## Output
+Output includes data files, figures, logs ...
+
 # Contributing
 Contributions are welcome. Please submit a Pull Request. 
 
 # Citation
 If you use `FastMDAnalysis` in your work, please cite:
 
-Adekunle Aina (2025). *FastMDAnalysis: Software for Automated Molecular Dynamics Trajectory Analysis.* GitHub. https://github.com/aai-research-lab/fastmdanalysis
+Adekunle Aina and Derrick Kwan (2025). *FastMDAnalysis: Software for Automated Molecular Dynamics Trajectory Analysis.* GitHub. https://github.com/aai-research-lab/fastmdanalysis
 
 ```bibtex
 @software{FastMDAnalysis,
-  author       = {Adekunle Aina},
+  author       = {Adekunle Aina and Derrick Kwan},
   title        = {FastMDAnalysis: Software for Automated Molecular Dynamics Trajectory Analysis},
   year         = {2025},
   publisher    = {GitHub},

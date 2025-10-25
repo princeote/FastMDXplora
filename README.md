@@ -1,4 +1,4 @@
-![FastMDAnalysis Banner](data/FastMDAnalysis_Banner.png)
+![FastMDAnalysis Banner](assets/FastMDAnalysis_Banner.png)
 
 [![Tests](https://github.com/aai-research-lab/FastMDAnalysis/actions/workflows/test.yml/badge.svg)](https://github.com/aai-research-lab/FastMDAnalysis/actions)
 [![codecov](https://codecov.io/gh/aai-research-lab/FastMDAnalysis/branch/main/graph/badge.svg)](https://codecov.io/gh/aai-research-lab/FastMDAnalysis)

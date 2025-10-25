@@ -20,9 +20,8 @@ jobs:
       # Run tests with coverage
       - run: pytest -q --cov=fastmdanalysis --cov-report=xml
       
-      # Upload to Codecov
+      # Upload to Codecov (no token needed)
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3
         with:
           file: ./coverage.xml
-          fail_ci_if_error: true

@@ -1,4 +1,5 @@
-# FastMDAnalysis
+![FastMDAnalysis Banner](data/FastMDAnalysis_Banner.png)
+
 [![Tests](https://github.com/aai-research-lab/FastMDAnalysis/actions/workflows/test.yml/badge.svg)](https://github.com/aai-research-lab/FastMDAnalysis/actions)
 [![codecov](https://codecov.io/gh/aai-research-lab/FastMDAnalysis/branch/main/graph/badge.svg)](https://codecov.io/gh/aai-research-lab/FastMDAnalysis)
 [![Docs](https://img.shields.io/badge/docs-latest-brightgreen.svg)](https://fastmdanalysis.readthedocs.io/en/latest/)
@@ -7,6 +8,9 @@
 [![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+
+
+# FastMDAnalysis
 **Fully Automated System for Molecular Dynamics Trajectory Analysis**
 
 - Perform a variety of MD analyses in a single line of code.

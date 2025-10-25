@@ -21,11 +21,6 @@
 <!--  Use the Python API or the Command‐Line Interface (CLI) -->
 
 
-# Documentation
-The documentation (with an extensive usage guide) is available [here](https://fastmdanalysis.readthedocs.io).
-
-
-
 
 # Analysis Modules
 | Analysis | Description |
@@ -71,6 +66,11 @@ fastmda rmsf -traj traj.dcd -top top.pdb
 ## Output
 Output includes data files, figures, logs ...
 
+
+# Documentation
+The documentation (with an extensive usage guide) is available [here](https://fastmdanalysis.readthedocs.io).
+
+
 # Contributing
 Contributions are welcome. Please submit a Pull Request. 
 
@@ -97,7 +97,7 @@ Adekunle Aina and Derrick Kwan (2025). *FastMDAnalysis: Software for Automated M
 
 ``FastMDAnalysis`` builds upon excellent open-source libraries to provide its high-performance analysis capabilities and to improve workflow efficiency, accessibility, usability, and reproducibility in molecular dynamics trajectory analysis. We gratefully acknowledge:
 
-- ``MDTraj`` for foundational trajectory reading functionality
+- ``MDTraj`` for foundational trajectory I/O and analysis modules
 - ``NumPy`` for efficient numerical computations
 - ``scikit-learn`` for advanced machine learning algorithms
 - ``Matplotlib`` for publication-quality visualization

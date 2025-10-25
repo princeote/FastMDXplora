@@ -11,7 +11,7 @@
 
 - Perform a variety of MD analyses in a single line of code.
 <!-- Simplify your workflow by loading a trajectory once (with options for frame and atom selection) and then performing multiple analyses without repeating input file details. --> 
-- Automatically generate publication-ready figures (with options for customization).
+- Automatically generate publication-quality figures (with options for customization).
 
 - Use the Python API or the Command‐Line Interface (CLI). 
 
@@ -85,7 +85,15 @@ Adekunle Aina (2025). *FastMDAnalysis: Software for Automated Molecular Dynamics
 
 `FastMDAnalysis` is licensed under the MIT license. 
 
-
 # Acknowledgements
 
-FastMDAnalysis leverages `MDTraj` for trajectory analysis. It also relies on Python libraries such as `NumPy`, `scikit-learn`, and `Matplotlib` for data processing and visualization. Special thanks to the community for their continuous support and contributions.
+``FastMDAnalysis`` builds upon excellent open-source libraries to provide its high-performance analysis capabilities and to improve workflow efficiency, accessibility, usability, and reproducibility in molecular dynamics trajectory analysis. We gratefully acknowledge:
+
+- ``MDTraj`` for foundational trajectory reading functionality
+- ``NumPy`` for efficient numerical computations
+- ``scikit-learn`` for advanced machine learning algorithms
+- ``Matplotlib`` for publication-quality visualization
+
+While leveraging these robust tools, ``FastMDAnalysis`` streamlines analysis for students, professionals, and researchers, especially those new to molecular dynamics. We thank the scientific Python community for their contributions to the ecosystem.
+
+

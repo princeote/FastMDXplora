@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 import glob
+import warnings
 
 import mdtraj as md
-
 
 PathLike = Union[str, Path]
 
@@ -67,8 +67,20 @@ def load_trajectory(
     if not traj_files:
         raise FileNotFoundError(f"No trajectory files found from input: {traj}")
 
-    # Load and concatenate in order
-    trajs = [md.load(str(p), top=str(top_path)) for p in traj_files]
+    # Load and concatenate in order.
+    # Suppress benign CRYST1 unit-cell warnings from MDTraj when reading PDB tops.
+    trajs = []
+    for p in traj_files:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Unlikely unit cell vectors detected.*CRYST1",
+                category=UserWarning,
+                module=r"mdtraj\.formats\.pdb\.pdbfile",
+            )
+            t_part = md.load(str(p), top=str(top_path))
+        trajs.append(t_part)
+
     t = trajs[0]
     for more in trajs[1:]:
         t = t.join(more)  # concatenate along time axis
@@ -86,4 +98,3 @@ def load_trajectory(
         t = t.atom_slice(idx, inplace=False)
 
     return t
-

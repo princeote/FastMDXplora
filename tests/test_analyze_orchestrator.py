@@ -52,3 +52,30 @@ def test_slides_hook_monkeypatched(tmp_path, monkeypatch):
     res = fmda.analyze(include=["rmsd"], slides=True, verbose=False)
     assert "slides" in res and res["slides"].ok
 
+from pathlib import Path
+
+def test_slides_moves_deck_into_output(tmp_path, fastmda, monkeypatch):
+    # Collect everything under a temp output dir
+    outdir = tmp_path / "collect"
+
+    # Return duplicates -> analyzer should de-dupe before calling slide_show
+    def fake_gather(roots, since_epoch=None):
+        return [tmp_path / "img1.png", tmp_path / "img1.png", tmp_path / "img2.png"]
+
+    monkeypatch.setattr("fastmdanalysis.analysis.analyze.gather_figures", fake_gather)
+
+    # Write deck OUTSIDE the analyze output dir so relocation branch runs
+    def fake_slide_show(images, outpath=None, title=None, subtitle=None):
+        assert len(images) == 2  # de-duped
+        p = tmp_path / "elsewhere" / "deck.pptx"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"fake")
+        return p
+
+    monkeypatch.setattr("fastmdanalysis.analysis.analyze.slide_show", fake_slide_show)
+
+    res = fastmda.analyze(include=["rmsd"], slides=True, verbose=False, output=outdir)
+    assert "slides" in res and res["slides"].ok
+    # Deck should now live under our output folder
+    assert Path(res["slides"].value).parent.resolve() == outdir.resolve()
+

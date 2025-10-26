@@ -46,3 +46,18 @@ def fastmda(dataset_paths):
     traj_path, top_path = dataset_paths
     # Same frame stride for consistency with 'traj' fixture
     return FastMDAnalysis(traj_path, top_path, frames=(0, None, 10), atoms="protein")
+
+# --- Compatibility fixture: behave like pytest-matplotlib's `matplotlib` ---
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import pytest
+
+@pytest.fixture
+def matplotlib(mpl_test_settings):
+    """Provide a minimal 'matplotlib' fixture without requiring pytest-matplotlib."""
+    try:
+        yield matplotlib
+    finally:
+        plt.close("all")
+

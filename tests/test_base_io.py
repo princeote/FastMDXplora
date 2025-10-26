@@ -26,3 +26,23 @@ def test_save_plot(tmp_path, matplotlib):
     out = d._save_plot(fig, "fig")
     assert Path(out).exists()
 
+import mdtraj as md
+import numpy as np
+import pytest
+from fastmdanalysis.utils import load_trajectory
+
+def test_load_trajectory_with_atom_selection(dataset_paths):
+    traj_path, top_path = dataset_paths
+    # Load a small stride for speed
+    t_all = load_trajectory(traj_path, top_path, frames=(0, None, 10))
+    sel = t_all.topology.select("protein and name CA")
+    t_sel = load_trajectory(traj_path, top_path, frames=(0, None, 10), atoms="protein and name CA")
+    assert t_sel.topology.n_atoms == sel.size
+    # frame slicing preserved
+    assert t_sel.n_frames == t_all.n_frames
+
+def test_load_trajectory_bad_selection_raises(dataset_paths):
+    traj_path, top_path = dataset_paths
+    with pytest.raises(ValueError):
+        load_trajectory(traj_path, top_path, atoms="name DOES_NOT_EXIST_XXX")
+

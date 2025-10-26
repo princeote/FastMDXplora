@@ -112,22 +112,31 @@ def _final_list(
     return candidates
 
 
-def _filter_kwargs(callable_obj, kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+def _filter_kwargs_and_unknown(callable_obj, kwargs: Mapping[str, Any]) -> Tuple[Dict[str, Any], set]:
     """
-    Only pass keyword arguments that the callable actually accepts.
-    If the callable has **kwargs, pass everything through unchanged.
+    Return (kwargs_to_pass, unknown_keys). Even if the callable accepts **kwargs,
+    we still compute 'unknown' by comparing against named parameters so callers
+    get a warning when they pass unsupported options.
     """
     if not kwargs:
-        return {}
+        return {}, set()
     sig = inspect.signature(callable_obj)
-    if any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
-        return dict(kwargs)
+    accepts_variadic = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+
     accepted = {
         name
         for name, p in sig.parameters.items()
         if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
     }
-    return {k: v for k, v in kwargs.items() if k in accepted}
+    unknown = set(kwargs.keys()) - accepted
+
+    if accepts_variadic:
+        # Pass everything through, but still report 'unknown'
+        return dict(kwargs), unknown
+    else:
+        filtered = {k: v for k, v in kwargs.items() if k in accepted}
+        dropped = set(kwargs.keys()) - set(filtered.keys())
+        return filtered, dropped
 
 
 def _unique_path(dest: Path) -> Path:
@@ -146,6 +155,22 @@ def _unique_path(dest: Path) -> Path:
         if not candidate.exists():
             return candidate
         i += 1
+
+
+def _dedupe_paths(paths: Sequence[Union[str, Path]]) -> List[Path]:
+    """Deduplicate a sequence of paths while preserving order (by resolved path string)."""
+    seen: set[str] = set()
+    out: List[Path] = []
+    for p in paths:
+        pp = Path(p)
+        try:
+            key = str(pp.resolve())
+        except Exception:
+            key = str(pp)
+        if key not in seen:
+            seen.add(key)
+            out.append(pp)
+    return out
 
 
 def _print_summary(results: Dict[str, AnalysisResult], analyze_outdir: Path) -> None:
@@ -179,7 +204,6 @@ def _inject_cluster_defaults(self, opts: Dict[str, Dict[str, Any]], plan: Sequen
     # methods default: all
     methods = ck.get("methods", "all")
     if isinstance(methods, str):
-        # Allow comma-separated string; normalize
         methods_list = [m.strip().lower() for m in methods.split(",")]
     else:
         methods_list = [str(m).lower() for m in methods]
@@ -194,7 +218,6 @@ def _inject_cluster_defaults(self, opts: Dict[str, Dict[str, Any]], plan: Sequen
             n_frames = int(getattr(self.traj, "n_frames", 0))
         except Exception:
             n_frames = 0
-        # Heuristic: clamp between 2 and 6; ~sqrt(n_frames/10) if available, else 3
         if n_frames > 0:
             guess = max(2, min(6, int(round(math.sqrt(max(1.0, n_frames / 10.0))))))
         else:
@@ -255,12 +278,12 @@ def run(
             warnings.warn(f"Skipping '{name}' (not implemented on this instance).")
             continue
 
-        kw = _filter_kwargs(fn, opts.get(name, {}))
+        user_opts = opts.get(name, {})
+        kw, unknown = _filter_kwargs_and_unknown(fn, user_opts)
 
-        if verbose and opts.get(name):
-            dropped = set(opts[name].keys()) - set(kw.keys())
-            if dropped:
-                warnings.warn(f"Ignoring unsupported options for '{name}': {sorted(dropped)}")
+        # Always warn on unsupported options (even if the method accepts **kwargs)
+        if unknown:
+            warnings.warn(f"Ignoring unsupported options for '{name}': {sorted(unknown)}")
 
         if verbose:
             print(f"  • {name}() ...", end="", flush=True)
@@ -296,10 +319,8 @@ def run(
     for name, src_dir in per_analysis_outdirs.items():
         if src_dir.exists():
             dest_dir = analyze_outdir / name
-            # ensure unique (won't clobber prior runs)
             if dest_dir.exists():
                 dest_dir = _unique_path(dest_dir)
-            # Skip if already there
             try:
                 if src_dir.resolve() == dest_dir.resolve():
                     moved_dirs.append(dest_dir)
@@ -309,7 +330,6 @@ def run(
             dest_dir.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src_dir), str(dest_dir))
             moved_dirs.append(dest_dir)
-            # Patch the analysis object's outdir if available
             if results[name].ok and results[name].value is not None:
                 try:
                     setattr(results[name].value, "outdir", dest_dir)
@@ -318,27 +338,27 @@ def run(
             if results[name].value is None:
                 results[name].value = {"outdir": dest_dir}
 
-    # ---- Slides: create AFTER moving, scanning only moved_dirs (no duplicates)
+    # ---- Slides: create AFTER moving, scanning only moved_dirs (dedup inputs) -
     if slides:
         t0 = time.perf_counter()
         try:
-            # Only scan the folders produced in THIS run
             roots: List[Union[str, Path]] = moved_dirs.copy()
-            images = gather_figures(roots, since_epoch=run_t0 - 5)  # tolerant window
+            images = gather_figures(roots, since_epoch=run_t0 - 5)
+            images = _dedupe_paths(images)  # ensure no duplicates reach slide_show
 
             if not images:
                 raise FileNotFoundError("No figures found to include in slide deck.")
 
-            # Let slideshow pick a timestamped name, then we relocate if needed
-            deck_path = slide_show(
-                images=images,
-                outpath=None,
-                title="FastMDAnalysis — Analysis Slides",
-                subtitle=f"{len(images)} figure(s) — generated {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            # Build deck (let slideshow name it), then relocate into analyze_outdir
+            deck_path = Path(
+                slide_show(
+                    images=images,
+                    outpath=None,
+                    title="FastMDAnalysis — Analysis Slides",
+                    subtitle=f"{len(images)} figure(s) — generated {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                )
             )
-            deck_path = Path(deck_path)
 
-            # Move deck into analyze_outdir if not already there
             if deck_path.parent.resolve() != analyze_outdir.resolve():
                 dest = analyze_outdir / deck_path.name
                 if dest.exists():

@@ -70,14 +70,10 @@ exclude = [
 
 # ----------------------------- Pytest config ----------------------------------
 [tool.pytest.ini_options]
-# What to collect
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-
-# Default options
 addopts = "-ra --strict-markers --disable-warnings"
 
-# Markers used in the suite
 markers = [
   "slow: time-consuming tests (run with -m slow or exclude with -m 'not slow')",
   "cli: tests that invoke the command-line interface",

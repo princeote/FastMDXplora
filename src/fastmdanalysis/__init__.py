@@ -6,13 +6,12 @@ Documentation: https://fastmdanalysis.readthedocs.io/en/latest/
 
 FastMDAnalysis Package Initialization
 
-This version of FastMDAnalysis allows you to instantiate a single object by providing
-the trajectory and topology file paths, along with optional parameters for frame and atom selection.
-Frame selection is specified as an iterable with three elements (start, stop, stride); negative indices are supported—
-e.g. using frames=(-10, -1, 1) or frames=[-10, -1, 1] will select frames from (n_frames - 10) to the last frame.
-An atom selection string may also be provided to use a specific subset of atoms.
-All subsequent analyses (rmsd, rmsf, rg, hbonds, cluster, ss, sasa, dimred) use the pre-loaded
-trajectory and default atom selection unless overridden.
+Instantiate a single object by providing the trajectory and topology file paths,
+optionally with frame and atom selection. Frame selection is an iterable
+(start, stop, stride) and supports None and negative indices. An MDTraj atom
+selection string may also be provided. All subsequent analyses (rmsd, rmsf, rg,
+hbonds, cluster, ss, sasa, dimred) use the pre-loaded trajectory and default
+atom selection unless overridden per-call.
 """
 
 from __future__ import annotations
@@ -20,19 +19,19 @@ from __future__ import annotations
 from typing import Optional, Tuple, Union, Sequence
 import logging
 
-import mdtraj as md  # noqa: F401
+import mdtraj as md  # noqa: F401  (exposed for convenience)
 from .analysis import rmsd, rmsf, rg, hbonds, cluster, ss, dimred, sasa
-from .utils import load_trajectory  # Extended utility supporting multiple files.
+from .utils import load_trajectory  # supports multiple file patterns
 
 # -----------------------------------------------------------------------------
 # Package logging: install a NullHandler so library users don't get warnings.
-# The CLI configures handlers/levels; library users can configure logging as well.
+# The CLI configures handlers/levels; library users can configure logging too.
 # -----------------------------------------------------------------------------
 _pkg_logger = logging.getLogger("fastmdanalysis")
 if not _pkg_logger.handlers:
     _pkg_logger.addHandler(logging.NullHandler())
 
-# Expose analysis classes.
+# Expose analysis classes at package level.
 RMSDAnalysis = rmsd.RMSDAnalysis
 RMSFAnalysis = rmsf.RMSFAnalysis
 RGAnalysis = rg.RGAnalysis
@@ -99,9 +98,9 @@ class FastMDAnalysis:
     """
     Main API class for MD trajectory analysis.
 
-    This class loads an MD trajectory from file paths and optionally subsets the trajectory (frames)
-    and the set of atoms used (atom selection). These default selections are then applied to all analyses,
-    although each analysis method can override them if desired.
+    Loads an MD trajectory from file paths and optionally subsets the trajectory
+    (frames) and atoms (MDTraj selection). These defaults apply to all analyses,
+    but each analysis method can override `atoms`.
 
     Parameters
     ----------
@@ -114,8 +113,7 @@ class FastMDAnalysis:
         For example, (-10, -1, 1) selects frames from (n_frames - 10) through the last frame.
         If None, the entire trajectory is used.
     atoms : str or None, optional
-        An MDTraj atom selection string (e.g., "protein" or "protein and name CA") specifying which atoms to use.
-        If None, all atoms are used.
+        MDTraj atom selection string (e.g., "protein" or "protein and name CA").
 
     Examples
     --------
@@ -125,7 +123,7 @@ class FastMDAnalysis:
     """
 
     def __init__(self, traj_file: str, top_file: str, frames=None, atoms: Optional[str] = None):
-        # Load the full trajectory first (keeps load_trajectory signature simple/compatible).
+        # Load the full trajectory (supports multi-file inputs via load_trajectory).
         self.full_traj = load_trajectory(traj_file, top_file)
 
         # Subset frames via native slicing semantics (handles None and negatives).
@@ -139,21 +137,17 @@ class FastMDAnalysis:
         # Store defaults for later analyses
         self.default_atoms = atoms
 
-        # Optional: common output/figure dirs other utilities may look for
-        # (these attributes are probed by the slides utility in analyze.py)
+        # Optional: locations other utilities may probe (e.g., slides)
         self.figdir = getattr(self, "figdir", "figures")
         self.outdir = getattr(self, "outdir", "results")
 
     def _get_atoms(self, specific_atoms: Optional[str]) -> Optional[str]:
-        """
-        Determine the atom selection string to use; prefer per-call override,
-        else fall back to the default selection provided at initialization.
-        """
+        """Prefer per-call atom selection; otherwise, use the default."""
         return specific_atoms if specific_atoms is not None else self.default_atoms
 
     # ----------------------------- Analyses -----------------------------------
 
-    def rmsd(self, reference_frame: Optional[int] = None, ref: Optional[int] = None, atoms: Optional[str] = None, **kwargs):
+    def rmsd(self, reference_frame: Optional[int] = None, ref: Optional[int] = None, atoms: Optional[str] = None):
         """
         Run RMSD analysis on the stored trajectory.
 
@@ -164,90 +158,79 @@ class FastMDAnalysis:
             Both names are accepted; `ref` overrides if both provided.
         atoms : str, optional
             Atom selection string for this analysis. If not provided, uses the default atom selection.
-        kwargs : dict
-            Additional keyword arguments to pass to RMSDAnalysis.
 
         Returns
         -------
         RMSDAnalysis
-            An RMSDAnalysis instance containing the computed results.
         """
         a = self._get_atoms(atoms)
         rf = ref if ref is not None else (reference_frame if reference_frame is not None else 0)
-        analysis = RMSDAnalysis(self.traj, reference_frame=rf, atoms=a, **kwargs)
+        analysis = RMSDAnalysis(self.traj, reference_frame=rf, atoms=a)
         analysis.run()
         return analysis
 
-    def rmsf(self, atoms: Optional[str] = None, **kwargs):
-        """
-        Run RMSF analysis on the stored trajectory.
-        """
+    def rmsf(self, atoms: Optional[str] = None):
+        """Run RMSF analysis on the stored trajectory."""
         a = self._get_atoms(atoms)
-        analysis = RMSFAnalysis(self.traj, atoms=a, **kwargs)
+        analysis = RMSFAnalysis(self.traj, atoms=a)
         analysis.run()
         return analysis
 
-    def rg(self, atoms: Optional[str] = None, **kwargs):
-        """
-        Run Radius of Gyration (RG) analysis.
-        """
+    def rg(self, atoms: Optional[str] = None):
+        """Run Radius of Gyration (RG) analysis."""
         a = self._get_atoms(atoms)
-        analysis = RGAnalysis(self.traj, atoms=a, **kwargs)
+        analysis = RGAnalysis(self.traj, atoms=a)
         analysis.run()
         return analysis
 
-    def hbonds(self, atoms: Optional[str] = None, **kwargs):
-        """
-        Run Hydrogen Bonds (HBonds) analysis.
-        """
+    def hbonds(self, atoms: Optional[str] = None):
+        """Run Hydrogen Bonds (HBonds) analysis."""
         a = self._get_atoms(atoms)
-        analysis = HBondsAnalysis(self.traj, atoms=a, **kwargs)
+        analysis = HBondsAnalysis(self.traj, atoms=a)
         analysis.run()
         return analysis
 
     def cluster(
         self,
-        methods="dbscan",
+        methods="all",
         eps: float = 0.5,
         min_samples: int = 5,
         n_clusters: Optional[int] = None,
         atoms: Optional[str] = None,
-        **kwargs
     ):
         """
         Run clustering analysis on the stored trajectory.
+
+        Notes
+        -----
+        - `methods="all"` applies DBSCAN, KMeans, and Hierarchical (where applicable).
+        - If `n_clusters` is None, the analysis may infer a reasonable value (see ClusterAnalysis).
         """
         a = self._get_atoms(atoms)
         analysis = ClusterAnalysis(
-            self.traj, methods=methods, eps=eps, min_samples=min_samples, n_clusters=n_clusters, atoms=a, **kwargs
+            self.traj, methods=methods, eps=eps, min_samples=min_samples, n_clusters=n_clusters, atoms=a
         )
         analysis.run()
         return analysis
 
-    def ss(self, atoms: Optional[str] = None, **kwargs):
-        """
-        Run Secondary Structure (SS) analysis on the stored trajectory.
-        """
+    def ss(self, atoms: Optional[str] = None):
+        """Run Secondary Structure (SS) analysis on the stored trajectory."""
         a = self._get_atoms(atoms)
-        analysis = SSAnalysis(self.traj, atoms=a, **kwargs)
+        analysis = SSAnalysis(self.traj, atoms=a)
         analysis.run()
         return analysis
 
-    def sasa(self, probe_radius: float = 0.14, atoms: Optional[str] = None, **kwargs):
-        """
-        Run Solvent Accessible Surface Area (SASA) analysis on the stored trajectory.
-        """
+    def sasa(self, probe_radius: float = 0.14, atoms: Optional[str] = None):
+        """Run Solvent Accessible Surface Area (SASA) analysis."""
         a = self._get_atoms(atoms)
-        analysis = SASAAnalysis(self.traj, probe_radius=probe_radius, atoms=a, **kwargs)
+        analysis = SASAAnalysis(self.traj, probe_radius=probe_radius, atoms=a)
         analysis.run()
         return analysis
 
-    def dimred(self, methods="all", atoms: Optional[str] = None, **kwargs):
-        """
-        Run dimensionality reduction analysis on the stored trajectory.
-        """
+    def dimred(self, methods="all", atoms: Optional[str] = None):
+        """Run dimensionality reduction analysis on the stored trajectory."""
         a = self._get_atoms(atoms)
-        analysis = DimRedAnalysis(self.traj, methods=methods, atoms=a, **kwargs)
+        analysis = DimRedAnalysis(self.traj, methods=methods, atoms=a)
         analysis.run()
         return analysis
 

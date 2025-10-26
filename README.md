@@ -44,24 +44,109 @@ pip install fastmdanalysis
 
 
 # Usage
-## Python API
-Instantiate a `FastMDAnalysis` object with your trajectory and topology file paths. Optionally, specify frame selection and atom selection. Frame selection is provided as a tuple (start, stop, stride). Negative indices (e.g., -1 for the last frame) are supported. If no options are provided, the entire trajectory and all atoms are used by default.
-
-**RMSD Analysis:**
-```python
-from fastmdanalysis import FastMDAnalysis
-fastmda = FastMDAnalysis("traj.dcd", "top.pdb")
-fastmda.rmsd()
-```
-
 
 ## Command-Line Interface (CLI) 
-After installation, you can run ``FastMDAnalysis`` from the command line using the `fastmda` command. Global options allow you to specify the trajectory, topology, frame selection, and atom selection.
+After installation, you can run ``FastMDAnalysis`` from the command line using the `fastmda` command. Global options allow you to specify the trajectory and topology file paths.
+Optionally, specify frame selection and atom selection. Frame selection is provided as a tuple (start, stop, stride). Negative indices (e.g., -1 for the last frame) are supported. If no options are provided, the entire trajectory and all atoms are used by default.
 
-**RMSF Analysis:**
+**(Recommended) Run the ``analyze`` orchestrator to execute multiple analyses in one go.**
 ```bash
-fastmda rmsf -traj traj.dcd -top top.pdb 
+# Run all available analyses
+fastmda analyze -traj path/to/trajectory -top path/to/topology
 ```
+```bash
+# Include/Exclude specific analyses
+fastmda analyze -traj traj.dcd -top top.pdb --include rmsd rg
+fastmda analyze -traj traj.dcd -top top.pdb --exclude sasa dimred cluster
+
+# Supply options via file (YAML or JSON)
+fastmda analyze -traj traj.dcd -top top.pdb --options options.yaml
+
+# Create a slide deck from generated figures
+fastmda analyze -traj traj.dcd -top top.pdb --options options.yaml --slides
+# or save to a specific path
+fastmda analyze -traj traj.dcd -top top.pdb --options options.yaml --slides results.pptx
+```
+
+
+**Global flags:**
+- ``--frames start,stop,stride`` (e.g., ``0,-1,10``)
+- ``--atoms "MDTraj selection"`` (e.g., ``protein and name CA``)
+- ``--output DIR`` (output directory name)
+- ``--verbose`` (prints progress and writes logs under ``<command>_output/`` unless ``--output`` is set)
+
+**Show help:**
+- ``fastmda -h``
+- ``fastmda analyze -h``
+
+
+
+**Options file (schema)**
+
+Provide per-analysis keyword arguments in a single file. CLI and Python API share the same schema:
+```yaml
+# options.yaml
+rmsd:
+  ref: 0
+  align: true
+rg:
+  by_chain: false
+cluster:
+  methods: [dbscan, hierarchical]
+  n_clusters: 5
+  eps: 0.6
+  min_samples: 8
+```
+JSON is also supported. If using YAML, ensure PyYAML is installed.
+
+**Slides:**
+- ``--slides`` creates ``fastmda_slides_<ddmmyy.HHMM>.pptx`` in the CWD.
+- ``--slides path/to/deck.pptx`` writes to an explicit filename.
+
+**Single-analysis commands (legacy, still available)**
+```bash
+fastmda rmsd   -traj traj.dcd -top top.pdb --ref 0     # aliases: --reference-frame, -ref
+fastmda rmsf   -traj traj.dcd -top top.pdb
+fastmda rg     -traj traj.dcd -top top.pdb
+fastmda hbonds -traj traj.dcd -top top.pdb
+fastmda cluster -traj traj.dcd -top top.pdb --methods kmeans dbscan --eps 0.5 --min_samples 8
+```
+
+
+## Python API
+Instantiate a `FastMDAnalysis` object with your trajectory and topology file paths. 
+
+**Run the ``analyze`` orchestrator to execute all available analyses.**
+```python
+from fastmdanalysis import FastMDAnalysis
+from fastmdanalysis.datasets import TrpCage  
+
+fastmda = FastMDAnalysis(TrpCage.traj, TrpCage.top)
+fastmda.analyze()
+```
+
+**Include or Exclude specific analyses; specify options, generate slides**
+```python
+from fastmdanalysis import FastMDAnalysis
+from fastmdanalysis.datasets import TrpCage  # optional helper
+
+fastmda = FastMDAnalysis(TrpCage.traj, TrpCage.top)
+result = fastmda.analyze(
+    include=["rmsd", "rg"],                 # or exclude=[...]; omit to run all
+    options={"rmsd": {"ref": 0, "align": True}},
+    slides=True                             # or slides="results.pptx"
+)
+
+# (Optional) Access per-analysis outputs
+rmsd_result = result["rmsd"].value          # object/type depends on analysis
+slides   = result.get("slides")             # AnalysisResult; .ok and .value (path)
+```
+
+**Notes**
+- Figures are saved during each analysis; slide decks include all figures produced in the run.
+- MDTraj may emit benign warnings (e.g., dummy CRYST1 records); they do not affect results.
+
+
 
 ## Output
 Output includes data files, figures, logs ...

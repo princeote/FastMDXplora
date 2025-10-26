@@ -41,10 +41,14 @@ jobs:
             --cov-fail-under=80
           ls -l coverage.xml
 
+      # Upload from only ONE job to avoid rate limits (no token)
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        uses: codecov/codecov-action@v4
         with:
-          file: ./coverage.xml
+          files: ./coverage.xml
+          flags: unittests
+          fail_ci_if_error: false
 
       - name: Upload test artifacts on failure
         if: failure()

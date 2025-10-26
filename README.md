@@ -7,6 +7,8 @@
 [![PyPI](https://img.shields.io/pypi/v/fastmdanalysis)](https://pypi.org/project/fastmdanalysis/)
 [![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://github.com/aai-research-lab/FastMDAnalysis/actions/workflows/test.yml/badge.svg)](…)
+[![codecov](https://codecov.io/gh/aai-research-lab/FastMDAnalysis/branch/main/graph/badge.svg)](…)
 
 ---
 # Highlights

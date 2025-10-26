@@ -26,25 +26,32 @@ dependencies = [
   "matplotlib>=3.5.0",
   "scikit-learn>=1.0.0",
   "scipy>=1.10",
-  "python-pptx>=0.6.21",
-  "Pillow>=10.0",
-  "cairosvg>=2.7",
-  "PyYAML>=6.0"
+  "python-pptx>=0.6.21",   # slide deck generation
+  "Pillow>=10.0",          # image handling for slides
+  "cairosvg>=2.7",         # SVG -> PNG for slides when needed
+  "PyYAML>=6.0"            # --options file loading
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
-test = ["pytest>=7.0"]
+dev = [
+  "pytest>=7.0",
+  "pytest-cov>=4.0"
+]
+test = [
+  "pytest>=7.0",
+  "pytest-cov>=4.0"
+]
 
 [project.urls]
-Repository = "https://github.com/aai-research-lab/fastmdanalysis"
+Repository = "https://github.com/aai-research-lab/FastMDAnalysis"
 Documentation = "https://fastmdanalysis.readthedocs.io"
-Issues = "https://github.com/aai-research-lab/fastmdanalysis/issues"
+Issues = "https://github.com/aai-research-lab/FastMDAnalysis/issues"
 
 [project.scripts]
-fastmda = "fastmdanalysis.cli:main"
+# Explicit module:function entrypoint
+fastmda = "fastmdanalysis.cli.main:main"
 
-# Package top-level directory
+# Package discovery for src/ layout
 [tool.hatch.build.targets.wheel]
 packages = ["src/fastmdanalysis"]
 
@@ -55,7 +62,13 @@ include = [
   "README.md",
   "LICENSE"
 ]
+exclude = [
+  "src/fastmdanalysis/**/old_*",
+  "src/fastmdanalysis/**/old_*/**",
+  ".github/workflows/old_*"
+]
 
+# ----------------------------- Pytest config ----------------------------------
 [tool.pytest.ini_options]
 # What to collect
 testpaths = ["tests"]
@@ -77,3 +90,20 @@ filterwarnings = [
   "ignore:.*deprecated.*:DeprecationWarning"
 ]
 
+# ----------------------------- Coverage config --------------------------------
+[tool.coverage.run]
+source = ["src/fastmdanalysis"]
+branch = true
+omit = [
+  "src/fastmdanalysis/__main__.py",            # tiny entry point
+  "src/fastmdanalysis/cli/*",                  # CLI is integration-heavy; add tests later
+  "src/fastmdanalysis/utils/slideshow.py"      # relies on python-pptx & FS; test later with fakes
+]
+
+[tool.coverage.report]
+show_missing = true
+precision = 1
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:"
+]

@@ -6,14 +6,8 @@ Calculates the Root-Mean-Square Fluctuation (RMSF) for each atom in an MD
 trajectory. If an atom selection is provided, only those atoms are analyzed;
 otherwise, all atoms are used. The analysis computes the fluctuations relative
 to the average structure, saves the computed data, and automatically generates
-a bar plot. The plotter now *auto-thins* crowded x-axis tick labels and can
-label by residue when appropriate.
-
-Typical use (inside FastMDAnalysis):
-------------------------------------
-res = fastmda.rmsf(atoms="protein and name CA")  # computes & plots
-# or re-plot with custom axes:
-res.plot(by="residue", max_ticks=25, rotate=60, filename="rmsf_ca.png")
+a bar plot. The plotter auto-thins crowded x-axis tick labels and can label by
+residue when appropriate.
 """
 from __future__ import annotations
 
@@ -41,7 +35,6 @@ def _infer_residue_labels(residues: Sequence[md.core.residue.Residue]) -> List[s
     labels: List[str] = []
     for r in residues:
         try:
-            # r.resSeq is PDB-style numbering (preferred), fall back to 0-based index
             resnum = getattr(r, "resSeq", None)
             if resnum is None:
                 resnum = r.index
@@ -60,7 +53,6 @@ def _auto_tick_step(n: int, max_ticks: int) -> int:
         return 1
     if n <= max_ticks:
         return 1
-    # ceil(n / max_ticks)
     return int(np.ceil(n / float(max_ticks)))
 
 
@@ -72,7 +64,6 @@ class RMSFAnalysis(BaseAnalysis):
     Per-atom RMSF analysis with an x-axis that stays readable for long selections.
     """
 
-    # ---- Construction --------------------------------------------------------
     def __init__(self, trajectory: md.Trajectory, atoms: Optional[str] = None, **kwargs):
         """
         Parameters
@@ -82,7 +73,7 @@ class RMSFAnalysis(BaseAnalysis):
         atoms
             MDTraj selection string (e.g., "protein and name CA"). If None, all atoms are used.
         kwargs
-            Passed through to BaseAnalysis (e.g., output directories/labels if supported there).
+            Passed through to BaseAnalysis.
         """
         super().__init__(trajectory, **kwargs)
         self.atoms: Optional[str] = atoms
@@ -93,7 +84,6 @@ class RMSFAnalysis(BaseAnalysis):
         self._sel_indices: Optional[np.ndarray] = None      # global atom indices (length N)
         self._sel_residues: Optional[List[md.core.residue.Residue]] = None  # residues for selected atoms
 
-    # ---- Core computation ----------------------------------------------------
     def run(self) -> Dict[str, np.ndarray]:
         """
         Compute RMSF (nm) for each selected atom relative to the average structure.
@@ -113,10 +103,9 @@ class RMSFAnalysis(BaseAnalysis):
                 self._sel_indices = np.asarray(sel, dtype=int)
             else:
                 subtraj = self.traj
-                # Use global indices 0..N-1 when plotting (display as 1..N by default)
                 self._sel_indices = None
 
-            # Track residue list for labeling (aligned to subtraj atoms)
+            # Residues for labeling (aligned to subtraj atoms)
             try:
                 self._sel_residues = [atom.residue for atom in subtraj.topology.atoms]
             except Exception:
@@ -127,11 +116,11 @@ class RMSFAnalysis(BaseAnalysis):
             ref = md.Trajectory(avg_xyz, subtraj.topology)
 
             # Per-atom RMSF (nm) relative to average structure
-            rmsf_values = md.rmsf(subtraj, ref)  # returns shape (N,)
+            rmsf_values = md.rmsf(subtraj, ref)  # shape (N,)
             self.data = rmsf_values.reshape(-1, 1)
             self.results = {"rmsf": self.data}
 
-            # Persist data and make a default plot
+            # Save data and a default plot
             self._save_data(self.data, "rmsf")
             self.plot()
 
@@ -141,7 +130,6 @@ class RMSFAnalysis(BaseAnalysis):
         except Exception as e:
             raise AnalysisError(f"RMSF analysis failed: {e}")
 
-    # ---- Plotting ------------------------------------------------------------
     def plot(
         self,
         data: Optional[Union[Sequence[float], np.ndarray]] = None,
@@ -160,25 +148,11 @@ class RMSFAnalysis(BaseAnalysis):
         """
         Generate a bar plot of RMSF with a readable x-axis.
 
-        Parameters
-        ----------
-        data
-            RMSF values to plot. If None, uses computed data from run().
-        by
-            'auto' chooses 'residue' if residue info is available and N>60; else 'atom'.
-        max_ticks
-            Target maximum number of x tick labels (used when tick_step is None).
-        tick_step
-            Force showing every Nth tick. If provided, overrides max_ticks heuristic.
-        rotate
-            Rotation angle for x-tick labels (degrees).
-        figsize, title, xlabel, ylabel, color, filename
-            Usual matplotlib/IO controls. If xlabel is None, it is inferred from 'by'.
-
-        Returns
-        -------
-        Path
-            File path of the saved plot image.
+        Notes
+        -----
+        `filename` is supported when BaseAnalysis._save_plot accepts it. If your
+        BaseAnalysis only supports `_save_plot(fig, key)`, we gracefully fall back
+        and still honor `filename` by saving the figure directly.
         """
         if data is None:
             data = self.data
@@ -200,7 +174,6 @@ class RMSFAnalysis(BaseAnalysis):
             labels_all = _infer_residue_labels(self._sel_residues)
             xlabel_eff = "Residue"
         else:
-            # Prefer global atom indices if selection was provided; else 1..N
             if self._sel_indices is not None and len(self._sel_indices) == n:
                 labels_all = [str(int(k)) for k in self._sel_indices]
             else:
@@ -226,11 +199,27 @@ class RMSFAnalysis(BaseAnalysis):
         ax.set_xticks(ticks)
         ax.set_xticklabels(ticklabels, rotation=rotate, ha="right")
 
-        # Subtle grid: y prominent, x light for readability
         ax.grid(axis="y", alpha=0.3)
         ax.grid(axis="x", alpha=0.12)
 
         fig.tight_layout()
-        outpath = self._save_plot(fig, "rmsf", filename=filename)
+
+        # Save with backward-compatible behavior
+        try:
+            # Newer BaseAnalysis accepting filename
+            outpath = self._save_plot(fig, "rmsf", filename=filename)  # type: ignore[arg-type]
+        except TypeError:
+            # Older BaseAnalysis: only (fig, key) supported
+            # Save via BaseAnalysis default first
+            out_default = Path(self._save_plot(fig, "rmsf"))
+            outpath = out_default
+            # If a custom filename is requested, save the figure again to that name in the same directory
+            if filename and filename != out_default.name:
+                custom = out_default.with_name(filename)
+                # Save directly; overwrite if exists
+                fig.savefig(custom, dpi=300, bbox_inches="tight")
+                outpath = custom
+
         plt.close(fig)
-        return outpath
+        return Path(outpath)
+

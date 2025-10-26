@@ -1,6 +1,9 @@
-name: CI
+name: test
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
 
 jobs:
   tests:
@@ -19,16 +22,15 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: |
+            pyproject.toml
 
       - name: Upgrade pip
         run: python -m pip install -U pip
 
-      # Editable install for speed + accurate coverage source mapping
       - name: Install project (editable) + test deps
         run: python -m pip install -e . pytest pytest-cov
 
-      # Environment knobs useful for headless plotting
       - name: Run tests (fast subset) with coverage
         env:
           MPLBACKEND: Agg
@@ -77,8 +79,10 @@ jobs:
         run: python -m pip install dist/*.whl
 
       - name: Smoke test import and CLI help
+        env:
+          MPLBACKEND: Agg
         run: |
-          python -c "import fastmdanalysis as m; print('OK:', m.__version__)"
+          python -c "import fastmdanalysis as m; print('OK:', getattr(m, '__version__', 'unknown'))"
           python -m fastmdanalysis.cli.main -h
           fastmda analyze -h
 

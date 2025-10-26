@@ -57,6 +57,23 @@ include = [
 ]
 
 [tool.pytest.ini_options]
+# What to collect
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+
+# Default options
+addopts = "-ra --strict-markers --disable-warnings"
+
+# Markers used in the suite
+markers = [
+  "slow: time-consuming tests (run with -m slow or exclude with -m 'not slow')",
+  "cli: tests that invoke the command-line interface",
+  "slides: tests that require python-pptx/Pillow and create a deck"
+]
+
+# Silence known benign warnings (MDTraj CRYST1, etc.)
+filterwarnings = [
+  "ignore:Unlikely unit cell vectors detected.*CRYST1:UserWarning:mdtraj.formats.pdb.pdbfile",
+  "ignore:.*deprecated.*:DeprecationWarning"
+]
 

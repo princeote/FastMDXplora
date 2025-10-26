@@ -1,27 +1,84 @@
-name: test
+name: CI
+
 on: [push, pull_request]
+
 jobs:
-  test:
+  tests:
+    name: tests (py${{ matrix.python-version }} • ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.9", "3.10", "3.11", "3.12"]
-    runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: 
+        with:
           python-version: ${{ matrix.python-version }}
-      
-      # Install dependencies
-      - run: pip install -U build pytest pytest-cov
-      - run: python -m build
-      - run: pip install dist/*.whl
-      
-      # Run tests with coverage
-      - run: pytest -q --cov=fastmdanalysis --cov-report=xml
-      
-      # Upload to Codecov (no token needed)
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Upgrade pip
+        run: python -m pip install -U pip
+
+      # Editable install for speed + accurate coverage source mapping
+      - name: Install project (editable) + test deps
+        run: python -m pip install -e . pytest pytest-cov
+
+      # Environment knobs useful for headless plotting
+      - name: Run tests (fast subset) with coverage
+        env:
+          MPLBACKEND: Agg
+        run: |
+          pytest -q -m "not slow" --cov=fastmdanalysis --cov-report=xml
+          ls -l coverage.xml
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3
         with:
           file: ./coverage.xml
+
+      - name: Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts-py${{ matrix.python-version }}-${{ matrix.os }}
+          if-no-files-found: ignore
+          path: |
+            **/*_output/**
+            **/*.log
+            **/fastmda_slides_*.pptx
+
+  package:
+    name: package (wheel+sdist) smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Upgrade pip and build tools
+        run: python -m pip install -U pip build
+
+      - name: Build wheel and sdist
+        run: python -m build
+
+      - name: Show dist
+        run: ls -l dist
+
+      - name: Install wheel
+        run: python -m pip install dist/*.whl
+
+      - name: Smoke test import and CLI help
+        run: |
+          python -c "import fastmdanalysis as m; print('OK:', m.__version__)"
+          python -m fastmdanalysis.cli.main -h
+          fastmda analyze -h
+

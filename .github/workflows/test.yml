@@ -22,8 +22,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: |
-            pyproject.toml
+          cache-dependency-path: pyproject.toml
 
       - name: Upgrade pip
         run: python -m pip install -U pip
@@ -31,7 +30,16 @@ jobs:
       - name: Install project (editable) + test deps
         run: python -m pip install -e ".[test]"
 
-      - name: Run tests (fast subset) with coverage gate
+      # Plain tests for all jobs except 3.11
+      - name: Run tests (fast subset) without coverage
+        if: ${{ matrix.python-version != '3.11' }}
+        env:
+          MPLBACKEND: Agg
+        run: pytest -q -m "not slow"
+
+      # Coverage only on Python 3.11
+      - name: Run tests with coverage gate (only on 3.11)
+        if: ${{ matrix.python-version == '3.11' }}
         env:
           MPLBACKEND: Agg
         run: |
@@ -41,9 +49,9 @@ jobs:
             --cov-fail-under=80
           ls -l coverage.xml
 
-      # Upload from only ONE job to avoid rate limits (no token)
-      - name: Upload coverage to Codecov
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+      # Upload from only ONE job; public repo => no token needed
+      - name: Upload coverage to Codecov (only on 3.11)
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' }}
         uses: codecov/codecov-action@v4
         with:
           files: ./coverage.xml

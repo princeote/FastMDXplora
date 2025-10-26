@@ -47,7 +47,11 @@ Thumbs.db
 .coverage
 htmlcov/
 
-# Working files
+# Working and Old files
 hsp90_casestudy.md
+**/old_*.py
+**/old_*/
+.github/workflows/old_*.yml
+
 # Note
 NOTE

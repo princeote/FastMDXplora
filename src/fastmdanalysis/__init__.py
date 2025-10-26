@@ -303,3 +303,8 @@ class FastMDAnalysis:
         analysis.run()
         return analysis
 
+
+# bind analyze method to FastMDAnalysis
+from .analysis.analyze import analyze as _analyze
+FastMDAnalysis.analyze = _analyze  # adds the bound method
+

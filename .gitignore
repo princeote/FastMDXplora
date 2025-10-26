@@ -29,6 +29,7 @@ demos/
 
 # Slides
 slides/FastMDAnalysis_demo_slides.pptx
+*.pptx
 
 # OS files
 .DS_Store

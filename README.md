@@ -49,23 +49,27 @@ pip install fastmdanalysis
 After installation, you can run ``FastMDAnalysis`` from the command line using the `fastmda` command. Global options allow you to specify the trajectory and topology file paths.
 Optionally, specify frame selection and atom selection. Frame selection is provided as a tuple (start, stop, stride). Negative indices (e.g., -1 for the last frame) are supported. If no options are provided, the entire trajectory and all atoms are used by default.
 
-**(Recommended) Run the ``analyze`` orchestrator to execute multiple analyses in one go.**
+**Run the ``analyze`` orchestrator to execute multiple analyses in one go.**
+
+**Run all available analyses**
 ```bash
-# Run all available analyses
 fastmda analyze -traj path/to/trajectory -top path/to/topology
 ```
+**Include specific analyses**
 ```bash
-# Include/Exclude specific analyses
 fastmda analyze -traj traj.dcd -top top.pdb --include rmsd rg
+```
+**Exclude specific analyses**
+```bash
 fastmda analyze -traj traj.dcd -top top.pdb --exclude sasa dimred cluster
-
-# Supply options via file (YAML or JSON)
+```
+**Supply options via file (YAML or JSON)**
+```bash
 fastmda analyze -traj traj.dcd -top top.pdb --options options.yaml
-
-# Create a slide deck from generated figures
+```
+**Create a slide deck from generated figures**
+```bash
 fastmda analyze -traj traj.dcd -top top.pdb --options options.yaml --slides
-# or save to a specific path
-fastmda analyze -traj traj.dcd -top top.pdb --options options.yaml --slides results.pptx
 ```
 
 
@@ -100,7 +104,7 @@ cluster:
 JSON is also supported. If using YAML, ensure PyYAML is installed.
 
 **Slides:**
-- ``--slides`` creates ``fastmda_slides_<ddmmyy.HHMM>.pptx`` in the CWD.
+- ``--slides`` creates ``fastmda_slides_<ddmmyy.HHMM>.pptx`` in the current working directory.
 - ``--slides path/to/deck.pptx`` writes to an explicit filename.
 
 **Single-analysis commands (legacy, still available)**
@@ -136,8 +140,9 @@ result = fastmda.analyze(
     options={"rmsd": {"ref": 0, "align": True}},
     slides=True                             # or slides="results.pptx"
 )
-
-# (Optional) Access per-analysis outputs
+```
+**(Optional) Access per-analysis outputs**
+```python
 rmsd_result = result["rmsd"].value          # object/type depends on analysis
 slides   = result.get("slides")             # AnalysisResult; .ok and .value (path)
 ```

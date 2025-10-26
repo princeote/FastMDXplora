@@ -1,4 +1,7 @@
 # tests/conftest.py
+# Enable Matplotlib's built-in pytest fixtures (e.g., `matplotlib`)
+pytest_plugins = ("matplotlib.testing.conftest",)
+
 import warnings
 from pathlib import Path
 import pytest
@@ -43,4 +46,3 @@ def fastmda(dataset_paths):
     traj_path, top_path = dataset_paths
     # Same frame stride for consistency with 'traj' fixture
     return FastMDAnalysis(traj_path, top_path, frames=(0, None, 10), atoms="protein")
-

@@ -92,7 +92,7 @@ rmsd:
 rg:
   by_chain: false
 cluster:
-  methods: [dbscan, hierarchical]
+  methods: [kmeans, hierarchical]
   n_clusters: 5
   eps: 0.6
   min_samples: 8

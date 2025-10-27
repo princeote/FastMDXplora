@@ -39,7 +39,7 @@ jobs:
 
       # Coverage only on Python 3.11
       - name: Run tests with coverage gate (only on 3.11)
-        if: ${{ matrix.python-version == '3.11' }}
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' }}
         env:
           MPLBACKEND: Agg
         run: |
@@ -50,7 +50,7 @@ jobs:
             --cov-fail-under=80
           ls -l coverage.xml
 
-      # Upload from only ONE job; requires token for protected branches
+      # Upload from only ONE job with explicit repository info
       - name: Upload coverage to Codecov (only on 3.11)
         if: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' }}
         uses: codecov/codecov-action@v4
@@ -59,6 +59,7 @@ jobs:
           files: ./coverage.xml
           flags: unittests
           name: codecov-umbrella
+          slug: aai-research-lab/FastMDAnalysis  
           fail_ci_if_error: false
 
       - name: Upload test artifacts on failure

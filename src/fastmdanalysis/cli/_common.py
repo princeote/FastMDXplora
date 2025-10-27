@@ -3,9 +3,11 @@ from __future__ import annotations
 import os
 import sys
 import json
+import glob
 import logging
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Sequence
 
 import argparse
 
@@ -28,9 +30,30 @@ def make_common_parser() -> argparse.ArgumentParser:
 
 
 def add_file_args(subparser: argparse.ArgumentParser) -> None:
-    subparser.add_argument("-traj", "--trajectory", required=True, help="Path to trajectory file")
-    subparser.add_argument("-top", "--topology",  required=True, help="Path to topology file")
-    subparser.add_argument("-o",   "--output",    default=None,  help="Output directory name")
+    """
+    Add standard IO args.
+
+    --trajectory accepts one or more values and supports:
+      - space-separated file paths:   -traj a.dcd b.dcd
+      - comma-separated tokens:       -traj "a.dcd,b.dcd"
+      - glob patterns:                -traj "Q*.dcd"
+    All tokens are expanded (env vars, ~, globs) and validated to exist.
+    """
+    subparser.add_argument(
+        "-traj", "--trajectory",
+        nargs="+", required=True,
+        help="One or more trajectory files (space- or comma-separated) and/or glob patterns."
+    )
+    subparser.add_argument(
+        "-top", "--topology",
+        required=True,
+        help="Path to topology file"
+    )
+    subparser.add_argument(
+        "-o", "--output",
+        default=None,
+        help="Output directory name"
+    )
 
 
 def setup_logging(output_dir: str, verbose: bool, command: str) -> logging.Logger:
@@ -61,7 +84,100 @@ def parse_frames(frames_str: Optional[str]) -> Optional[Tuple[int, int, int]]:
         raise SystemExit("Invalid --frames format. Expected 'start,stop,stride' (e.g., '0,-1,10').")
 
 
-def build_instance(trajectory: str, topology: str, frames: Optional[Tuple[int, int, int]], atoms: Optional[str]):
+def _split_commas_and_ws(token: str) -> List[str]:
+    """
+    Split a token by commas and whitespace. Collapses repeats and strips empties.
+    Examples:
+      'a,b,c' -> ['a','b','c']
+      'a  b, c' -> ['a','b','c']
+    """
+    parts = re.split(r"[,\s]+", token.strip())
+    return [p for p in parts if p]
+
+
+def _expand_one(piece: str) -> List[str]:
+    """Expand ~, env vars, and glob patterns; return list of matches or the path if literal exists."""
+    expanded = os.path.expanduser(os.path.expandvars(piece))
+    # If it contains glob syntax, expand with glob.glob
+    if any(ch in expanded for ch in "*?[]"):
+        matches = sorted(glob.glob(expanded))
+        return matches
+    # Otherwise, keep the literal if it exists
+    return [expanded] if os.path.exists(expanded) else []
+
+
+def _dedupe_preserve_order(paths: Sequence[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def expand_trajectory_args(tokens: Sequence[str]) -> List[str]:
+    """
+    Normalize a list of tokens into a validated list of file paths.
+
+    Steps:
+      - split each token by commas/whitespace
+      - expand ~ and env vars
+      - expand glob patterns
+      - require that each resulting path exists
+      - deduplicate while preserving order
+    """
+    pieces: List[str] = []
+    for tok in tokens:
+        for piece in _split_commas_and_ws(tok):
+            pieces.append(piece)
+
+    expanded_paths: List[str] = []
+    missing_literals: List[str] = []
+    for piece in pieces:
+        matches = _expand_one(piece)
+        if matches:
+            expanded_paths.extend(matches)
+        else:
+            # keep track of unresolved literals or unmatched globs
+            missing_literals.append(piece)
+
+    files = _dedupe_preserve_order(expanded_paths)
+
+    if not files:
+        msg = "No trajectory files found from input: " + ", ".join(tokens)
+        if missing_literals:
+            msg += f"\nUnresolved paths/patterns: {', '.join(missing_literals)}"
+        raise SystemExit(msg)
+
+    # Warn/raise on partially unresolved inputs (helps catch typos early)
+    # Here we choose to raise with a clear message.
+    if missing_literals:
+        raise SystemExit(
+            "Some trajectory paths/patterns did not resolve to existing files:\n  - "
+            + "\n  - ".join(missing_literals)
+        )
+
+    return files
+
+
+def normalize_topology_arg(path: str) -> str:
+    p = os.path.expanduser(os.path.expandvars(path))
+    if not os.path.exists(p):
+        raise SystemExit(f"Topology file not found: {path}")
+    return p
+
+
+def build_instance(
+    trajectory: Sequence[str] | str,
+    topology: str,
+    frames: Optional[Tuple[int, int, int]],
+    atoms: Optional[str],
+):
+    """
+    Construct FastMDAnalysis. The core class supports either a single path or a list of paths.
+    Upstream code should pass the output of expand_trajectory_args(...) for 'trajectory'.
+    """
     from fastmdanalysis import FastMDAnalysis
     return FastMDAnalysis(trajectory, topology, frames=frames, atoms=atoms)
 
@@ -167,4 +283,20 @@ def deep_merge_options(base: Dict[str, Dict[str, Any]], override: Dict[str, Dict
         for k, v in params.items():
             dst[k] = v
     return out
+
+
+__all__ = [
+    "make_common_parser",
+    "add_file_args",
+    "setup_logging",
+    "parse_frames",
+    "expand_trajectory_args",
+    "normalize_topology_arg",
+    "build_instance",
+    "coerce_scalar",
+    "parse_opt_pairs",
+    "validate_options_mapping",
+    "load_options_file",
+    "deep_merge_options",
+]
 

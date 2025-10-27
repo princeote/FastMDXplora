@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import sys
 import argparse
-from pathlib import Path
 
-from ._common import make_common_parser, setup_logging, parse_frames, build_instance
+from ._common import (
+    make_common_parser,
+    setup_logging,
+    parse_frames,
+    build_instance,
+    expand_trajectory_args,
+    normalize_topology_arg,
+)
 from . import analyze as analyze_cmd
 from . import simple as simple_cmd
 
@@ -53,12 +59,27 @@ def main() -> None:
     logger = setup_logging(output_dir, getattr(args, "verbose", False), args.command)
     logger.info("Parsed arguments: %s", args)
 
+    # Normalize IO args centrally (Option A)
+    try:
+        # expand space/comma/glob and validate existence
+        trajs = expand_trajectory_args(args.trajectory)
+        top = normalize_topology_arg(args.topology)
+        # write back normalized values so handlers can use them if needed
+        args.trajectory = trajs
+        args.topology = top
+    except SystemExit:
+        # clear error message already formed in helper
+        raise
+    except Exception as e:
+        logger.error("Invalid input paths: %s", e)
+        sys.exit(2)
+
     # Shared init
     frames = parse_frames(getattr(args, "frames", None))
     atoms = getattr(args, "atoms", None)
 
     try:
-        fastmda = build_instance(args.trajectory, args.topology, frames=frames, atoms=atoms)
+        fastmda = build_instance(trajs, top, frames=frames, atoms=atoms)
     except SystemExit:
         raise
     except Exception as e:

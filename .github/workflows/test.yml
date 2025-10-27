@@ -46,16 +46,19 @@ jobs:
           pytest -q -m "not slow" \
             --cov=fastmdanalysis \
             --cov-report=xml \
+            --cov-report=term-missing \
             --cov-fail-under=80
           ls -l coverage.xml
 
-      # Upload from only ONE job; public repo => no token needed
+      # Upload from only ONE job; requires token for protected branches
       - name: Upload coverage to Codecov (only on 3.11)
         if: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' }}
         uses: codecov/codecov-action@v4
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml
           flags: unittests
+          name: codecov-umbrella
           fail_ci_if_error: false
 
       - name: Upload test artifacts on failure
@@ -100,4 +103,3 @@ jobs:
           python -c "import fastmdanalysis as m; print('OK:', getattr(m, '__version__', 'unknown'))"
           python -m fastmdanalysis.cli.main -h
           fastmda analyze -h
-

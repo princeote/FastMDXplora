@@ -50,17 +50,14 @@ jobs:
             --cov-fail-under=80
           ls -l coverage.xml
 
-      # Upload from only ONE job with explicit repository info
+      # Upload from only ONE job; no token needed for your org
       - name: Upload coverage to Codecov (only on 3.11)
         if: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' }}
         uses: codecov/codecov-action@v4
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml
           flags: unittests
           name: codecov-umbrella
-          slug: aai-research-lab/FastMDAnalysis  
-          fail_ci_if_error: false
 
       - name: Upload test artifacts on failure
         if: failure()

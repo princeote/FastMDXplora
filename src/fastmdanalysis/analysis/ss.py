@@ -324,3 +324,4 @@ class SSAnalysis(BaseAnalysis):
 
         plt.close(fig)
         return Path(out)
+

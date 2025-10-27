@@ -1,194 +1,208 @@
-# src/fastmdanalysis/analysis/dimred.py
-"""
-Dimensionality Reduction Analysis Module
-
-This module computes 2D embeddings of an MD trajectory using one or more methods:
-  - PCA
-  - MDS
-  - t-SNE
-
-It uses a default atom selection ("protein and name CA") to construct a feature matrix by
-flattening the 3D coordinates of the selected atoms. For each chosen method, a 2D embedding
-is computed, the embedding data are saved, and a scatter plot is generated where points
-are colored by frame index.
-
-Usage Example (API):
-    from fastmdanalysis import FastMDAnalysis
-
-    fastmda = FastMDAnalysis()
-    # Run dimensionality reduction using all available methods.
-    analysis = fastmda.dimred("path/to/trajectory.dcd", "path/to/topology.pdb", methods=["all"])
-    data = analysis.data
-    # Replot embeddings with custom options.
-    custom_plots = analysis.plot(data, title="Custom DimRed Plot", xlabel="X Component",
-                                 ylabel="Y Component", marker="s", cmap="plasma")
-    print("Scatter plots generated for:", custom_plots)
-"""
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+
 import numpy as np
-
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-
 from sklearn.decomposition import PCA
 from sklearn.manifold import MDS, TSNE
 
-from .base import BaseAnalysis, AnalysisError
+from .base import BaseAnalysis
+
+
+PathLike = Union[str, Path]
+
+
+def _as_list(methods: Union[str, Sequence[str]]) -> List[str]:
+    """
+    Normalize methods to a lowercase list in canonical order.
+    Supports: "all", comma-separated string, or an iterable.
+    """
+    if isinstance(methods, str):
+        if methods.lower() == "all":
+            return ["pca", "mds", "tsne"]
+        items = [m.strip().lower() for m in methods.split(",")]
+    else:
+        items = [str(m).strip().lower() for m in methods]
+
+    if "all" in items:
+        return ["pca", "mds", "tsne"]
+
+    order = ["pca", "mds", "tsne"]
+    items_set = set(items)
+    return [m for m in order if m in items_set]
+
+
+def _auto_tsne_perplexity(n_frames: int, user_value: Optional[int] = None) -> int:
+    """
+    Choose a sensible t-SNE perplexity. Clamp to [5, 30] and < n_frames.
+    """
+    if user_value is not None:
+        p = int(user_value)
+    else:
+        # simple heuristic: ~ min(30, max(5, n/10))
+        p = max(5, min(30, n_frames // 10 if n_frames > 0 else 30))
+    # t-SNE requires perplexity < n_samples
+    p = min(p, max(1, n_frames - 1))
+    return max(5, p)
+
 
 class DimRedAnalysis(BaseAnalysis):
-    def __init__(self, trajectory, methods="all", atoms="protein and name CA", **kwargs):
-        """
-        Initialize the Dimensionality Reduction analysis.
+    """
+    Dimensionality reduction (PCA, MDS, t-SNE) on Cartesian coordinates.
 
-        Parameters
-        ----------
-        trajectory : mdtraj.Trajectory
-            The MD trajectory to analyze.
-        methods : str or list
-            Which dimensionality reduction method(s) to use.
-            Options: 'pca', 'mds', 'tsne'. If "all" (default), all three are applied.
-        atoms : str, optional
-            MDTraj selection string to choose atoms for building the feature matrix.
-            Default is "protein and name CA".
-        kwargs : dict
-            Additional keyword arguments passed to BaseAnalysis.
-        """
-        super().__init__(trajectory, **kwargs)
-        # Process the methods parameter.
-        if isinstance(methods, str):
-            if methods.lower() == "all":
-                self.methods = ["pca", "mds", "tsne"]
-            else:
-                self.methods = [methods.lower()]
-        elif isinstance(methods, list):
-            methods_lower = [m.lower() for m in methods]
-            if "all" in methods_lower:
-                self.methods = ["pca", "mds", "tsne"]
-            else:
-                self.methods = methods_lower
-        else:
-            raise AnalysisError("Parameter 'methods' must be a string or a list of strings.")
+    Parameters
+    ----------
+    trajectory : mdtraj.Trajectory
+        The trajectory to analyze.
+    methods : {"all", "pca", "mds", "tsne"} or list of them
+        Which embeddings to compute. "all" runs pca, mds, tsne.
+    atoms : str, optional
+        MDTraj atom selection string.
+    outdir : str, optional
+        Output directory (default: "dimred_output").
+    tsne_perplexity : int, optional
+        Override the auto-chosen t-SNE perplexity.
+    tsne_max_iter : int, optional
+        Iterations for t-SNE (default 500, avoids deprecated `n_iter`).
+    random_state : int, optional
+        Random seed for reproducibility (default 42).
+    """
 
+    def __init__(
+        self,
+        trajectory,
+        methods: Union[str, Sequence[str]] = "all",
+        atoms: Optional[str] = None,
+        outdir: Optional[PathLike] = None,
+        tsne_perplexity: Optional[int] = None,
+        tsne_max_iter: int = 500,
+        random_state: int = 42,
+    ):
+        # Initialize the base class with the trajectory
+        super().__init__(trajectory, output=outdir)
+        
         self.atoms = atoms
-        if self.atoms is not None:
-            self.atom_indices = self.traj.topology.select(self.atoms)
-            if self.atom_indices is None or len(self.atom_indices) == 0:
-                raise AnalysisError("No atoms found using the given atom selection for dimensionality reduction.")
-            self._feature_traj = self.traj.atom_slice(self.atom_indices)
-        else:
-            self.atom_indices = None
-            self._feature_traj = self.traj
-        self.results = {}
-        self.data = None  # Will hold a dictionary with embeddings.
+        self.methods = _as_list(methods)
+        self.tsne_perplexity = tsne_perplexity
+        self.tsne_max_iter = int(tsne_max_iter)
+        self.random_state = int(random_state)
 
-    def run(self) -> dict:
+        # Results: method -> ndarray of shape (n_frames, 2)
+        self.results: Dict[str, np.ndarray] = {}
+
+    # ------------------------------- helpers ---------------------------------
+
+    def _flatten_xyz(self) -> np.ndarray:
         """
-        Compute 2D embeddings using the selected dimensionality reduction methods.
-
-        The coordinates of the selected atoms are flattened to create a feature matrix.
-        For each method, the 2D embedding is computed and stored in the results.
-        Each embedding is saved to disk, and default scatter plots are generated.
-
-        Returns
-        -------
-        dict
-            A dictionary with keys corresponding to each method (e.g. "pca", "mds", "tsne")
-            mapping to the 2D embedding arrays.
+        Return (n_frames, n_atoms*3) float32 array for (optionally) selected atoms.
         """
-        # Create the feature matrix from the selected atoms.
-        X = self._feature_traj.xyz  # shape: (n_frames, n_atoms_selected, 3)
-        X_flat = X.reshape(self._feature_traj.n_frames, -1)  # shape: (n_frames, n_atoms_selected*3)
+        t = self.traj
+        if self.atoms:
+            idx = t.topology.select(self.atoms)
+            if idx.size == 0:
+                raise ValueError(f"Atom selection returned 0 atoms: {self.atoms}")
+            t = t.atom_slice(idx, inplace=False)
 
-        for method in self.methods:
-            if method == "pca":
-                pca = PCA(n_components=2)
-                embedding = pca.fit_transform(X_flat)
-                self.results["pca"] = embedding
-                self._save_data(embedding, "dimred_pca")
+        # (n_frames, n_atoms, 3) -> (n_frames, n_atoms * 3)
+        X = t.xyz.astype(np.float32).reshape((t.n_frames, -1), order="C")
+        return X
 
-            elif method == "mds":
-                # Explicit n_init to avoid FutureWarning about default changing in sklearn 1.9
-                # Keep dissimilarity="euclidean" with feature matrix input.
-                mds = MDS(n_components=2, random_state=42, dissimilarity="euclidean", n_init=4)
-                embedding = mds.fit_transform(X_flat)
-                self.results["mds"] = embedding
-                self._save_data(embedding, "dimred_mds")
+    def _save_array(self, name: str, arr: np.ndarray) -> Path:
+        """Save array to file using BaseAnalysis method."""
+        return self._save_data(arr, f"dimred_{name}")
 
-            elif method in ["tsne", "t-sne"]:
-                # Use stable defaults; sklearn 1.5+ renamed n_iter->max_iter internally, default works.
-                tsne = TSNE(n_components=2, random_state=42, metric="euclidean")
-                embedding = tsne.fit_transform(X_flat)
-                self.results["tsne"] = embedding
-                self._save_data(embedding, "dimred_tsne")
-            else:
-                raise AnalysisError(f"Unknown dimensionality reduction method: {method}")
+    def _plot_one(self, name: str, emb: np.ndarray) -> Path:
+        """
+        Scatter colored by frame index; returns the saved PNG path.
+        """
+        fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
 
-        self.data = self.results
-        # Generate default scatter plots for all computed methods.
+        # Color by frame index with a colorbar
+        c = np.arange(emb.shape[0], dtype=np.int32)
+        sc = ax.scatter(emb[:, 0], emb[:, 1], s=20, c=c, cmap="viridis", alpha=0.7)
+        cb = fig.colorbar(sc, ax=ax)
+        cb.set_label("Frame Index")
+
+        # Set titles and labels based on method
+        title_map = {
+            "pca": "PCA Projection",
+            "mds": "MDS Projection", 
+            "tsne": "t-SNE Projection"
+        }
+        title = title_map.get(name, f"{name.upper()} Projection")
+        
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.set_xlabel("Component 1", fontsize=12)
+        ax.set_ylabel("Component 2", fontsize=12)
+        
+        # Add grid for better readability
+        ax.grid(True, alpha=0.3)
+        
+        # Remove top and right spines
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+        # Save plot using BaseAnalysis method
+        out = self._save_plot(fig, f"dimred_{name}")
+        plt.close(fig)
+        return out
+
+    # --------------------------------- API -----------------------------------
+
+    def run(self) -> "DimRedAnalysis":
+        """
+        Compute the requested embeddings and save numeric outputs immediately.
+        Also logs brief progress via BaseAnalysis logger (if configured).
+        """
+        X_flat = self._flatten_xyz()
+        n_frames = X_flat.shape[0]
+
+        # PCA
+        if "pca" in self.methods:
+            pca = PCA(n_components=2, random_state=self.random_state)
+            emb = pca.fit_transform(X_flat)
+            self.results["pca"] = emb.astype(np.float32)
+            self._save_array("pca", self.results["pca"])
+
+        # MDS (silence FutureWarning by setting n_init explicitly)
+        if "mds" in self.methods:
+            mds = MDS(
+                n_components=2,
+                n_init=4,  # default value today; avoids FutureWarning("...will change...")
+                random_state=self.random_state,
+                normalized_stress="auto",
+            )
+            emb = mds.fit_transform(X_flat)
+            self.results["mds"] = emb.astype(np.float32)
+            self._save_array("mds", self.results["mds"])
+
+        # t-SNE
+        if "tsne" in self.methods:
+            perplexity = _auto_tsne_perplexity(n_frames, self.tsne_perplexity)
+            tsne = TSNE(
+                n_components=2,
+                perplexity=perplexity,
+                max_iter=self.tsne_max_iter,  # use max_iter (not deprecated n_iter)
+                random_state=self.random_state,
+                init="pca",
+                learning_rate="auto",
+            )
+            emb = tsne.fit_transform(X_flat)
+            self.results["tsne"] = emb.astype(np.float32)
+            self._save_array("tsne", self.results["tsne"])
+
+        # Generate plots automatically after computation
         self.plot()
-        return self.results
+        
+        return self
 
-    def plot(self, data=None, method=None, **kwargs):
+    def plot(self) -> Dict[str, Path]:
         """
-        Generate scatter plots for the 2D embeddings.
-
-        Parameters
-        ----------
-        data : dict, optional
-            A dictionary of embeddings (e.g., with keys "pca", "mds", "tsne"). If not provided, self.data is used.
-        method : str, optional
-            If specified, only the embedding for that method ('pca', 'mds', or 'tsne') is re-plotted.
-            Otherwise, scatter plots are generated for all embeddings.
-        kwargs : dict
-            Custom plot options such as:
-                - title: Plot title.
-                - xlabel: Label for the x-axis.
-                - ylabel: Label for the y-axis.
-                - marker: Marker style (default: 'o').
-                - cmap: Matplotlib colormap (default: 'viridis').
-
-        Returns
-        -------
-        dict or str
-            If method is specified, returns the plot file path (str) for that method.
-            Otherwise, returns a dictionary mapping each method to its plot file path.
+        Generate and save plots for each computed embedding, returning a {method: Path} map.
         """
-        if data is None:
-            data = self.data
-        if data is None:
-            raise AnalysisError("No dimensionality reduction data available to plot. Please run analysis first.")
-
-        def _plot_embedding(embedding, method_name):
-            title = kwargs.get("title", f"{method_name.upper()} Projection")
-            xlabel = kwargs.get("xlabel", "Component 1")
-            ylabel = kwargs.get("ylabel", "Component 2")
-            marker = kwargs.get("marker", "o")
-            cmap = kwargs.get("cmap", "viridis")
-
-            fig = plt.figure(figsize=(10, 8))
-            # Color points using the frame index.
-            colors = np.arange(self.traj.n_frames)
-            sc = plt.scatter(embedding[:, 0], embedding[:, 1], c=colors, cmap=cmap, marker=marker)
-            plt.title(title)
-            plt.xlabel(xlabel)
-            plt.ylabel(ylabel)
-            plt.grid(alpha=0.3)
-            cbar = plt.colorbar(sc)
-            cbar.set_label("Frame Index")
-            plot_path = self._save_plot(fig, f"dimred_{method_name}")
-            plt.close(fig)
-            return plot_path
-
-        plot_paths = {}
-        if method:
-            m = method.lower()
-            if m not in data:
-                raise AnalysisError(f"Dimensionality reduction method '{m}' not found in results.")
-            return _plot_embedding(data[m], m)
-        else:
-            for m, emb in data.items():
-                plot_paths[m] = _plot_embedding(emb, m)
-            return plot_paths
-
+        out: Dict[str, Path] = {}
+        for name, emb in self.results.items():
+            out[name] = self._plot_one(name, emb)
+        return out

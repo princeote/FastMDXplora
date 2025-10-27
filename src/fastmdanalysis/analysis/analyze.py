@@ -9,13 +9,7 @@ This module provides a bound method `FastMDAnalysis.analyze(...)` that:
 - Optionally builds a PowerPoint slide deck of figures produced during the run
   via the top-level `slides` argument (bool or explicit output path).
 - Collects all generated folders/files into a single analyze output directory.
-
-Binding (done once, typically in fastmdanalysis/__init__.py):
-----------------------------------------------------------------
-from .analysis.analyze import analyze as _analyze
-FastMDAnalysis.analyze = _analyze
 """
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -112,38 +106,26 @@ def _final_list(
     return candidates
 
 
-def _filter_kwargs_and_unknown(callable_obj, kwargs: Mapping[str, Any]) -> Tuple[Dict[str, Any], set]:
+def _filter_kwargs(callable_obj, kwargs: Mapping[str, Any]) -> Dict[str, Any]:
     """
-    Return (kwargs_to_pass, unknown_keys). Even if the callable accepts **kwargs,
-    we still compute 'unknown' by comparing against named parameters so callers
-    get a warning when they pass unsupported options.
+    Pass only keyword arguments that the callable explicitly declares.
+
+    Even if the callable accepts **kwargs, we still drop unknown keys here so the
+    orchestrator can warn the user (tests expect this behavior).
     """
     if not kwargs:
-        return {}, set()
+        return {}
     sig = inspect.signature(callable_obj)
-    accepts_variadic = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
-
     accepted = {
         name
         for name, p in sig.parameters.items()
         if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
     }
-    unknown = set(kwargs.keys()) - accepted
-
-    if accepts_variadic:
-        # Pass everything through, but still report 'unknown'
-        return dict(kwargs), unknown
-    else:
-        filtered = {k: v for k, v in kwargs.items() if k in accepted}
-        dropped = set(kwargs.keys()) - set(filtered.keys())
-        return filtered, dropped
+    return {k: v for k, v in kwargs.items() if k in accepted}
 
 
 def _unique_path(dest: Path) -> Path:
-    """
-    If dest exists, append _1, _2, ... until a free path is found.
-    Works for both files and directories.
-    """
+    """Append _1, _2, ... until a free path is found (files or directories)."""
     if not dest.exists():
         return dest
     stem = dest.stem
@@ -194,9 +176,7 @@ def _print_summary(results: Dict[str, AnalysisResult], analyze_outdir: Path) -> 
 
 
 def _inject_cluster_defaults(self, opts: Dict[str, Dict[str, Any]], plan: Sequence[str]) -> None:
-    """
-    Ensure cluster runs with all methods by default and has n_clusters when needed.
-    """
+    """Ensure cluster runs with all methods by default and has n_clusters when needed."""
     if "cluster" not in plan:
         return
     ck = opts.setdefault("cluster", {})
@@ -207,7 +187,6 @@ def _inject_cluster_defaults(self, opts: Dict[str, Dict[str, Any]], plan: Sequen
         methods_list = [m.strip().lower() for m in methods.split(",")]
     else:
         methods_list = [str(m).lower() for m in methods]
-
     if "all" in methods_list:
         methods_list = ["dbscan", "kmeans", "hierarchical"]
     ck["methods"] = methods_list
@@ -218,10 +197,9 @@ def _inject_cluster_defaults(self, opts: Dict[str, Dict[str, Any]], plan: Sequen
             n_frames = int(getattr(self.traj, "n_frames", 0))
         except Exception:
             n_frames = 0
+        guess = 3
         if n_frames > 0:
             guess = max(2, min(6, int(round(math.sqrt(max(1.0, n_frames / 10.0))))))
-        else:
-            guess = 3
         ck["n_clusters"] = guess
 
 
@@ -238,19 +216,6 @@ def run(
     """
     Execute multiple analyses on the current FastMDAnalysis instance and
     collect all generated outputs into a single directory.
-
-    Parameters
-    ----------
-    include, exclude, options, stop_on_error, verbose, slides
-        See docstring above.
-    output : str | Path | None
-        Parent directory into which all per-analysis output folders and the slide deck
-        will be moved. Defaults to "analyze_output".
-
-    Returns
-    -------
-    Dict[str, AnalysisResult]
-        Per-analysis outcomes. If slides were requested, includes a "slides" entry.
     """
     available = _discover_available(self)
     plan = _final_list(available, include, exclude)
@@ -278,12 +243,12 @@ def run(
             warnings.warn(f"Skipping '{name}' (not implemented on this instance).")
             continue
 
-        user_opts = opts.get(name, {})
-        kw, unknown = _filter_kwargs_and_unknown(fn, user_opts)
+        kw = _filter_kwargs(fn, opts.get(name, {}))
 
-        # Always warn on unsupported options (even if the method accepts **kwargs)
-        if unknown:
-            warnings.warn(f"Ignoring unsupported options for '{name}': {sorted(unknown)}")
+        if verbose and opts.get(name):
+            dropped = set(opts[name].keys()) - set(kw.keys())
+            if dropped:
+                warnings.warn(f"Ignoring unsupported options for '{name}': {sorted(dropped)}")
 
         if verbose:
             print(f"  • {name}() ...", end="", flush=True)
@@ -314,7 +279,7 @@ def run(
         if verbose and ok:
             print(f" done ({dt:.2f}s)")
 
-    # ---- Move per-analysis outputs under analyze_outdir/<analysis> -----------
+    # Move per-analysis outputs under analyze_outdir/<analysis>
     moved_dirs: List[Path] = []
     for name, src_dir in per_analysis_outdirs.items():
         if src_dir.exists():
@@ -338,18 +303,17 @@ def run(
             if results[name].value is None:
                 results[name].value = {"outdir": dest_dir}
 
-    # ---- Slides: create AFTER moving, scanning only moved_dirs (dedup inputs) -
+    # Slides: create AFTER moving, scanning only moved_dirs (and de-dupe images)
     if slides:
         t0 = time.perf_counter()
         try:
             roots: List[Union[str, Path]] = moved_dirs.copy()
             images = gather_figures(roots, since_epoch=run_t0 - 5)
-            images = _dedupe_paths(images)  # ensure no duplicates reach slide_show
+            images = _dedupe_paths(images)
 
             if not images:
                 raise FileNotFoundError("No figures found to include in slide deck.")
 
-            # Build deck (let slideshow name it), then relocate into analyze_outdir
             deck_path = Path(
                 slide_show(
                     images=images,
@@ -394,9 +358,7 @@ def analyze(
     slides: Optional[Union[bool, str, Path]] = None,
     output: Optional[Union[str, Path]] = None,
 ) -> Dict[str, AnalysisResult]:
-    """
-    Public façade so callers can do: fastmda.analyze(...)
-    """
+    """Public façade so callers can do: fastmda.analyze(...)"""
     return run(
         self,
         include=include,
@@ -407,3 +369,4 @@ def analyze(
         slides=slides,
         output=output,
     )
+

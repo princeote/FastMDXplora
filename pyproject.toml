@@ -93,7 +93,8 @@ branch = true
 omit = [
   "src/fastmdanalysis/__main__.py",            # tiny entry point
   "src/fastmdanalysis/cli/*",                  # CLI is integration-heavy; add tests later
-  "src/fastmdanalysis/utils/slideshow.py"      # relies on python-pptx & FS; test later with fakes
+  "src/fastmdanalysis/utils/slideshow.py",     # relies on python-pptx & FS; test later with fakes
+  "src/fastmdanalysis/datasets.py",            # data locators (not core logic)
 ]
 
 [tool.coverage.report]

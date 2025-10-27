@@ -145,3 +145,4 @@ class RGAnalysis(BaseAnalysis):
         out = self._save_plot(fig, "rg")
         plt.close(fig)
         return out
+

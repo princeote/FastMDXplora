@@ -467,3 +467,4 @@ class ClusterAnalysis(BaseAnalysis):
         if not self.results:
             raise AnalysisError("No clustering results available. Run the analysis first.")
         return self.results
+

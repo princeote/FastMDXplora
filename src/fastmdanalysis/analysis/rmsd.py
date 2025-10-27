@@ -201,3 +201,4 @@ class RMSDAnalysis(BaseAnalysis):
         out = self._save_plot(fig, "rmsd")
         plt.close(fig)
         return out
+

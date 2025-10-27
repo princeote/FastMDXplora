@@ -272,3 +272,4 @@ class SASAAnalysis(BaseAnalysis):
         out = self._save_plot(fig, "average_residue_sasa")
         plt.close(fig)
         return out
+

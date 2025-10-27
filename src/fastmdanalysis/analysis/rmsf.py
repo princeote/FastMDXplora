@@ -172,3 +172,4 @@ class RMSFAnalysis(BaseAnalysis):
         outpath = self._save_plot(fig, "rmsf")
         plt.close(fig)
         return Path(outpath)
+

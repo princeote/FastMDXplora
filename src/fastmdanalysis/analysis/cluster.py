@@ -83,11 +83,10 @@ def relabel_compact_positive(
 # ----------------------------- Colormaps/Norms --------------------------------
 
 def get_cluster_cmap(n_clusters: int):
-    predefined_colors = [
-        '#1f77b4','#ff7f0e','#2ca02c','#d62728',
-        '#9467bd','#8c564b','#e377c2','#bcbd22',
-        '#17becf','#e41a1c','#377eb8','#f781bf'
-    ]
+    predefined_colors = ['#e41a1c','#377eb8','#00ff00','#ffd700',
+               '#9932cc','#ffa500','#00bfff','#a52a2a',
+               '#808080','#000000','#006400','#000080'
+               ]
     if n_clusters <= len(predefined_colors):
         logger.debug("Using predefined colormap for %d clusters", n_clusters)
         return ListedColormap(predefined_colors[:n_clusters])

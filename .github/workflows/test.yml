@@ -50,11 +50,12 @@ jobs:
             --cov-fail-under=80
           ls -l coverage.xml
 
-      # Upload from only ONE job; no token needed for your org
+      # Upload from only ONE job; token required for protected branch
       - name: Upload coverage to Codecov (only on 3.11)
         if: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' }}
         uses: codecov/codecov-action@v4
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml
           flags: unittests
           name: codecov-umbrella
@@ -101,3 +102,34 @@ jobs:
           python -c "import fastmdanalysis as m; print('OK:', getattr(m, '__version__', 'unknown'))"
           python -m fastmdanalysis.cli.main -h
           fastmda analyze -h
+
+  # Release to PyPI on tag push
+  release:
+    name: Release to PyPI
+    runs-on: ubuntu-latest
+    # Only run when a tag is pushed (e.g., v0.0.2, v1.0.0)
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [tests, package]  # Wait for tests and package to succeed
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          
+      - name: Install dependencies
+        run: python -m pip install build twine
+        
+      - name: Build package
+        run: python -m build
+        
+      - name: Verify distributions
+        run: |
+          ls -la dist/
+          python -m twine check dist/*
+        
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}

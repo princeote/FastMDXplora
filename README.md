@@ -37,8 +37,42 @@
 
 # Installation
 <!-- ## From PyPI (Recommended for users) -->
+**Recommended: Install in a Virtual Environment**
+
+We strongly recommend installing ``FastMDAnalysis`` in a virtual environment to avoid conflicts with system packages and ensure the ``fastmda`` command is available in your PATH.
+
+Using ``venv`` (Python's built-in virtual environment):
 ```bash
+# Create a virtual environment
+python -m venv fastmda_env
+
+# Activate the virtual environment
+# On Linux/macOS:
+source fastmda_env/bin/activate
+# On Windows:
+# fastmda_env\Scripts\activate
+
+# Install FastMDAnalysis
 pip install fastmdanalysis
+
+# Verify installation
+fastmda --version
+fastmda analyze --help
+```
+Using conda:
+```bash
+# Create a conda environment
+conda create -n fastmda_env python=3.9
+
+# Activate the environment
+conda activate fastmda_env
+
+# Install FastMDAnalysis
+pip install fastmdanalysis
+
+# Verify installation
+fastmda --version
+fastmda analyze --help
 ```
 
 
@@ -97,7 +131,7 @@ rg:
 cluster:
   methods: [kmeans, hierarchical]
   n_clusters: 5
-  eps: 0.6
+  eps: 0.3
   min_samples: 8
 ```
 JSON is also supported. If using YAML, ensure PyYAML is installed.
@@ -109,10 +143,10 @@ JSON is also supported. If using YAML, ensure PyYAML is installed.
 **Single-analysis commands (legacy, still available)**
 ```bash
 fastmda rmsd   -traj traj.dcd -top top.pdb --ref 0     # aliases: --reference-frame, -ref
-fastmda rmsf   -traj traj.dcd -top top.pdb
+fastmda rmsf  -traj traj.dcd -top top.pdb
 fastmda rg     -traj traj.dcd -top top.pdb
-fastmda hbonds -traj traj.dcd -top top.pdb
-fastmda cluster -traj traj.dcd -top top.pdb --methods kmeans dbscan --eps 0.5 --min_samples 8
+fastmda ss -traj traj.dcd -top top.pdb
+fastmda cluster -traj traj.dcd -top top.pdb --methods kmeans hierarchical --n_clusters 5
 ```
 
 
@@ -154,11 +188,31 @@ Output includes data files, figures, logs ...
 
 
 # Documentation
-The documentation (with an extensive usage guide) is available [here](https://fastmdanalysis.readthedocs.io).
+The documentation (with an extensive user guide) is available [here](https://fastmdanalysis.readthedocs.io).
 
 
 # Contributing
 Contributions are welcome. Please submit a Pull Request. 
+
+**Development Installation**
+
+If you want to contribute or modify the code:
+```bash
+# Clone the repository
+git clone https://github.com/aai-research-lab/FastMDAnalysis.git
+cd FastMDAnalysis
+
+# Create and activate virtual environment
+python -m venv fastmda_env
+source fastmda_env/bin/activate  # On Windows: fastmda_env\Scripts\activate
+
+# Install in development mode with test dependencies
+pip install -e ".[test]"
+
+# Verify installation
+fastmda --version
+fastmda analyze --help
+```
 
 # Citation
 If you use `FastMDAnalysis` in your work, please cite:

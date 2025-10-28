@@ -132,8 +132,6 @@ rg:
 cluster:
   methods: [kmeans, hierarchical]
   n_clusters: 5
-  eps: 0.3
-  min_samples: 8
 ```
 JSON is also supported. If using YAML, ensure PyYAML is installed.
 
@@ -189,7 +187,7 @@ Output includes data files, figures, logs ...
 
 
 # Documentation
-The documentation (with an extensive user guide) is available [here](https://fastmdanalysis.readthedocs.io).
+The documentation [is under development] (with an extensive user guide) is available [here](https://fastmdanalysis.readthedocs.io).
 
 
 # Contributing

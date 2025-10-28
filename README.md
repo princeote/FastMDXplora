@@ -176,14 +176,14 @@ rmsd_result = result["rmsd"].value          # object/type depends on analysis
 slides   = result.get("slides")             # AnalysisResult; .ok and .value (path)
 ```
 
-**Notes**
-- Figures are saved during each analysis; slide decks include all figures produced in the run.
-- MDTraj may emit benign warnings (e.g., dummy CRYST1 records); they do not affect results.
+> **Notes** 
+> - Figures are saved during each analysis; slide decks include all figures produced in the run.
+> - MDTraj may emit benign warnings (e.g., dummy CRYST1 records); they do not affect results.
 
 
 
 ## Output
-Output includes data files, figures, logs ...
+Output includes data tables, figures, slide deck, log file ...
 
 
 # Documentation

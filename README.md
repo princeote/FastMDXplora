@@ -57,8 +57,8 @@ source fastmda_env/bin/activate
 pip install fastmdanalysis
 
 # Verify installation
-fastmda --version
-fastmda analyze --help
+fastmda -h
+fastmda analyze --h
 ```
 Using conda:
 ```bash
@@ -72,8 +72,8 @@ conda activate fastmda_env
 pip install fastmdanalysis
 
 # Verify installation
-fastmda --version
-fastmda analyze --help
+fastmda -h
+fastmda analyze -h
 ```
 
 
@@ -211,8 +211,8 @@ source fastmda_env/bin/activate  # On Windows: fastmda_env\Scripts\activate
 pip install -e ".[test]"
 
 # Verify installation
-fastmda --version
-fastmda analyze --help
+fastmda -h
+fastmda analyze -h
 ```
 
 # Citation

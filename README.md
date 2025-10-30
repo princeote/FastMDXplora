@@ -187,7 +187,7 @@ Output includes data tables, figures, slide deck, log file ...
 
 
 # Documentation
-The documentation [is under development] (with an extensive user guide) is available [here](https://fastmdanalysis.readthedocs.io).
+The documentation [under development] (with an extensive User Guide) is available [here](https://fastmdanalysis.readthedocs.io).
 
 
 # Contributing

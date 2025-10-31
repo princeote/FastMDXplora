@@ -109,7 +109,7 @@ fastmda analyze -traj traj.dcd -top top.pdb --options options.yaml --slides
 
 **Global flags:**
 - ``--frames start,stop,stride`` (e.g., ``0,-1,10``)
-- ``--atoms "MDTraj selection"`` (e.g., ``protein and name CA``)
+- ``--atoms "MDTraj selection"`` (e.g., ``"protein and name CA"``)
 - ``--output DIR`` (output directory name)
 - ``--verbose`` (prints progress and writes logs under ``<command>_output/`` unless ``--output`` is set)
 
@@ -237,7 +237,7 @@ Adekunle Aina and Derrick Kwan (2025). *FastMDAnalysis: Software for Automated M
 ``FastMDAnalysis`` builds upon excellent open-source libraries to provide its high-performance analysis capabilities and to improve workflow efficiency, accessibility, usability, and reproducibility in molecular dynamics trajectory analysis. We gratefully acknowledge:
 
 - ``MDTraj`` for foundational trajectory I/O and analysis modules
-- ``NumPy`` for efficient numerical computations
+- ``NumPy/SciPy`` for efficient numerical computations
 - ``scikit-learn`` for advanced machine learning algorithms
 - ``Matplotlib`` for publication-quality visualization
 

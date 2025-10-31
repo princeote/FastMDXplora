@@ -1,3 +1,4 @@
+# src/fastmdanalysis/cli/main.py
 from __future__ import annotations
 
 import sys
@@ -13,6 +14,7 @@ from ._common import (
 )
 from . import analyze as analyze_cmd
 from . import simple as simple_cmd
+from ..utils.logging import log_run_header  
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -57,6 +59,14 @@ def main() -> None:
     # Output dir per command
     output_dir = args.output if getattr(args, "output", None) else f"{args.command}_output"
     logger = setup_logging(output_dir, getattr(args, "verbose", False), args.command)
+
+    # Emit version/runtime header for provenance
+    try:
+        log_run_header(logger)
+    except Exception:
+        # Never fail the CLI due to logging
+        pass
+
     logger.info("Parsed arguments: %s", args)
 
     # Normalize IO args centrally (Option A)
@@ -91,4 +101,3 @@ def main() -> None:
     if handler is None:
         parser.error("No handler registered for the selected subcommand.")
     handler(args, fastmda, logger)
-

@@ -20,9 +20,39 @@ from __future__ import annotations
 from typing import Optional, Tuple, Union, Sequence
 import logging
 
+# Optional dependency import to ensure availability at import time (not used directly here).
 import mdtraj as md  # noqa: F401
+
 from .analysis import rmsd, rmsf, rg, hbonds, cluster, ss, dimred, sasa
 from .utils import load_trajectory  # Extended utility supporting multiple files.
+from .utils.logging import setup_library_logging, log_run_header  # convenient re-exports
+
+# -----------------------------------------------------------------------------
+# Package version
+# -----------------------------------------------------------------------------
+try:
+    from importlib.metadata import version as _pkg_version, PackageNotFoundError  # type: ignore
+except Exception:  # pragma: no cover
+    try:  # Python <3.8 backport
+        from importlib_metadata import version as _pkg_version, PackageNotFoundError  # type: ignore
+    except Exception:  # pragma: no cover
+        _pkg_version = None  # type: ignore
+        PackageNotFoundError = Exception  # type: ignore
+
+def _resolve_version() -> str:
+    # Prefer distribution name in normalized (PEP 503) form; fall back to alt casing.
+    for dist_name in ("fastmdanalysis", "FastMDAnalysis"):
+        try:
+            if _pkg_version:
+                return _pkg_version(dist_name)
+        except PackageNotFoundError:
+            continue
+        except Exception:
+            continue
+    # Last resort if metadata is unavailable (e.g., source checkout)
+    return "0+unknown"
+
+__version__ = _resolve_version()
 
 # -----------------------------------------------------------------------------
 # Package logging: install a NullHandler so library users don't get warnings.
@@ -32,7 +62,9 @@ _pkg_logger = logging.getLogger("fastmdanalysis")
 if not _pkg_logger.handlers:
     _pkg_logger.addHandler(logging.NullHandler())
 
+# -----------------------------------------------------------------------------
 # Expose analysis classes.
+# -----------------------------------------------------------------------------
 RMSDAnalysis = rmsd.RMSDAnalysis
 RMSFAnalysis = rmsf.RMSFAnalysis
 RGAnalysis = rg.RGAnalysis
@@ -43,6 +75,7 @@ DimRedAnalysis = dimred.DimRedAnalysis
 SASAAnalysis = sasa.SASAAnalysis
 
 __all__ = [
+    "__version__",
     "FastMDAnalysis",
     "RMSDAnalysis",
     "RMSFAnalysis",
@@ -52,6 +85,9 @@ __all__ = [
     "SSAnalysis",
     "DimRedAnalysis",
     "SASAAnalysis",
+    "load_trajectory",
+    "setup_library_logging",
+    "log_run_header",
 ]
 
 
@@ -179,27 +215,21 @@ class FastMDAnalysis:
         return analysis
 
     def rmsf(self, atoms: Optional[str] = None, **kwargs):
-        """
-        Run RMSF analysis on the stored trajectory.
-        """
+        """Run RMSF analysis on the stored trajectory."""
         a = self._get_atoms(atoms)
         analysis = RMSFAnalysis(self.traj, atoms=a, **kwargs)
         analysis.run()
         return analysis
 
     def rg(self, atoms: Optional[str] = None, **kwargs):
-        """
-        Run Radius of Gyration (RG) analysis.
-        """
+        """Run Radius of Gyration (RG) analysis."""
         a = self._get_atoms(atoms)
         analysis = RGAnalysis(self.traj, atoms=a, **kwargs)
         analysis.run()
         return analysis
 
     def hbonds(self, atoms: Optional[str] = None, **kwargs):
-        """
-        Run Hydrogen Bonds (HBonds) analysis.
-        """
+        """Run Hydrogen Bonds (HBonds) analysis."""
         a = self._get_atoms(atoms)
         analysis = HBondsAnalysis(self.traj, atoms=a, **kwargs)
         analysis.run()
@@ -214,9 +244,7 @@ class FastMDAnalysis:
         atoms: Optional[str] = None,
         **kwargs
     ):
-        """
-        Run clustering analysis on the stored trajectory.
-        """
+        """Run clustering analysis on the stored trajectory."""
         a = self._get_atoms(atoms)
         analysis = ClusterAnalysis(
             self.traj, methods=methods, eps=eps, min_samples=min_samples, n_clusters=n_clusters, atoms=a, **kwargs
@@ -225,27 +253,21 @@ class FastMDAnalysis:
         return analysis
 
     def ss(self, atoms: Optional[str] = None, **kwargs):
-        """
-        Run Secondary Structure (SS) analysis on the stored trajectory.
-        """
+        """Run Secondary Structure (SS) analysis on the stored trajectory."""
         a = self._get_atoms(atoms)
         analysis = SSAnalysis(self.traj, atoms=a, **kwargs)
         analysis.run()
         return analysis
 
     def sasa(self, probe_radius: float = 0.14, atoms: Optional[str] = None, **kwargs):
-        """
-        Run Solvent Accessible Surface Area (SASA) analysis on the stored trajectory.
-        """
+        """Run Solvent Accessible Surface Area (SASA) analysis on the stored trajectory."""
         a = self._get_atoms(atoms)
         analysis = SASAAnalysis(self.traj, probe_radius=probe_radius, atoms=a, **kwargs)
         analysis.run()
         return analysis
 
     def dimred(self, methods="all", atoms: Optional[str] = None, **kwargs):
-        """
-        Run dimensionality reduction analysis on the stored trajectory.
-        """
+        """Run dimensionality reduction analysis on the stored trajectory."""
         a = self._get_atoms(atoms)
         analysis = DimRedAnalysis(self.traj, methods=methods, atoms=a, **kwargs)
         analysis.run()
@@ -255,4 +277,3 @@ class FastMDAnalysis:
 # Bind analyze method to FastMDAnalysis
 from .analysis.analyze import analyze as _analyze  # noqa: E402
 FastMDAnalysis.analyze = _analyze  # adds the bound method
-

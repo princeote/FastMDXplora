@@ -20,9 +20,11 @@ import warnings
 import time
 import shutil
 import math
+import logging  
 
 # Slide deck utilities (timestamped filename handled inside slideshow.py)
 from ..utils.slideshow import slide_show, gather_figures
+from ..utils.logging import log_run_header as _log_run_header  
 
 
 # Canonical analysis names in preferred execution order.
@@ -229,6 +231,14 @@ def run(
 
     results: Dict[str, AnalysisResult] = {}
 
+    # Version/runtime header in logs (honors caller's logging config)
+    if verbose:
+        try:
+            _log_run_header(logging.getLogger("fastmdanalysis"))
+        except Exception:
+            # never fail the run due to logging
+            pass
+
     if verbose:
         print(f"[FastMDAnalysis] Running {len(plan)} analyses: {', '.join(plan)}")
 
@@ -369,4 +379,3 @@ def analyze(
         slides=slides,
         output=output,
     )
-

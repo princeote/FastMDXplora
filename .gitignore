@@ -23,6 +23,15 @@ __pycache__/
 *.so
 .Python
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+
 # Output files
 *_output/
 demos/

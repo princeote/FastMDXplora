@@ -216,7 +216,7 @@ fastmda analyze -h
 # Citation
 If you use `FastMDAnalysis` in your work, please cite:
 
-Adekunle Aina and Derrick Kwan (2025). *FastMDAnalysis: Software for Automated Molecular Dynamics Analysis.* GitHub. https://github.com/aai-research-lab/fastmdanalysis
+Adekunle Aina and Derrick Kwan. *FastMDAnalysis: Software for Automated Molecular Dynamics Analysis.* GitHub 2025. https://github.com/aai-research-lab/fastmdanalysis
 
 ```bibtex
 @software{FastMDAnalysis,

@@ -2,11 +2,6 @@
 # Helper for semantic version bumps
 
 
-# Usage From project root
-#scripts/release.sh help
-#scripts/release.sh current
-#scripts/release.sh next
-#scripts/release.sh quick 0.0.3
 
 #scripts/bump_version.sh patch
 #scripts/bump_version.sh minor

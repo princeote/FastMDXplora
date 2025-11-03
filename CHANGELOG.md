@@ -12,6 +12,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 - Bug fixes and documentation corrections.
 
+
+## [1.0.0] - <2025-11-02>
+### Added
+- **Version header in log files.
+
 ## [0.0.1] - <2025-10-27>
 ### Added
 - **First public release of FastMDAnalysis** (non-testing).
@@ -23,5 +28,6 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
-[Unreleased]: https://github.com/aai-research-lab/FastMDAnalysis/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/aai-research-lab/FastMDAnalysis/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/aai-research-lab/FastMDAnalysis/compare/v1.0.0
 [0.0.1]: https://github.com/aai-research-lab/FastMDAnalysis/releases/tag/v0.0.1

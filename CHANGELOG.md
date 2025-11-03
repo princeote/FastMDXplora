@@ -6,7 +6,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Added
-- New features since `v0.0.1`.
+- New features since `v1.0.0`.
 ### Changed
 - Behavior/CLI/API updates.
 ### Fixed
@@ -15,9 +15,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [1.0.0] - <2025-11-02>
 ### Added
-- **Version header in log files.
+- **First stable release of FastMDAnalysis**
+- Version header in log files.
 
-## [0.0.1] - <2025-10-27>
+## [0.0.3] - <2025-10-27>
 ### Added
 - **First public release of FastMDAnalysis** (non-testing).
 - Command-line workflow: `fastmda analyze --traj <traj> --top <top> --include rmsd rg cluster
@@ -30,4 +31,4 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 [Unreleased]: https://github.com/aai-research-lab/FastMDAnalysis/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/aai-research-lab/FastMDAnalysis/compare/v1.0.0
-[0.0.1]: https://github.com/aai-research-lab/FastMDAnalysis/releases/tag/v0.0.1
+[0.0.3]: https://github.com/aai-research-lab/FastMDAnalysis/releases/tag/v0.0.3

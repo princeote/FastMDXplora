@@ -1,8 +1,8 @@
 cff-version: 1.2.0
 message: "If you use this software in your work, please cite:"
 title: "FastMDAnalysis: Software for Automated Analysis of Molecular Dynamics Trajectories"
-version: "0.0.3"
-date-released: "2025-10-25"
+version: "1.0.0"
+date-released: "2025-11-02"
 license: "MIT"  
 authors:
   - given-names: "Adekunle"

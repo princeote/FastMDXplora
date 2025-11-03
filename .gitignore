@@ -2,7 +2,7 @@
 .venv/
 venv/
 env/
-test_env/
+*_env/
 test_env2/
 
 # Build artifacts
@@ -55,6 +55,7 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+.python-version
 
 # Working and Old files
 hsp90_casestudy.md

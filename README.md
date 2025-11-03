@@ -1,5 +1,6 @@
 ![FastMDAnalysis Banner](assets/fastmdanalysis_banner.png)
 
+[![DOI](https://zenodo.org/badge/965215244.svg)](https://doi.org/10.5281/zenodo.17510591)
 [![Tests](https://github.com/aai-research-lab/FastMDAnalysis/actions/workflows/test.yml/badge.svg)](https://github.com/aai-research-lab/FastMDAnalysis/actions)
 [![codecov](https://codecov.io/gh/aai-research-lab/FastMDAnalysis/branch/main/graph/badge.svg)](https://codecov.io/gh/aai-research-lab/FastMDAnalysis)
 [![Docs](https://img.shields.io/badge/docs-latest-brightgreen.svg)](https://fastmdanalysis.readthedocs.io/en/latest/)
@@ -219,12 +220,13 @@ If you use `FastMDAnalysis` in your work, please cite:
 Adekunle Aina and Derrick Kwan. *FastMDAnalysis: Software for Automated Analysis of Molecular Dynamics Trajectories.* GitHub 2025. https://github.com/aai-research-lab/fastmdanalysis
 
 ```bibtex
-@software{FastMDAnalysis,
+@software{fastmdanalysis,
   author       = {Adekunle Aina and Derrick Kwan},
   title        = {FastMDAnalysis: Software for Automated Analysis of Molecular Dynamics Trajectories},
   year         = {2025},
-  publisher    = {GitHub},
-  url          = {https://github.com/aai-research-lab/fastmdanalysis}
+  doi          = {10.5281/zenodo.17510591},
+  publisher    = {Zenodo},
+  url          = {https://doi.org/10.5281/zenodo.17510591}
 }
 ```
 

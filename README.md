@@ -127,9 +127,6 @@ Provide per-analysis keyword arguments in a single file. CLI and Python API shar
 # options.yaml
 rmsd:
   ref: 0
-  align: true
-rg:
-  by_chain: false
 cluster:
   methods: [kmeans, hierarchical]
   n_clusters: 5
@@ -143,8 +140,6 @@ JSON is also supported. If using YAML, ensure PyYAML is installed.
 **Single-analysis commands (legacy, still available)**
 ```bash
 fastmda rmsd   -traj traj.dcd -top top.pdb --ref 0     # aliases: --reference-frame, -ref
-fastmda rmsf  -traj traj.dcd -top top.pdb
-fastmda rg     -traj traj.dcd -top top.pdb
 fastmda ss -traj traj.dcd -top top.pdb
 fastmda cluster -traj traj.dcd -top top.pdb --methods kmeans hierarchical --n_clusters 5
 ```
@@ -217,7 +212,7 @@ fastmda analyze -h
 # Citation
 If you use `FastMDAnalysis` in your work, please cite:
 
-Adekunle Aina and Derrick Kwan. *FastMDAnalysis: Software for Automated Analysis of Molecular Dynamics Trajectories.* Zenodo 2025. https://doi.org/10.5281/zenodo.17510591
+Aina, A. and Kwan, D. (2025) “FastMDAnalysis: Software for Automated Analysis of Molecular Dynamics Trajectories”. Zenodo. https://doi.org/10.5281/zenodo.17510591
 
 ```bibtex
 @software{fastmdanalysis,

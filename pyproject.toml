@@ -46,6 +46,8 @@ test = [
 Repository = "https://github.com/aai-research-lab/FastMDAnalysis"
 Documentation = "https://fastmdanalysis.readthedocs.io"
 Issues = "https://github.com/aai-research-lab/FastMDAnalysis/issues"
+Changelog = "https://github.com/aai-research-lab/FastMDAnalysis/blob/main/CHANGELOG.md"
+Archive = "https://doi.org/10.5281/zenodo.17510591" 
 
 [project.scripts]
 # Explicit module:function entrypoint

@@ -34,6 +34,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
 
 from .base import BaseAnalysis, AnalysisError
+from ..utils.options import OptionsForwarder
 
 
 # Order matters: numeric codes 0..7 map to these labels/colors
@@ -80,7 +81,20 @@ SS_CODE_ROWS = [
 
 
 class SSAnalysis(BaseAnalysis):
-    def __init__(self, trajectory, atoms: Optional[str] = None, **kwargs):
+    _ALIASES = {
+        "atom_indices": "atoms",
+        "selection": "atoms",
+    }
+    
+    def __init__(
+        self, 
+        trajectory, 
+        atoms: Optional[str] = None,
+        algorithm: str = "dssp",
+        mkdssp_path: Optional[str] = None,
+        strict: bool = False,
+        **kwargs
+    ):
         """
         Parameters
         ----------
@@ -89,11 +103,46 @@ class SSAnalysis(BaseAnalysis):
         atoms : str, optional
             MDTraj selection string. If provided, SS will be computed on that subset.
             If None, all atoms are used.
+            Aliases: atom_indices, selection
+        algorithm : str
+            Secondary structure algorithm (default: "dssp"). Currently only DSSP is supported.
+        mkdssp_path : str, optional
+            Path to mkdssp executable if needed (MDTraj typically auto-detects).
+        strict : bool
+            If True, raise errors for unknown options. If False, log warnings.
         kwargs : dict
             Passed to BaseAnalysis.
         """
-        super().__init__(trajectory, **kwargs)
+        warn_unknown = kwargs.pop("_warn_unknown", False)
+
+        analysis_opts = {
+            "atoms": atoms,
+            "algorithm": algorithm,
+            "mkdssp_path": mkdssp_path,
+            "strict": strict,
+        }
+        analysis_opts.update(kwargs)
+        
+        forwarder = OptionsForwarder(aliases=self._ALIASES, strict=strict)
+        resolved = forwarder.apply_aliases(analysis_opts)
+        resolved = forwarder.filter_known(
+            resolved,
+            {"atoms", "algorithm", "mkdssp_path", "strict", "output"},
+            context="ss",
+            warn=warn_unknown,
+        )
+
+        atoms = resolved.get("atoms", None)
+        algorithm = resolved.get("algorithm", "dssp")
+        mkdssp_path = resolved.get("mkdssp_path", None)
+        base_kwargs = {k: v for k, v in resolved.items() 
+                      if k not in ("atoms", "algorithm", "mkdssp_path", "strict")}
+
+        super().__init__(trajectory, **base_kwargs)
         self.atoms = atoms
+        self.algorithm = algorithm.lower()
+        self.mkdssp_path = mkdssp_path
+        self.strict = strict
         self.data: Optional[np.ndarray] = None  # will hold letter codes (n_frames, n_residues)
 
     # -------------------------- helpers --------------------------

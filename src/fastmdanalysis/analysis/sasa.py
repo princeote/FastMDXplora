@@ -30,6 +30,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from .base import BaseAnalysis, AnalysisError
+from ..utils.options import OptionsForwarder
 
 logger = logging.getLogger(__name__)
 
@@ -43,22 +44,68 @@ def _auto_tick_step(n: int, max_ticks: int) -> int:
 
 
 class SASAAnalysis(BaseAnalysis):
-    def __init__(self, trajectory, probe_radius: float = 0.14, atoms: Optional[str] = None, **kwargs):
+    _ALIASES = {
+        "probe_radius_nm": "probe_radius",
+        "atom_indices": "atoms",
+        "selection": "atoms",
+    }
+    
+    def __init__(
+        self, 
+        trajectory, 
+        probe_radius: float = 0.14, 
+        atoms: Optional[str] = None,
+        n_sphere_points: Optional[int] = None,
+        strict: bool = False,
+        **kwargs
+    ):
         """
         Parameters
         ----------
         trajectory : mdtraj.Trajectory
             Trajectory to analyze.
         probe_radius : float
-            Probe radius in nm (default 0.14 nm).
+            Probe radius in nm (default 0.14 nm). Alias: probe_radius_nm
         atoms : str or None
             MDTraj atom selection string. If None, uses all atoms.
+            Aliases: atom_indices, selection
+        n_sphere_points : int, optional
+            Number of sphere points for SASA calculation (default uses MDTraj default).
+        strict : bool
+            If True, raise errors for unknown options. If False, log warnings.
         kwargs : dict
             Passed to BaseAnalysis (e.g., output directory).
         """
-        super().__init__(trajectory, **kwargs)
+        warn_unknown = kwargs.pop("_warn_unknown", False)
+
+        analysis_opts = {
+            "probe_radius": probe_radius,
+            "atoms": atoms,
+            "n_sphere_points": n_sphere_points,
+            "strict": strict,
+        }
+        analysis_opts.update(kwargs)
+        
+        forwarder = OptionsForwarder(aliases=self._ALIASES, strict=strict)
+        resolved = forwarder.apply_aliases(analysis_opts)
+        resolved = forwarder.filter_known(
+            resolved,
+            {"probe_radius", "atoms", "n_sphere_points", "strict", "output"},
+            context="sasa",
+            warn=warn_unknown,
+        )
+
+        probe_radius = resolved.get("probe_radius", 0.14)
+        atoms = resolved.get("atoms", None)
+        n_sphere_points = resolved.get("n_sphere_points", None)
+        base_kwargs = {k: v for k, v in resolved.items() 
+                      if k not in ("probe_radius", "atoms", "n_sphere_points", "strict")}
+
+        super().__init__(trajectory, **base_kwargs)
         self.probe_radius = float(probe_radius)
         self.atoms = atoms
+        self.n_sphere_points = int(n_sphere_points) if n_sphere_points is not None else None
+        self.strict = strict
         self.data: Optional[Dict[str, np.ndarray]] = None
         self.results: Dict[str, np.ndarray] = {}
 
@@ -94,15 +141,18 @@ class SASAAnalysis(BaseAnalysis):
                 T, subtraj.n_atoms, self.probe_radius
             )
 
-            # --- Compute per-residue SASA (robust to MDTraj versions)
             residue_sasa = None
+            sasa_kwargs = {"probe_radius": self.probe_radius}
+            if self.n_sphere_points is not None:
+                sasa_kwargs["n_sphere_points"] = self.n_sphere_points
+            
             try:
                 # Newer MDTraj versions support mode="residue"
-                residue_sasa = md.shrake_rupley(subtraj, probe_radius=self.probe_radius, mode="residue")
+                residue_sasa = md.shrake_rupley(subtraj, mode="residue", **sasa_kwargs)
                 # shape (T, R)
             except TypeError:
                 # Fallback: compute per-atom SASA then sum by residue
-                atom_sasa = md.shrake_rupley(subtraj, probe_radius=self.probe_radius)  # (T, A)
+                atom_sasa = md.shrake_rupley(subtraj, **sasa_kwargs)  # (T, A)
                 # Map atoms -> residue index (0..R-1 within subtraj topology)
                 atom_res = np.array([a.residue.index for a in subtraj.topology.atoms], dtype=int)
                 R = int(max(atom_res) + 1) if atom_res.size else 0

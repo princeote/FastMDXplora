@@ -1,6 +1,9 @@
-![FastMDAnalysis Banner](assets/fastmdanalysis_banner.png)
-
 [![DOI](https://zenodo.org/badge/965215244.svg)](https://doi.org/10.5281/zenodo.17510591)
+[![Total PyPI downloads](https://pepy.tech/badge/fastmdanalysis)](https://pepy.tech/project/fastmdanalysis)
+[![Monthly PyPI downloads](https://pepy.tech/badge/fastmdanalysis/month)](https://pepy.tech/project/fastmdanalysis) 
+
+![FastMDAnalysis](assets/fastmdanalysis_banner.png)
+
 [![Tests](https://github.com/aai-research-lab/FastMDAnalysis/actions/workflows/test.yml/badge.svg)](https://github.com/aai-research-lab/FastMDAnalysis/actions)
 [![codecov](https://codecov.io/gh/aai-research-lab/FastMDAnalysis/branch/main/graph/badge.svg)](https://codecov.io/gh/aai-research-lab/FastMDAnalysis)
 [![Docs](https://img.shields.io/badge/docs-latest-brightgreen.svg)](https://fastmdanalysis.readthedocs.io/en/latest/)
@@ -104,7 +107,7 @@ fastmda analyze -traj traj.dcd -top top.pdb --options options.yaml
 ```
 **Create a slide deck from generated figures**
 ```bash
-fastmda analyze -traj traj.dcd -top top.pdb --options options.yaml --slides
+fastmda analyze -traj traj.dcd -top top.pdb  --slides
 ```
 
 
@@ -231,7 +234,7 @@ Aina, A. and Kwan, D. (2025) “FastMDAnalysis: Software for Automated Analysis 
 
 # Acknowledgements
 
-``FastMDAnalysis`` builds upon excellent open-source libraries to provide its high-performance analysis capabilities and to improve workflow efficiency, accessibility, usability, and reproducibility in molecular dynamics trajectory analysis. We gratefully acknowledge:
+``FastMDAnalysis`` builds upon excellent open-source libraries to provide its high-performance analysis capabilities and to improve workflow efficiency, usability, and reproducibility in molecular dynamics trajectory analysis. We gratefully acknowledge:
 
 - ``MDTraj`` for foundational trajectory I/O and analysis modules
 - ``NumPy/SciPy`` for efficient numerical computations

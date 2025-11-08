@@ -55,6 +55,7 @@ def _handle(args: argparse.Namespace, fastmda, logger: logging.Logger) -> None:
         stop_on_error=args.stop_on_error,
         verbose=True,     # keep progress prints
         slides=args.slides,  # bool or OUT.pptx
+        output=args.output,  # custom output directory
     )
 
     # Summary (exclude slides entry here)

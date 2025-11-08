@@ -112,17 +112,26 @@ def _filter_kwargs(callable_obj, kwargs: Mapping[str, Any]) -> Dict[str, Any]:
     """
     Pass only keyword arguments that the callable explicitly declares.
 
-    Even if the callable accepts **kwargs, we still drop unknown keys here so the
-    orchestrator can warn the user (tests expect this behavior).
+    If the callable exposes **kwargs we forward everything so downstream alias
+    mapping and strict-mode handling can decide what to keep.
     """
     if not kwargs:
         return {}
     sig = inspect.signature(callable_obj)
+    has_var_keyword = False
     accepted = {
         name
         for name, p in sig.parameters.items()
         if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
     }
+    for p in sig.parameters.values():
+        if p.kind == p.VAR_KEYWORD:
+            has_var_keyword = True
+            break
+
+    if has_var_keyword:
+        return dict(kwargs)
+
     return {k: v for k, v in kwargs.items() if k in accepted}
 
 
@@ -214,14 +223,28 @@ def run(
     verbose: bool = True,
     slides: Optional[Union[bool, str, Path]] = None,
     output: Optional[Union[str, Path]] = None,
+    strict: bool = False,
 ) -> Dict[str, AnalysisResult]:
     """
     Execute multiple analyses on the current FastMDAnalysis instance and
     collect all generated outputs into a single directory.
+    
+    Parameters
+    ----------
+    strict : bool
+        If True, raise errors for unknown options in analysis calls.
+        If False, log warnings (default).
     """
     available = _discover_available(self)
     plan = _final_list(available, include, exclude)
     opts = _validate_options(options)
+    
+    if strict:
+        for analysis in plan:
+            if analysis in opts:
+                opts[analysis]["strict"] = True
+            else:
+                opts[analysis] = {"strict": True}
 
     # Inject cluster defaults so kmeans & hierarchical run by default
     _inject_cluster_defaults(self, opts, plan)
@@ -253,7 +276,8 @@ def run(
             warnings.warn(f"Skipping '{name}' (not implemented on this instance).")
             continue
 
-        kw = _filter_kwargs(fn, opts.get(name, {}))
+        kw = dict(_filter_kwargs(fn, opts.get(name, {})))
+        kw.setdefault("_warn_unknown", True)
 
         if verbose and opts.get(name):
             dropped = set(opts[name].keys()) - set(kw.keys())
@@ -280,7 +304,7 @@ def run(
             err = e
             if verbose:
                 print(" failed")
-            if stop_on_error:
+            if stop_on_error or opts.get(name, {}).get("strict"):
                 raise
         finally:
             dt = time.perf_counter() - t0
@@ -367,6 +391,7 @@ def analyze(
     verbose: bool = True,
     slides: Optional[Union[bool, str, Path]] = None,
     output: Optional[Union[str, Path]] = None,
+    strict: bool = False,
 ) -> Dict[str, AnalysisResult]:
     """Public façade so callers can do: fastmda.analyze(...)"""
     return run(
@@ -378,4 +403,5 @@ def analyze(
         verbose=verbose,
         slides=slides,
         output=output,
+        strict=strict,
     )

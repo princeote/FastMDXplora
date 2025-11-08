@@ -34,6 +34,7 @@ from matplotlib.cm import ScalarMappable
 from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
 
 from .base import BaseAnalysis, AnalysisError
+from ..utils.options import OptionsForwarder
 
 # Module logger (configured by CLI / caller)
 logger = logging.getLogger(__name__)
@@ -138,6 +139,12 @@ def dendrogram_link_color_func_factory(linkage_matrix, final_labels):
 # ------------------------------- Core class -----------------------------------
 
 class ClusterAnalysis(BaseAnalysis):
+    _ALIASES = {
+        "method": "methods",
+        "atom_indices": "atoms",
+        "selection": "atoms",
+    }
+    
     def __init__(
         self,
         trajectory,
@@ -146,6 +153,10 @@ class ClusterAnalysis(BaseAnalysis):
         min_samples: int = 5,
         n_clusters: Optional[int] = None,
         atoms: Optional[str] = None,
+        random_state: int = 42,
+        n_init: Union[int, str] = 10,
+        linkage_method: str = "ward",
+        strict: bool = False,
         **kwargs
     ):
         """
@@ -154,6 +165,7 @@ class ClusterAnalysis(BaseAnalysis):
         methods : {"all"} | str | list[str]
             Which clustering methods to run. Default "all" expands to
             ["dbscan", "kmeans", "hierarchical"].
+            Alias: method (singular)
         eps : float
             DBSCAN epsilon in **nm** (MDTraj RMSD units). 0.2 nm ≈ 2 Å is a good starting point.
         min_samples : int
@@ -162,8 +174,68 @@ class ClusterAnalysis(BaseAnalysis):
             If None and methods include kmeans/hierarchical, defaults to 3.
         atoms : str, optional
             MDTraj atom selection string used to slice the trajectory for all methods.
+            Aliases: atom_indices, selection
+        random_state : int
+            Random seed for KMeans (default 42).
+        n_init : int or "auto"
+            Number of KMeans initializations (default 10).
+        linkage_method : str
+            Linkage method for hierarchical clustering (default "ward").
+            Alias: linkage
+        strict : bool
+            If True, raise errors for unknown options. If False, log warnings.
         """
-        super().__init__(trajectory, **kwargs)
+        warn_unknown = kwargs.pop("_warn_unknown", False)
+
+        analysis_opts = {
+            "methods": methods,
+            "eps": eps,
+            "min_samples": min_samples,
+            "n_clusters": n_clusters,
+            "atoms": atoms,
+            "random_state": random_state,
+            "n_init": n_init,
+            "linkage_method": linkage_method,
+            "strict": strict,
+        }
+        analysis_opts.update(kwargs)
+        
+        if "linkage" in analysis_opts and "linkage_method" not in kwargs:
+            analysis_opts["linkage_method"] = analysis_opts.pop("linkage")
+        
+        forwarder = OptionsForwarder(aliases=self._ALIASES, strict=strict)
+        resolved = forwarder.apply_aliases(analysis_opts)
+        resolved = forwarder.filter_known(
+            resolved,
+            {
+                "methods",
+                "eps",
+                "min_samples",
+                "n_clusters",
+                "atoms",
+                "random_state",
+                "n_init",
+                "linkage_method",
+                "strict",
+                "output",
+            },
+            context="cluster",
+            warn=warn_unknown,
+        )
+
+        methods = resolved.get("methods", "all")
+        eps = resolved.get("eps", 0.2)
+        min_samples = resolved.get("min_samples", 5)
+        n_clusters = resolved.get("n_clusters", None)
+        atoms = resolved.get("atoms", None)
+        random_state = resolved.get("random_state", 42)
+        n_init = resolved.get("n_init", 10)
+        linkage_method = resolved.get("linkage_method", "ward")
+        base_kwargs = {k: v for k, v in resolved.items() 
+                      if k not in ("methods", "eps", "min_samples", "n_clusters", 
+                                  "atoms", "random_state", "n_init", "linkage_method", "strict", "linkage")}
+
+        super().__init__(trajectory, **base_kwargs)
 
         # Normalize methods
         if isinstance(methods, str):
@@ -180,6 +252,10 @@ class ClusterAnalysis(BaseAnalysis):
         self.min_samples = int(min_samples)
         self.n_clusters = int(n_clusters) if (n_clusters is not None and int(n_clusters) > 0) else None
         self.atoms = atoms
+        self.random_state = int(random_state)
+        self.n_init = n_init if isinstance(n_init, str) else int(n_init)
+        self.linkage_method = linkage_method
+        self.strict = strict
 
         self.atom_indices = self.traj.topology.select(self.atoms) if self.atoms is not None else None
         if self.atoms and (self.atom_indices is None or len(self.atom_indices) == 0):
@@ -405,7 +481,11 @@ class ClusterAnalysis(BaseAnalysis):
                 elif key == "kmeans":
                     if self.n_clusters is None or self.n_clusters < 1:
                         raise AnalysisError("For KMeans clustering, n_clusters must be provided and >=1.")
-                    km = KMeans(n_clusters=int(self.n_clusters), random_state=42, n_init=10)
+                    km = KMeans(
+                        n_clusters=int(self.n_clusters), 
+                        random_state=self.random_state, 
+                        n_init=self.n_init
+                    )
                     labels0 = km.fit_predict(X_flat).astype(int, copy=False)  # 0..K-1
                     labels = labels0 + 1                                      # 1..K
                     frame_idx = np.arange(labels.size, dtype=int)
@@ -429,8 +509,8 @@ class ClusterAnalysis(BaseAnalysis):
                 elif key == "hierarchical":
                     if self.n_clusters is None or self.n_clusters < 1:
                         raise AnalysisError("For hierarchical clustering, n_clusters must be provided and >=1.")
-                    logger.info("Computing Ward linkage for hierarchical clustering...")
-                    Z = linkage(X_flat, method="ward")
+                    logger.info("Computing %s linkage for hierarchical clustering...", self.linkage_method)
+                    Z = linkage(X_flat, method=self.linkage_method)
                     labels = fcluster(Z, t=int(self.n_clusters), criterion="maxclust").astype(int, copy=False)  # 1..K
                     frame_idx = np.arange(labels.size, dtype=int)
                     results["hierarchical"] = {

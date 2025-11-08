@@ -37,6 +37,10 @@ def register(subparsers: argparse._SubParsersAction, common_parser: argparse.Arg
         "--slides", nargs="?", const=True, metavar="OUT.pptx",
         help="Create a PowerPoint deck of figures (optionally specify output path).",
     )
+    p.add_argument(
+        "--strict", action="store_true",
+        help="Enable strict mode: raise errors for unknown options (default: log warnings).",
+    )
     p.set_defaults(_handler=_handle)
 
 
@@ -55,6 +59,7 @@ def _handle(args: argparse.Namespace, fastmda, logger: logging.Logger) -> None:
         stop_on_error=args.stop_on_error,
         verbose=True,     # keep progress prints
         slides=args.slides,  # bool or OUT.pptx
+        strict=args.strict,  # strict mode flag
         output=args.output,  # custom output directory
     )
 

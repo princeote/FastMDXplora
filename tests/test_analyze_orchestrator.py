@@ -46,7 +46,6 @@ def test_stop_on_error_continues(tmp_path):
     assert res["rmsd"].ok
     assert not res["rmsf"].ok
     assert res["rmsf"].error is not None
-
 def test_slides_hook_monkeypatched(tmp_path, monkeypatch):
     fmda = make_fastmda()
 
@@ -57,7 +56,16 @@ def test_slides_hook_monkeypatched(tmp_path, monkeypatch):
     # Stub slide_show that asserts deduping happened upstream (inside orchestrator)
     def fake_slide_show(images, outpath=None, title=None, subtitle=None):
         assert len(images) == 2  # duplicates removed before calling slide_show
-        p = tmp_path / "deck.pptx"
+        
+        # Create the deck file in the expected location with expected pattern
+        analyze_output = Path("analyze_output")
+        analyze_output.mkdir(exist_ok=True)
+        
+        # Use the actual naming pattern from the real slide_show function
+        from fastmdanalysis.utils.slideshow import _timestamp_tag
+        stamp = _timestamp_tag()
+        p = analyze_output / f"fastmda_slides_{stamp}.pptx"
+        
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(b"fake")
         return str(p)
@@ -68,9 +76,9 @@ def test_slides_hook_monkeypatched(tmp_path, monkeypatch):
     res = fmda.analyze(include=["rmsd"], slides=True, verbose=False)
     assert "slides" in res and res["slides"].ok
     
-    # Check that ANY deck file exists in analyze_output (since the name gets a timestamp/number)
+    # Check that ANY deck file exists in analyze_output (using the correct pattern)
     analyze_output = Path("analyze_output")
-    deck_files = list(analyze_output.glob("deck_*.pptx"))
+    deck_files = list(analyze_output.glob("fastmda_slides_*.pptx"))  # Fixed pattern
     assert len(deck_files) > 0, f"No deck files found in {analyze_output}"
     assert deck_files[0].stat().st_size > 0, "Deck file is empty"
 

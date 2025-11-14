@@ -396,7 +396,8 @@ def test_print_summary():
         assert "rmsf" in output
         assert "OK" in output
         assert "FAIL" in output
-        assert "/test/output" in output
+        expected_path = str(output_dir.resolve())
+        assert expected_path in output
     finally:
         sys.stdout = old_stdout  
 

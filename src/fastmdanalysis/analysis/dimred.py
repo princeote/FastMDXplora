@@ -10,6 +10,7 @@ from sklearn.manifold import MDS, TSNE
 
 from .base import BaseAnalysis
 from ..utils.options import OptionsForwarder
+from ..utils.plotting import apply_slide_style
 
 
 PathLike = Union[str, Path]
@@ -215,6 +216,14 @@ class DimRedAnalysis(BaseAnalysis):
         # Remove top and right spines
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
+
+        apply_slide_style(
+            ax,
+            x_values=emb[:, 0],
+            y_values=emb[:, 1],
+            x_max_ticks=6,
+            y_max_ticks=6,
+        )
 
         # Save plot using BaseAnalysis method
         out = self._save_plot(fig, f"dimred_{name}")

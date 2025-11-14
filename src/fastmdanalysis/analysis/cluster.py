@@ -35,6 +35,7 @@ from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
 
 from .base import BaseAnalysis, AnalysisError
 from ..utils.options import OptionsForwarder
+from ..utils.plotting import apply_slide_style, auto_ticks
 
 # Module logger (configured by CLI / caller)
 logger = logging.getLogger(__name__)
@@ -302,15 +303,22 @@ class ClusterAnalysis(BaseAnalysis):
         logger.info("Plotting population bar plot...")
         unique = np.sort(np.unique(labels))
         counts = np.array([np.sum(labels == u) for u in unique])
-        fig = plt.figure(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(10, 6))
         cmap = get_cluster_cmap(len(unique))
         norm = get_discrete_norm(unique)
-        plt.bar(unique, counts, width=0.8, color=[cmap(norm(u)) for u in unique])
-        plt.title(kwargs.get("title", "Cluster Populations"))
-        plt.xlabel(kwargs.get("xlabel", "Cluster ID (compact)"))
-        plt.ylabel(kwargs.get("ylabel", "Number of Frames"))
-        plt.xticks(unique)
-        plt.grid(alpha=0.3)
+        ax.bar(unique, counts, width=0.8, color=[cmap(norm(u)) for u in unique])
+        ax.set_title(kwargs.get("title", "Cluster Populations"))
+        ax.set_xlabel(kwargs.get("xlabel", "Cluster ID (compact)"))
+        ax.set_ylabel(kwargs.get("ylabel", "Number of Frames"))
+        ax.grid(alpha=0.3)
+        apply_slide_style(
+            ax,
+            x_ticks=unique,
+            y_values=counts,
+            integer_x=True,
+            integer_y=True,
+            zero_y=True,
+        )
         return self._save_plot(fig, filename)
 
     def _plot_cluster_trajectory_histogram(self, labels, filename, **kwargs):
@@ -327,6 +335,14 @@ class ClusterAnalysis(BaseAnalysis):
         cbar = fig.colorbar(im, ax=ax, orientation="vertical", ticks=unique)
         cbar.ax.set_yticklabels([str(u) for u in unique])
         cbar.set_label("Cluster (compact)")
+        apply_slide_style(
+            ax,
+            x_values=np.arange(image_data.shape[1], dtype=int),
+            integer_x=True,
+            x_max_ticks=10,
+            zero_x=True,
+        )
+        ax.set_yticks([])
         return self._save_plot(fig, filename)
 
     def _plot_cluster_trajectory_scatter(self, labels, filename, **kwargs):
@@ -345,17 +361,37 @@ class ClusterAnalysis(BaseAnalysis):
         cbar = fig.colorbar(sm, ax=ax, orientation="vertical", ticks=unique)
         cbar.ax.set_yticklabels([str(u) for u in unique])
         cbar.set_label("Cluster (compact)")
+        apply_slide_style(
+            ax,
+            x_values=frames,
+            y_ticks=[0.0],
+            integer_x=True,
+            x_max_ticks=10,
+            zero_x=True,
+            zero_y=True,
+        )
+        ax.set_yticks([])
         return self._save_plot(fig, filename)
 
     def _plot_distance_matrix(self, distances, filename, **kwargs):
         logger.info("Plotting distance matrix heatmap...")
-        fig = plt.figure(figsize=(10, 8))
-        im = plt.imshow(distances, aspect="auto", interpolation="none", cmap=kwargs.get("cmap", "viridis"))
-        plt.title(kwargs.get("title", "RMSD Distance Matrix (nm)"))
-        plt.xlabel(kwargs.get("xlabel", "Frame"))
-        plt.ylabel(kwargs.get("ylabel", "Frame"))
-        cbar = plt.colorbar(im, ax=plt.gca())
+        fig, ax = plt.subplots(figsize=(10, 8))
+        im = ax.imshow(distances, aspect="auto", interpolation="none", cmap=kwargs.get("cmap", "viridis"))
+        ax.set_title(kwargs.get("title", "RMSD Distance Matrix (nm)"))
+        ax.set_xlabel(kwargs.get("xlabel", "Frame"))
+        ax.set_ylabel(kwargs.get("ylabel", "Frame"))
+        cbar = fig.colorbar(im, ax=ax)
         cbar.set_label("RMSD (nm)")
+        frames = np.arange(distances.shape[0], dtype=int)
+        apply_slide_style(
+            ax,
+            x_values=frames,
+            y_values=frames,
+            integer_x=True,
+            integer_y=True,
+            zero_x=True,
+            zero_y=True,
+        )
         return self._save_plot(fig, filename)
 
     def _plot_dendrogram(self, linkage_matrix, labels, filename, **kwargs):
@@ -380,16 +416,24 @@ class ClusterAnalysis(BaseAnalysis):
         fig, ax = plt.subplots(figsize=(12, 6))
         dendro = dendrogram(linkage_matrix, ax=ax, labels=explicit_labels, link_color_func=color_func)
         new_labels = [str(labels[i]) if i < len(labels) else "NA" for i in dendro["leaves"]]
-        ax.set_xticklabels(new_labels, rotation=90)
         unique = np.sort(np.unique(labels))
         cmap_local = get_cluster_cmap(len(unique))
         norm_local = get_discrete_norm(unique)
-        for tick, i in zip(ax.get_xticklabels(), dendro["leaves"]):
-            if i < len(labels):
-                tick.set_color(cmap_local(norm_local(labels[i])))
         ax.set_title(kwargs.get("title", "Hierarchical Clustering Dendrogram"))
         ax.set_xlabel(kwargs.get("xlabel", "Frame (Cluster Assignment)"))
         ax.set_ylabel(kwargs.get("ylabel", "Distance"))
+        apply_slide_style(
+            ax,
+            x_ticks=ax.get_xticks(),
+            y_values=ax.get_ylim(),
+            integer_x=True,
+            zero_y=True,
+        )
+        tick_font = ax.get_xticklabels()[0].get_fontsize() if ax.get_xticklabels() else None
+        ax.set_xticklabels(new_labels, rotation=90, rotation_mode="anchor", fontsize=tick_font)
+        for tick, i in zip(ax.get_xticklabels(), dendro["leaves"]):
+            if i < len(labels):
+                tick.set_color(cmap_local(norm_local(labels[i])))
         return self._save_plot(fig, filename)
 
     def _save_plot(self, fig, name: str):

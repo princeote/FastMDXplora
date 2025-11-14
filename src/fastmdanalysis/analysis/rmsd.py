@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 
 from .base import BaseAnalysis, AnalysisError
 from ..utils.options import OptionsForwarder
+from ..utils.plotting import apply_slide_style
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +237,16 @@ class RMSDAnalysis(BaseAnalysis):
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.grid(alpha=0.3)
+        apply_slide_style(
+            ax,
+            x_values=x,
+            y_values=y,
+            integer_x=True,
+            x_max_ticks=8,
+            y_max_ticks=6,
+            zero_x=True,
+            zero_y=True,
+        )
         fig.tight_layout()
 
         out = self._save_plot(fig, "rmsd")

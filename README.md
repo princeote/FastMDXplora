@@ -1,6 +1,5 @@
-[![DOI](https://zenodo.org/badge/965215244.svg)](https://doi.org/10.5281/zenodo.17510591)
+[![DOI](https://img.shields.io/badge/DOI-10.26434/chemrxiv--2025--x8xnq-blue)](https://doi.org/10.26434/chemrxiv-2025-x8xnq)
 [![Total PyPI downloads](https://pepy.tech/badge/fastmdanalysis)](https://pepy.tech/project/fastmdanalysis)
-[![Monthly PyPI downloads](https://pepy.tech/badge/fastmdanalysis/month)](https://pepy.tech/project/fastmdanalysis) 
 
 ![FastMDAnalysis](assets/fastmdanalysis_banner.png)
 
@@ -22,7 +21,8 @@
 <!-- Simplify your workflow by loading a trajectory once (with options for frame and atom selection) and then performing multiple analyses without repeating input file details. --> 
 <!--  Automatically generate publication-quality figures (with options for customization) -->
 <!--  Use the Python API or the Command‐Line Interface (CLI) -->
-<!-- [![Documentation](https://readthedocs.org/projects/fastmdanalysis/badge/?version=latest)](https://fastmdanalysis.readthedocs.io) --> 
+<!-- [![Documentation](https://readthedocs.org/projects/fastmdanalysis/badge/?version=latest)](https://fastmdanalysis.readthedocs.io) 
+<!-- [![Monthly PyPI downloads](https://pepy.tech/badge/fastmdanalysis/month)](https://pepy.tech/project/fastmdanalysis) --> 
 
 
 
@@ -216,16 +216,17 @@ fastmda analyze -h
 # Citation
 If you use `FastMDAnalysis` in your work, please cite:
 
-Aina, A. and Kwan, D. (2025) “FastMDAnalysis: Software for Automated Analysis of Molecular Dynamics Trajectories”. Zenodo. https://doi.org/10.5281/zenodo.17510591
+Aina, A. and Kwan, D. (2025) “FastMDAnalysis: Software for Automated Analysis of Molecular Dynamics Trajectories”. ChemRxiv. https://doi.org/10.26434/chemrxiv-2025-x8xnq
 
 ```bibtex
-@software{fastmdanalysis,
+@article{fastmdanalysis,
   author       = {Adekunle Aina and Derrick Kwan},
   title        = {FastMDAnalysis: Software for Automated Analysis of Molecular Dynamics Trajectories},
   year         = {2025},
-  doi          = {10.5281/zenodo.17510591},
-  publisher    = {Zenodo},
-  url          = {https://doi.org/10.5281/zenodo.17510591}
+  doi          = {10.26434/chemrxiv-2025-x8xnq},
+  publisher    = {ChemRxiv},
+  url          = {https://doi.org/10.26434/chemrxiv-2025-x8xnq},
+  type         = {preprint}
 }
 ```
 

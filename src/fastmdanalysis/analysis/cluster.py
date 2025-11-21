@@ -37,6 +37,10 @@ from .base import BaseAnalysis, AnalysisError
 from ..utils.options import OptionsForwarder
 from ..utils.plotting import apply_slide_style, auto_ticks
 
+CLUSTER_AXIS_LABEL = "Cluster ID"
+CLUSTER_TITLE_SIZE = 26.0
+CLUSTER_COLORBAR_KW = {"fraction": 0.085, "pad": 0.02}
+
 # Module logger (configured by CLI / caller)
 logger = logging.getLogger(__name__)
 
@@ -307,10 +311,10 @@ class ClusterAnalysis(BaseAnalysis):
         cmap = get_cluster_cmap(len(unique))
         norm = get_discrete_norm(unique)
         ax.bar(unique, counts, width=0.8, color=[cmap(norm(u)) for u in unique])
+        ax.grid(False)
         ax.set_title(kwargs.get("title", "Cluster Populations"))
-        ax.set_xlabel(kwargs.get("xlabel", "Cluster ID (compact)"))
+        ax.set_xlabel(kwargs.get("xlabel", CLUSTER_AXIS_LABEL))
         ax.set_ylabel(kwargs.get("ylabel", "Number of Frames"))
-        ax.grid(alpha=0.3)
         apply_slide_style(
             ax,
             x_ticks=unique,
@@ -318,6 +322,7 @@ class ClusterAnalysis(BaseAnalysis):
             integer_x=True,
             integer_y=True,
             zero_y=True,
+            title_size=kwargs.get("title_size", CLUSTER_TITLE_SIZE),
         )
         return self._save_plot(fig, filename)
 
@@ -329,20 +334,31 @@ class ClusterAnalysis(BaseAnalysis):
         norm = get_discrete_norm(unique)
         fig, ax = plt.subplots(figsize=(12, 4))
         im = ax.imshow(image_data, aspect="auto", interpolation="nearest", cmap=cmap, norm=norm)
+        ax.grid(False)
         ax.set_title(kwargs.get("title", "Cluster Trajectory Histogram"))
         ax.set_xlabel(kwargs.get("xlabel", "Frame"))
         ax.set_yticks([])
-        cbar = fig.colorbar(im, ax=ax, orientation="vertical", ticks=unique)
+        cbar = fig.colorbar(
+            im,
+            ax=ax,
+            orientation="vertical",
+            ticks=unique,
+            **CLUSTER_COLORBAR_KW,
+        )
         cbar.ax.set_yticklabels([str(u) for u in unique])
-        cbar.set_label("Cluster (compact)")
+        cbar.set_label(CLUSTER_AXIS_LABEL)
         apply_slide_style(
             ax,
             x_values=np.arange(image_data.shape[1], dtype=int),
             integer_x=True,
             x_max_ticks=10,
             zero_x=True,
+            title_size=kwargs.get("title_size", CLUSTER_TITLE_SIZE),
         )
         ax.set_yticks([])
+        label_size = ax.xaxis.label.get_fontsize()
+        cbar.ax.yaxis.label.set_fontsize(label_size)
+        cbar.ax.tick_params(labelsize=label_size)
         return self._save_plot(fig, filename)
 
     def _plot_cluster_trajectory_scatter(self, labels, filename, **kwargs):
@@ -353,14 +369,21 @@ class ClusterAnalysis(BaseAnalysis):
         cmap = get_cluster_cmap(len(unique))
         norm = get_discrete_norm(unique)
         ax.scatter(frames, np.zeros_like(frames), c=labels, s=100, cmap=cmap, norm=norm, marker="o")
+        ax.grid(False)
         ax.set_title(kwargs.get("title", "Cluster Trajectory Scatter Plot"))
         ax.set_xlabel(kwargs.get("xlabel", "Frame"))
         ax.set_yticks([])
         sm = ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
-        cbar = fig.colorbar(sm, ax=ax, orientation="vertical", ticks=unique)
+        cbar = fig.colorbar(
+            sm,
+            ax=ax,
+            orientation="vertical",
+            ticks=unique,
+            **CLUSTER_COLORBAR_KW,
+        )
         cbar.ax.set_yticklabels([str(u) for u in unique])
-        cbar.set_label("Cluster (compact)")
+        cbar.set_label(CLUSTER_AXIS_LABEL)
         apply_slide_style(
             ax,
             x_values=frames,
@@ -369,8 +392,12 @@ class ClusterAnalysis(BaseAnalysis):
             x_max_ticks=10,
             zero_x=True,
             zero_y=True,
+            title_size=kwargs.get("title_size", CLUSTER_TITLE_SIZE),
         )
         ax.set_yticks([])
+        label_size = ax.xaxis.label.get_fontsize()
+        cbar.ax.yaxis.label.set_fontsize(label_size)
+        cbar.ax.tick_params(labelsize=label_size)
         return self._save_plot(fig, filename)
 
     def _plot_distance_matrix(self, distances, filename, **kwargs):

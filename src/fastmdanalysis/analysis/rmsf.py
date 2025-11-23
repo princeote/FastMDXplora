@@ -27,17 +27,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from .base import BaseAnalysis, AnalysisError
 from ..utils.options import OptionsForwarder
+from ..utils.plotting import apply_slide_style, auto_ticks
 
 logger = logging.getLogger(__name__)
-
-
-def _auto_tick_step(n: int, max_ticks: int) -> int:
-    """Compute a thinning step so that ~max_ticks or fewer labels are drawn."""
-    if n <= 0:
-        return 1
-    if n <= max_ticks:
-        return 1
-    return int(np.ceil(n / float(max_ticks)))
 
 
 class RMSFAnalysis(BaseAnalysis):
@@ -209,11 +201,6 @@ class RMSFAnalysis(BaseAnalysis):
         # Numeric-only atom indices for x-axis (1-based for readability)
         labels_all = [str(i + 1) for i in x]
 
-        # Determine ticks
-        step = tick_step if tick_step is not None else _auto_tick_step(n, max_ticks)
-        ticks = x[::step]
-        ticklabels = [labels_all[i] for i in ticks]
-
         # Plot
         fig, ax = plt.subplots(figsize=figsize)
         bar_kwargs = {"width": 0.9}
@@ -225,11 +212,38 @@ class RMSFAnalysis(BaseAnalysis):
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
 
-        ax.set_xticks(ticks)
-        ax.set_xticklabels(ticklabels, rotation=rotate, ha="right")
-
         ax.grid(axis="y", alpha=0.3)
         ax.grid(axis="x", alpha=0.12)
+
+        if tick_step is not None:
+            step = max(1, int(tick_step))
+            tick_positions = x[::step]
+        else:
+            tick_positions = auto_ticks(x, max_ticks=max_ticks, integer=True)
+            if tick_positions is None or tick_positions.size == 0:
+                tick_positions = x
+        tick_positions = np.asarray(tick_positions, dtype=float)
+        tick_positions = np.clip(tick_positions, 0, n - 1)
+        ticklabels = [labels_all[int(pos)] for pos in tick_positions.astype(int)]
+
+        ax.set_xticks(tick_positions)
+        apply_slide_style(
+            ax,
+            x_ticks=tick_positions,
+            y_values=y,
+            integer_x=True,
+            zero_x=True,
+            zero_y=True,
+            x_tick_rotation=rotate,
+        )
+        tick_font = ax.get_xticklabels()[0].get_fontsize() if ax.get_xticklabels() else None
+        ax.set_xticklabels(
+            ticklabels,
+            rotation=rotate,
+            ha="right",
+            rotation_mode="anchor",
+            fontsize=tick_font,
+        )
 
         fig.tight_layout()
         outpath = self._save_plot(fig, "rmsf")

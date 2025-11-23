@@ -35,6 +35,7 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 
 from .base import BaseAnalysis, AnalysisError
 from ..utils.options import OptionsForwarder
+from ..utils.plotting import apply_slide_style, auto_ticks
 
 
 # Order matters: numeric codes 0..7 map to these labels/colors
@@ -338,31 +339,46 @@ class SSAnalysis(BaseAnalysis):
         Z = numeric.T  # shape: (n_residues, n_frames)
         n_residues = Z.shape[0]
 
-        fig = plt.figure(figsize=(12, 8))
-        im = plt.imshow(
+        fig, ax = plt.subplots(figsize=(12, 8))
+        im = ax.imshow(
             Z,
             aspect="auto",
             interpolation="none",
             cmap=(cmap if cmap is not None else SS_CMAP),
             norm=SS_NORM,
         )
-        plt.title(title)
-        plt.xlabel(xlabel)
-        plt.ylabel(ylabel)
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
 
-        cbar = plt.colorbar(im, ticks=SS_TICKS)
+        cbar = fig.colorbar(im, ax=ax, ticks=SS_TICKS)
         cbar.set_ticklabels(SS_TICK_LABELS)
         cbar.set_label("SS Code")
 
-        # Residue index ticks start at 1 (dense ticks only for small systems)
+        frames = np.arange(Z.shape[1], dtype=int)
+        residues = np.arange(n_residues, dtype=int)
         if n_residues <= 60:
-            plt.yticks(ticks=np.arange(n_residues), labels=np.arange(1, n_residues + 1))
+            res_ticks = residues
         else:
-            step = max(1, n_residues // 30)
-            ticks = np.arange(0, n_residues, step)
-            plt.yticks(ticks=ticks, labels=(ticks + 1))
+            auto = auto_ticks(residues, max_ticks=30, integer=True)
+            res_ticks = auto.astype(int) if auto is not None and auto.size > 0 else residues[:: max(1, n_residues // 30)]
 
-        plt.tight_layout()
+        apply_slide_style(
+            ax,
+            x_values=frames,
+            y_ticks=res_ticks,
+            integer_x=True,
+            integer_y=True,
+        )
+        tick_font = ax.get_yticklabels()[0].get_fontsize() if ax.get_yticklabels() else None
+        ax.set_yticks(res_ticks)
+        ax.set_yticklabels(
+            [str(int(v) + 1) for v in res_ticks],
+            rotation_mode="anchor",
+            fontsize=tick_font,
+        )
+
+        fig.tight_layout()
 
         # Save (BaseAnalysis._save_plot supports filename=)
         try:

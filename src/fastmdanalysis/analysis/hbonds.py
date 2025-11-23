@@ -22,10 +22,10 @@ import mdtraj as md
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
 
 from .base import BaseAnalysis, AnalysisError
 from ..utils.options import OptionsForwarder
+from ..utils.plotting import apply_slide_style
 
 log = logging.getLogger(__name__)
 
@@ -313,17 +313,28 @@ class HBondsAnalysis(BaseAnalysis):
         color = kwargs.get("color")
         linestyle = kwargs.get("linestyle", "-")
 
-        fig = plt.figure(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(10, 6))
         plot_kwargs = {"marker": "o", "linestyle": linestyle}
         if color is not None:
             plot_kwargs["color"] = color
-        plt.plot(frames, np.asarray(data).flatten(), **plot_kwargs)
-        plt.title(title)
-        plt.xlabel(xlabel)
-        plt.ylabel(ylabel)
-        plt.grid(alpha=0.3)
-        ax = plt.gca()
-        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+        y_vals = np.asarray(data, dtype=float).flatten()
+        ax.plot(frames, y_vals, **plot_kwargs)
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.grid(alpha=0.3)
+
+        apply_slide_style(
+            ax,
+            x_values=frames,
+            y_values=y_vals,
+            integer_x=True,
+            integer_y=True,
+            x_max_ticks=8,
+            y_max_ticks=6,
+            zero_x=True,
+            zero_y=True,
+        )
 
         plot_path = self._save_plot(fig, "hbonds")
         plt.close(fig)

@@ -198,8 +198,8 @@ class RMSFAnalysis(BaseAnalysis):
         n = int(y.size)
         x = np.arange(n)
 
-        # Numeric-only atom indices for x-axis (1-based for readability)
-        labels_all = [str(i + 1) for i in x]
+        # Numeric-only atom indices for x-axis (now zero-based to align with other plots)
+        labels_all = [str(i) for i in x]
 
         # Plot
         fig, ax = plt.subplots(figsize=figsize)
@@ -240,6 +240,9 @@ class RMSFAnalysis(BaseAnalysis):
         xticks_after = np.asarray(ax.get_xticks(), dtype=float)
         xticks_after = np.clip(np.rint(xticks_after).astype(int), 0, n - 1)
         xticks_after = np.unique(xticks_after)
+
+        if not np.any(xticks_after == 0):
+            xticks_after = np.insert(xticks_after, 0, 0)
 
         if (
             tick_step is None

@@ -30,6 +30,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm, to_hex
 from matplotlib.cm import ScalarMappable
+from matplotlib.ticker import FixedLocator, FuncFormatter
 
 from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
 
@@ -400,13 +401,22 @@ class ClusterAnalysis(BaseAnalysis):
     def _plot_distance_matrix(self, distances, filename, **kwargs):
         logger.info("Plotting distance matrix heatmap...")
         fig, ax = plt.subplots(figsize=(10, 8))
-        im = ax.imshow(distances, aspect="auto", interpolation="none", cmap=kwargs.get("cmap", "viridis"))
+        im = ax.imshow(
+            distances,
+            aspect="auto",
+            interpolation="none",
+            cmap=kwargs.get("cmap", "viridis"),
+        )
         ax.set_title(kwargs.get("title", "RMSD Distance Matrix (nm)"))
         ax.set_xlabel(kwargs.get("xlabel", "Frame"))
         ax.set_ylabel(kwargs.get("ylabel", "Frame"))
         cbar = fig.colorbar(im, ax=ax)
         cbar.set_label("RMSD (nm)")
-        frames = np.arange(1, distances.shape[0] + 1, dtype=int)
+        n_frames = int(distances.shape[0])
+        ax.set_xlim(0, n_frames)
+        ax.set_ylim(n_frames, 0)
+
+        frames = np.arange(0, n_frames + 1, dtype=int)
         apply_slide_style(
             ax,
             x_values=frames,
@@ -416,6 +426,26 @@ class ClusterAnalysis(BaseAnalysis):
             zero_x=True,
             zero_y=True,
         )
+        ax.set_xlim(0, n_frames)
+        ax.set_ylim(n_frames, 0)
+
+        def _ensure_endpoint(axis_obj, endpoint: float) -> np.ndarray:
+            ticks = np.asarray(axis_obj.get_majorticklocs(), dtype=float)
+            if ticks.size == 0:
+                ticks = np.array([0.0, endpoint], dtype=float)
+            elif not np.any(np.isclose(ticks, endpoint)):
+                ticks = np.append(ticks, endpoint)
+                ticks = np.sort(np.unique(ticks))
+            else:
+                return ticks
+            axis_obj.set_major_locator(FixedLocator(ticks))
+            return ticks
+
+        _ensure_endpoint(ax.xaxis, float(n_frames))
+        _ensure_endpoint(ax.yaxis, float(n_frames))
+        formatter = FuncFormatter(lambda value, _: f"{int(round(value))}")
+        ax.xaxis.set_major_formatter(formatter)
+        ax.yaxis.set_major_formatter(formatter)
         match_colorbar_font(cbar, ax)
         return self._save_plot(fig, filename)
 

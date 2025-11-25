@@ -225,6 +225,8 @@ def apply_slide_style(
     )
 
     # Stash sizes for downstream helpers (e.g., colorbar font syncing)
+    ax._fastmda_tick_size_x = tick_size_x  # type: ignore[attr-defined]
+    ax._fastmda_label_size_x = label_size_x  # type: ignore[attr-defined]
     ax._fastmda_tick_size_y = tick_size_y  # type: ignore[attr-defined]
     ax._fastmda_label_size_y = label_size_y  # type: ignore[attr-defined]
 
@@ -257,20 +259,40 @@ def apply_slide_style(
 
 
 def match_colorbar_font(colorbar: Colorbar, ax: Axes) -> None:
-    """Align colorbar tick/label fonts with the plot's y-axis fonts."""
+    """Align colorbar fonts with the active axis, falling back to the other axis if hidden."""
 
-    tick_size = getattr(ax, "_fastmda_tick_size_y", None)
-    if tick_size is None:
-        tick_labels = ax.yaxis.get_ticklabels()
-        for label in tick_labels:
-            size = label.get_fontsize()
-            if size:
-                tick_size = float(size)
-                break
+    def _axis_fonts(axis_name: str) -> tuple[Optional[float], Optional[float]]:
+        tick_size_val = getattr(ax, f"_fastmda_tick_size_{axis_name}", None)
+        label_size_val = getattr(ax, f"_fastmda_label_size_{axis_name}", None)
+        ticks = getattr(ax, f"get_{axis_name}ticks")()
+        has_ticks = bool(len(ticks))
+        if not has_ticks:
+            tick_size_val = None
+        elif tick_size_val is None:
+            for label in getattr(ax, f"get_{axis_name}ticklabels")():
+                size = label.get_fontsize()
+                if size:
+                    tick_size_val = float(size)
+                    break
 
-    label_size = getattr(ax, "_fastmda_label_size_y", None)
-    if label_size is None:
-        label_size = float(ax.yaxis.label.get_fontsize()) if ax.yaxis.label else tick_size
+        axis = getattr(ax, f"{axis_name}axis")
+        label_text = axis.get_label_text() or ""
+        has_label = bool(label_text.strip())
+        if not has_label:
+            label_size_val = None
+        elif label_size_val is None and axis.label:
+            label_size_val = float(axis.label.get_fontsize())
+
+        return tick_size_val, label_size_val
+
+    primary_axis = "y" if colorbar.orientation != "horizontal" else "x"
+    secondary_axis = "x" if primary_axis == "y" else "y"
+
+    tick_size_primary, label_size_primary = _axis_fonts(primary_axis)
+    tick_size_secondary, label_size_secondary = _axis_fonts(secondary_axis)
+
+    tick_size = tick_size_primary or tick_size_secondary
+    label_size = label_size_primary or label_size_secondary
 
     if tick_size is None and label_size is None:
         return

@@ -361,8 +361,11 @@ class SSAnalysis(BaseAnalysis):
         if n_residues <= 60:
             res_ticks = residues
         else:
-            auto = auto_ticks(residues, max_ticks=30, integer=True)
-            res_ticks = auto.astype(int) if auto is not None and auto.size > 0 else residues[:: max(1, n_residues // 30)]
+            desired_ticks = 12
+            step = max(5, int(np.ceil(n_residues / desired_ticks)))
+            res_ticks = np.arange(0, n_residues, step, dtype=int)
+            if res_ticks.size == 0 or res_ticks[-1] != n_residues - 1:
+                res_ticks = np.append(res_ticks, n_residues - 1)
 
         apply_slide_style(
             ax,
@@ -372,6 +375,7 @@ class SSAnalysis(BaseAnalysis):
             integer_y=True,
             zero_x=True,
         )
+
         tick_font = ax.get_yticklabels()[0].get_fontsize() if ax.get_yticklabels() else None
         ax.set_yticks(res_ticks)
         ax.set_yticklabels(

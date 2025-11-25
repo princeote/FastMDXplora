@@ -5,12 +5,13 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
 from sklearn.decomposition import PCA
 from sklearn.manifold import MDS, TSNE
 
 from .base import BaseAnalysis
 from ..utils.options import OptionsForwarder
-from ..utils.plotting import apply_slide_style, match_colorbar_font
+from ..utils.plotting import apply_slide_style, match_colorbar_font, auto_ticks
 
 
 PathLike = Union[str, Path]
@@ -193,17 +194,33 @@ class DimRedAnalysis(BaseAnalysis):
         fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
 
         # Color by frame index with a colorbar
-        frame_colors = np.arange(1, emb.shape[0] + 1, dtype=np.int32)
-        sc = ax.scatter(emb[:, 0], emb[:, 1], s=20, c=frame_colors, cmap="viridis", alpha=0.7)
+        n_frames = emb.shape[0]
+        frame_colors = np.arange(1, n_frames + 1, dtype=np.int32)
+        norm = Normalize(vmin=0.0, vmax=float(n_frames))
+        sc = ax.scatter(
+            emb[:, 0],
+            emb[:, 1],
+            s=20,
+            c=frame_colors,
+            cmap="viridis",
+            alpha=0.7,
+            norm=norm,
+        )
         cb = fig.colorbar(sc, ax=ax)
         cb.set_label("Frame Index")
         if frame_colors.size == 1:
-            ticks = np.asarray([float(frame_colors[0])])
+            ticks = np.asarray([0.0, float(frame_colors[-1])])
         else:
-            tick_count = min(6, frame_colors.size)
-            ticks = np.linspace(float(frame_colors[0]), float(frame_colors[-1]), num=tick_count)
-            ticks[0] = float(frame_colors[0])
-            ticks[-1] = float(frame_colors[-1])
+            ticks = auto_ticks(
+                np.array([0.0, float(n_frames)], dtype=float),
+                max_ticks=6,
+                integer=True,
+                include_zero=True,
+            )
+            if ticks is None or ticks.size == 0:
+                ticks = np.linspace(0.0, float(n_frames), num=6)
+        ticks = np.unique(np.append(ticks, [0.0, float(n_frames)]))
+        ticks.sort()
         cb.set_ticks(ticks)
         cb.set_ticklabels([f"{int(round(t))}" for t in ticks])
 

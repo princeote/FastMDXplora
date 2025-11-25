@@ -272,6 +272,7 @@ def test_plot_custom_kwargs_and_color_branch(tmp_path, monkeypatch):
             self.xaxis = _DummyAxis()
             self.yaxis = _DummyAxis()
             self.title = _DummyTitle()
+            self._xlim = (0.0, 1.0)
 
         def plot(self, *a, **k):
             pass
@@ -293,6 +294,12 @@ def test_plot_custom_kwargs_and_color_branch(tmp_path, monkeypatch):
 
         def get_xticklabels(self):
             return []
+
+        def get_xlim(self):
+            return self._xlim
+
+        def set_xlim(self, left, right):
+            self._xlim = (left, right)
 
     class _DummyFig:
         def subplots(self, *a, **k):

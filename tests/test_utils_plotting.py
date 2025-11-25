@@ -121,3 +121,26 @@ def test_match_colorbar_font_falls_back_to_x_axis(matplotlib):
     tick_sizes = [label.get_fontsize() for label in cbar.ax.get_yticklabels() if label.get_text()]
     assert tick_sizes and tick_sizes[0] == pytest.approx(ax._fastmda_tick_size_x, rel=1e-5)
     plt.close(fig)
+
+
+def test_match_colorbar_font_inherits_other_axis_label(matplotlib):
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    ax.set_xlabel("Frames")
+    ax.set_ylabel("")
+    mesh = ax.imshow(np.arange(4).reshape(2, 2))
+    cbar = fig.colorbar(mesh, ax=ax)
+    cbar.set_label("Scale")
+    apply_slide_style(
+        ax,
+        x_values=np.arange(6),
+        y_values=np.arange(6),
+        tick_size=14,
+        label_size=26,
+    )
+    ax.set_yticks([])
+    match_colorbar_font(cbar, ax)
+    fig.canvas.draw()
+    assert cbar.ax.yaxis.label.get_fontsize() == pytest.approx(ax._fastmda_label_size_x, rel=1e-5)
+    plt.close(fig)

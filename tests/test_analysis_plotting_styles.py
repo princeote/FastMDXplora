@@ -171,3 +171,26 @@ def test_cluster_histogram_plot_sets_colorbar(monkeypatch, tmp_path, matplotlib)
     assert out.exists()
     assert {"1", "2", "3"}.issubset(set(saved["cbar_labels"]))
     assert any(np.isclose(t, 1.0) for t in saved["xticks"])
+
+
+def test_ss_plot_thins_ticks_for_many_residues(monkeypatch, tmp_path, matplotlib):
+    analysis = _make_analysis(SSAnalysis, tmp_path)
+    residues = 80
+    frames = 3
+    pattern = list(("CHBETGITS" * ((residues // 9) + 1))[:residues])
+    letters = np.array([pattern for _ in range(frames)])
+
+    saved = {}
+
+    def fake_save(self, fig, key, **kwargs):
+        saved["labels"] = [t.get_text() for t in fig.axes[0].get_yticklabels()]
+        path = tmp_path / f"{key}.png"
+        fig.savefig(path)
+        return path
+
+    monkeypatch.setattr(SSAnalysis, "_save_plot", fake_save)
+
+    out = analysis.plot(data=letters, title="SS Many")
+    assert out.exists()
+    assert saved["labels"][-1] == str(residues)
+    assert len(saved["labels"]) <= 13

@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 
 from .base import BaseAnalysis, AnalysisError
 from ..utils.options import OptionsForwarder
-from ..utils.plotting import apply_slide_style, auto_ticks
+from ..utils.plotting import apply_slide_style, auto_ticks, match_colorbar_font
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +226,7 @@ class SASAAnalysis(BaseAnalysis):
 
     def _plot_total_sasa(self, total_sasa: np.ndarray, **kwargs):
         """Total SASA vs frame."""
-        x = np.arange(total_sasa.shape[0], dtype=int)
+        x = np.arange(1, total_sasa.shape[0] + 1, dtype=int)
         title = kwargs.get("title_total", "Total SASA vs Frame")
         xlabel = kwargs.get("xlabel_total", "Frame")
         ylabel = kwargs.get("ylabel_total", "Total SASA (nm²)")
@@ -251,8 +251,8 @@ class SASAAnalysis(BaseAnalysis):
             integer_x=True,
             x_max_ticks=10,
             y_max_ticks=6,
-             zero_x=True,
-             zero_y=True,
+            zero_x=True,
+            zero_y=True,
         )
         fig.tight_layout()
         out = self._save_plot(fig, "total_sasa")
@@ -287,9 +287,10 @@ class SASAAnalysis(BaseAnalysis):
             auto = auto_ticks(np.arange(R, dtype=int), max_ticks=max_y_ticks, integer=True)
             res_ticks = auto.astype(int) if auto is not None and auto.size > 0 else np.arange(R, dtype=int)
 
+        frame_values = np.arange(1, residue_sasa.shape[0] + 1, dtype=int)
         apply_slide_style(
             ax,
-            x_values=np.arange(residue_sasa.shape[0], dtype=int),
+            x_values=frame_values,
             y_ticks=res_ticks,
             integer_x=True,
             integer_y=True,
@@ -303,6 +304,7 @@ class SASAAnalysis(BaseAnalysis):
             rotation_mode="anchor",
             fontsize=tick_font,
         )
+        match_colorbar_font(cbar, ax)
 
         fig.tight_layout()
         out = self._save_plot(fig, "residue_sasa")

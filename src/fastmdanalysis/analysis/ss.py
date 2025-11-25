@@ -35,7 +35,7 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 
 from .base import BaseAnalysis, AnalysisError
 from ..utils.options import OptionsForwarder
-from ..utils.plotting import apply_slide_style, auto_ticks
+from ..utils.plotting import apply_slide_style, auto_ticks, match_colorbar_font
 
 
 # Order matters: numeric codes 0..7 map to these labels/colors
@@ -346,6 +346,7 @@ class SSAnalysis(BaseAnalysis):
             interpolation="none",
             cmap=(cmap if cmap is not None else SS_CMAP),
             norm=SS_NORM,
+            origin="lower",
         )
         ax.set_title(title)
         ax.set_xlabel(xlabel)
@@ -355,7 +356,7 @@ class SSAnalysis(BaseAnalysis):
         cbar.set_ticklabels(SS_TICK_LABELS)
         cbar.set_label("SS Code")
 
-        frames = np.arange(Z.shape[1], dtype=int)
+        frames = np.arange(1, Z.shape[1] + 1, dtype=int)
         residues = np.arange(n_residues, dtype=int)
         if n_residues <= 60:
             res_ticks = residues
@@ -369,6 +370,7 @@ class SSAnalysis(BaseAnalysis):
             y_ticks=res_ticks,
             integer_x=True,
             integer_y=True,
+            zero_x=True,
         )
         tick_font = ax.get_yticklabels()[0].get_fontsize() if ax.get_yticklabels() else None
         ax.set_yticks(res_ticks)
@@ -377,6 +379,7 @@ class SSAnalysis(BaseAnalysis):
             rotation_mode="anchor",
             fontsize=tick_font,
         )
+        match_colorbar_font(cbar, ax)
 
         fig.tight_layout()
 

@@ -10,7 +10,7 @@ from sklearn.manifold import MDS, TSNE
 
 from .base import BaseAnalysis
 from ..utils.options import OptionsForwarder
-from ..utils.plotting import apply_slide_style
+from ..utils.plotting import apply_slide_style, match_colorbar_font
 
 
 PathLike = Union[str, Path]
@@ -193,10 +193,19 @@ class DimRedAnalysis(BaseAnalysis):
         fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
 
         # Color by frame index with a colorbar
-        c = np.arange(emb.shape[0], dtype=np.int32)
-        sc = ax.scatter(emb[:, 0], emb[:, 1], s=20, c=c, cmap="viridis", alpha=0.7)
+        frame_colors = np.arange(1, emb.shape[0] + 1, dtype=np.int32)
+        sc = ax.scatter(emb[:, 0], emb[:, 1], s=20, c=frame_colors, cmap="viridis", alpha=0.7)
         cb = fig.colorbar(sc, ax=ax)
         cb.set_label("Frame Index")
+        if frame_colors.size == 1:
+            ticks = np.asarray([float(frame_colors[0])])
+        else:
+            tick_count = min(6, frame_colors.size)
+            ticks = np.linspace(float(frame_colors[0]), float(frame_colors[-1]), num=tick_count)
+            ticks[0] = float(frame_colors[0])
+            ticks[-1] = float(frame_colors[-1])
+        cb.set_ticks(ticks)
+        cb.set_ticklabels([f"{int(round(t))}" for t in ticks])
 
         # Set titles and labels based on method
         title_map = {
@@ -224,6 +233,7 @@ class DimRedAnalysis(BaseAnalysis):
             x_max_ticks=6,
             y_max_ticks=6,
         )
+        match_colorbar_font(cb, ax)
 
         # Save plot using BaseAnalysis method
         out = self._save_plot(fig, f"dimred_{name}")

@@ -306,7 +306,7 @@ class HBondsAnalysis(BaseAnalysis):
         if data is None:
             raise AnalysisError("No hydrogen bonds data available to plot. Please run analysis first.")
 
-        frames = np.arange(len(data))
+        frames = np.arange(1, len(data) + 1, dtype=int)
         title = kwargs.get("title", "Hydrogen Bonds per Frame")
         xlabel = kwargs.get("xlabel", "Frame")
         ylabel = kwargs.get("ylabel", "Number of H-Bonds")

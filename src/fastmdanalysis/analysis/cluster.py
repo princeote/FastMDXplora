@@ -35,7 +35,7 @@ from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
 
 from .base import BaseAnalysis, AnalysisError
 from ..utils.options import OptionsForwarder
-from ..utils.plotting import apply_slide_style, auto_ticks
+from ..utils.plotting import apply_slide_style, auto_ticks, match_colorbar_font
 
 CLUSTER_AXIS_LABEL = "Cluster ID"
 CLUSTER_TITLE_SIZE = 26.0
@@ -347,23 +347,22 @@ class ClusterAnalysis(BaseAnalysis):
         )
         cbar.ax.set_yticklabels([str(u) for u in unique])
         cbar.set_label(CLUSTER_AXIS_LABEL)
+        frame_values = np.arange(1, image_data.shape[1] + 1, dtype=int)
         apply_slide_style(
             ax,
-            x_values=np.arange(image_data.shape[1], dtype=int),
+            x_values=frame_values,
             integer_x=True,
             x_max_ticks=10,
             zero_x=True,
             title_size=kwargs.get("title_size", CLUSTER_TITLE_SIZE),
         )
         ax.set_yticks([])
-        label_size = ax.xaxis.label.get_fontsize()
-        cbar.ax.yaxis.label.set_fontsize(label_size)
-        cbar.ax.tick_params(labelsize=label_size)
+        match_colorbar_font(cbar, ax)
         return self._save_plot(fig, filename)
 
     def _plot_cluster_trajectory_scatter(self, labels, filename, **kwargs):
         logger.info("Plotting trajectory scatter...")
-        frames = np.arange(len(labels))
+        frames = np.arange(1, len(labels) + 1, dtype=int)
         fig, ax = plt.subplots(figsize=(10, 4))
         unique = np.sort(np.unique(labels))
         cmap = get_cluster_cmap(len(unique))
@@ -395,9 +394,7 @@ class ClusterAnalysis(BaseAnalysis):
             title_size=kwargs.get("title_size", CLUSTER_TITLE_SIZE),
         )
         ax.set_yticks([])
-        label_size = ax.xaxis.label.get_fontsize()
-        cbar.ax.yaxis.label.set_fontsize(label_size)
-        cbar.ax.tick_params(labelsize=label_size)
+        match_colorbar_font(cbar, ax)
         return self._save_plot(fig, filename)
 
     def _plot_distance_matrix(self, distances, filename, **kwargs):
@@ -409,7 +406,7 @@ class ClusterAnalysis(BaseAnalysis):
         ax.set_ylabel(kwargs.get("ylabel", "Frame"))
         cbar = fig.colorbar(im, ax=ax)
         cbar.set_label("RMSD (nm)")
-        frames = np.arange(distances.shape[0], dtype=int)
+        frames = np.arange(1, distances.shape[0] + 1, dtype=int)
         apply_slide_style(
             ax,
             x_values=frames,
@@ -419,6 +416,7 @@ class ClusterAnalysis(BaseAnalysis):
             zero_x=True,
             zero_y=True,
         )
+        match_colorbar_font(cbar, ax)
         return self._save_plot(fig, filename)
 
     def _plot_dendrogram(self, linkage_matrix, labels, filename, **kwargs):

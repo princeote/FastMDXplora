@@ -218,7 +218,7 @@ class RMSDAnalysis(BaseAnalysis):
             raise AnalysisError("No RMSD data available to plot. Please run the analysis first.")
 
         y = np.asarray(data, dtype=float).reshape(-1)
-        x = np.arange(y.size, dtype=int)
+        x = np.arange(1, y.size + 1, dtype=int)
 
         title = kwargs.get("title", f"RMSD vs Frame (ref={self.reference_frame}, align={self.align})")
         xlabel = kwargs.get("xlabel", "Frame")

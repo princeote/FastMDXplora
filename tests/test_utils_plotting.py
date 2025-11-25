@@ -1,6 +1,7 @@
 import numpy as np
+import pytest
 
-from fastmdanalysis.utils.plotting import auto_ticks, apply_slide_style
+from fastmdanalysis.utils.plotting import auto_ticks, apply_slide_style, match_colorbar_font
 
 
 def test_auto_ticks_integer_scaling():
@@ -79,3 +80,44 @@ def test_apply_slide_style_adapts_font_size(matplotlib):
 
     plt.close(fig_sparse)
     plt.close(fig_dense)
+
+
+def test_apply_slide_style_zero_padding_extends_xlim(matplotlib):
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    ax.set_xlim(0.0, 1.0)
+    apply_slide_style(
+        ax,
+        x_values=np.linspace(0.0, 5.0, 6),
+        y_values=[0.0, 1.0],
+        integer_x=True,
+        zero_x=True,
+    )
+    left, right = ax.get_xlim()
+    assert left < 0.0
+    assert right >= 4.99
+    plt.close(fig)
+
+
+def test_match_colorbar_font_falls_back_to_x_axis(matplotlib):
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    mesh = ax.imshow(np.arange(4).reshape(2, 2))
+    cbar = fig.colorbar(mesh, ax=ax)
+    apply_slide_style(
+        ax,
+        x_values=np.arange(5),
+        y_values=np.arange(5),
+        tick_size=16,
+        label_size=22,
+    )
+    ax.set_ylabel("")
+    ax.set_yticks([])
+    cbar.set_ticks([0.0, 1.0])
+    match_colorbar_font(cbar, ax)
+    fig.canvas.draw()
+    tick_sizes = [label.get_fontsize() for label in cbar.ax.get_yticklabels() if label.get_text()]
+    assert tick_sizes and tick_sizes[0] == pytest.approx(ax._fastmda_tick_size_x, rel=1e-5)
+    plt.close(fig)

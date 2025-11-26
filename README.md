@@ -11,7 +11,8 @@
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ---
-# Highlights
+
+## Highlights
 - Perform complex **molecular dynamics analyses** with intuitive, **single-line commands**
 - Automatically generate **publication-quality figures** with customizable styling for immediate use  
 - Seamlessly switch between **Python API** for advanced workflows and **CLI** for rapid batch processing
@@ -24,10 +25,10 @@
 <!-- [![Documentation](https://readthedocs.org/projects/fastmdanalysis/badge/?version=latest)](https://fastmdanalysis.readthedocs.io) 
 <!-- [![Monthly PyPI downloads](https://pepy.tech/badge/fastmdanalysis/month)](https://pepy.tech/project/fastmdanalysis) --> 
 
+---
 
 
-
-# Analysis Modules
+## Analysis Modules
 | Analysis | Description |
 |----------|-------------|
 | ``rmsd`` | Root-Mean-Square Deviation relative to a reference frame |
@@ -39,9 +40,9 @@
 | ``sasa`` | Solvent Accessible Surface Area with total, per-residue, and average per-residue |
 | ``dimred`` | Dimensionality reduction using PCA, MDS, and t-SNE methods |
 
+---
 
-
-# Installation
+## Installation
 
 We **strongly recommend** installing ``FastMDAnalysis`` in a **virtual environment** to avoid conflicts with system packages and ensure the ``fastmda`` command is available in your PATH.
 
@@ -89,10 +90,11 @@ Verify installation
 fastmda analyze --h
 ```
 
+---
 
-# Usage
+## Usage
 
-## Command-Line Interface (CLI) 
+### Command-Line Interface (CLI) 
 After installation, you can run ``FastMDAnalysis`` from the command line using the `fastmda` command. Global options allow you to specify the trajectory and topology file paths.
 Optionally, specify frame selection and atom selection. Frame selection is provided as a tuple (start, stop, stride). Negative indices (e.g., -1 for the last frame) are supported. If no options are provided, the entire trajectory and all atoms are used by default.
 
@@ -157,7 +159,7 @@ fastmda cluster -traj traj.dcd -top top.pdb --methods kmeans hierarchical --n_cl
 ```
 
 
-## Python API
+### Python API
 Instantiate a `FastMDAnalysis` object with your trajectory and topology file paths. 
 
 **Run the ``analyze`` orchestrator to execute all available analyses.**
@@ -188,17 +190,20 @@ slides   = result.get("slides")             # AnalysisResult; .ok and .value (pa
 > - Figures are saved during each analysis; slide decks include all figures produced in the run.
 > - MDTraj may emit benign warnings (e.g., dummy CRYST1 records); they do not affect results.
 
-
+---
 
 ## Output
 Output includes data tables, figures, slide deck, log file ...
 
+---
 
-# Documentation
+
+## Documentation
 The documentation [under development] (with an extensive User Guide) is available [here](https://fastmdanalysis.readthedocs.io).
 
+---
 
-# Contributing
+## Contributing
 Contributions are welcome. Please submit a Pull Request. 
 
 **Development Installation**
@@ -221,7 +226,9 @@ fastmda -h
 fastmda analyze -h
 ```
 
-# Citation
+---
+
+## Citation
 If you use `FastMDAnalysis` in your work, please cite:
 
 Aina, A. and Kwan, D. (2025) “FastMDAnalysis: Software for Automated Analysis of Molecular Dynamics Trajectories”. ChemRxiv. https://doi.org/10.26434/chemrxiv-2025-x8xnq
@@ -238,11 +245,15 @@ Aina, A. and Kwan, D. (2025) “FastMDAnalysis: Software for Automated Analysis 
 }
 ```
 
-# License
+---
+
+## License
 
 `FastMDAnalysis` is licensed under the MIT license. 
 
-# Acknowledgements
+---
+
+## Acknowledgements
 
 ``FastMDAnalysis`` builds upon excellent open-source libraries to provide its high-performance analysis capabilities and to improve workflow efficiency, usability, and reproducibility in molecular dynamics trajectory analysis. We gratefully acknowledge:
 

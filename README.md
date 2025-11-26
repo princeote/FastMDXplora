@@ -50,7 +50,7 @@ We **strongly recommend installing ``FastMDAnalysis`` in a virtual environment**
 ### Install from conda-forge (Recommended)
 
 ```bash
-conda create -n fastmda_env python=3.9
+conda create -n fastmda_env python=3.11
 ```
 ```bash
 conda activate fastmda_env
@@ -65,7 +65,7 @@ fastmda analyze -h
 ```
 
 ### [Alternatively] Install from PyPI 
-
+Make sure you have Python 3.9+ installed and available as 'python'.
 ```bash
 python -m venv fastmda_env
 ```

@@ -1,25 +1,27 @@
 Datasets
 ========
 
-FastMDAnalysis ships with two curated molecular dynamics datasets that underpin
-the manuscript examples and unit tests. They live in ``data/`` and are exposed
-through ``FastMDAnalysis.datasets`` for convenience.
+FastMDAnalysis ships with a curated Trp-cage molecular dynamics dataset that
+underpins the manuscript examples and tutorials. It lives in ``data/`` and is
+exposed through ``fastmdanalysis.datasets`` (``TrpCage`` class plus the
+``trp_cage`` shortcut).
 
-Ubiquitin
----------
+Attributes available on the dataset helper:
 
-* **Files:** ``data/ubiquitin.dcd`` (trajectory), ``data/ubiquitin.pdb``
-	(topology)
-* **Frames:** 10 000 snapshots sampled every 10 ps (100 ns total)
-* **Force field / engine:** CHARMM36m, GROMACS
-* **Use cases:** Full regression test suite, clustering benchmarks, RMSD/RMSF
-	demonstrations
+``traj`` / ``top``
+	Absolute paths to trajectory (``.dcd``) and topology (``.pdb``) files. Paths
+	are resolved via :func:`fastmdanalysis.datasets._get_data_path`, so installs
+from PyPI and editable checkouts behave the same.
 
-Example usage::
+``time_step``
+	Simulation timestep in picoseconds.
 
-	 from fastmdanalysis.datasets import ubiquitin
-	 print(ubiquitin.traj)
-	 print(ubiquitin.top)
+``force_field`` / ``integrator`` / ``md_engine``
+	Metadata copied from the original simulations; useful for reporting or
+	selecting analysis parameters.
+
+``temperature`` / ``pressure``
+	Nominal ensemble settings (Kelvin, atm/bar).
 
 Trp-cage
 --------
@@ -39,10 +41,11 @@ paths, making it easy to run tutorials from any working directory::
 Best practices
 --------------
 
+
 * Call ``traj.topology.create_standard_bonds()`` when an analysis needs bond
 	definitions (hydrogen bonds, secondary structure).
 * Use the ``--frames`` CLI option or the ``frames`` constructor argument to
 	subsample long trajectories without editing the source files.
-* Treat these datasets as smoke tests; real research trajectories can be passed
+* Treat this dataset as a smoke test; real research trajectories can be passed
 	via single paths, comma-separated strings, lists, or glob patterns thanks to
 	:func:`FastMDAnalysis.utils.load_trajectory`.

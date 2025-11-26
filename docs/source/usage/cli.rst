@@ -3,7 +3,9 @@ CLI Usage
 
 The ``fastmda`` command-line interface mirrors the API methods described in the
 FastMDAnalysis manuscript. It is ideal for batch pipelines, HPC clusters, or
-users who prefer not to write Python scripts.
+users who prefer not to write Python scripts. Every plot produced through the
+CLI runs through the same styling helpers as the API, so PNG outputs are
+publication-ready without manual Matplotlib tweaks.
 
 Global options
 --------------
@@ -35,6 +37,11 @@ arguments:
 ``--output, -o``
 	Optional explicit output directory; defaults to ``<command>_output``.
 
+``--slides``
+	(Orchestrator only) write a PowerPoint deck combining every figure. Accepts a
+	boolean flag (timestamped filename) or a path; deck slides embed the same
+	publication-ready PNGs saved during each analysis.
+
 Quick-reference table
 ~~~~~~~~~~~~~~~~~~~~~
 
@@ -50,6 +57,39 @@ Subcommand        Highlights                                   Extra options
 ``cluster``       DBSCAN / KMeans / hierarchical clustering    ``--methods`` ``--n_clusters`` ``--atoms``
 ``dimred``        PCA / MDS / t-SNE embeddings                 ``--methods`` ``--atoms``
 ================  =========================================  ===============================
+
+Analyze orchestrator
+--------------------
+
+``fastmda analyze`` runs multiple analyses in one pass, sharing the cached
+trajectory and styling settings. Use ``--include``/``--exclude`` to control the
+portfolio and ``--options`` to point at a YAML/JSON file with per-analysis
+keywords (same schema as the Python ``options`` dict). The resulting PNGs and
+optional deck preserve the publication-ready defaults.
+See :doc:`usage/plotting` for helper details and option descriptions referenced
+by each analysis module.
+
+.. code-block:: bash
+
+	fastmda analyze \
+	    --traj data/trp_cage.dcd \
+	    --top data/trp_cage.pdb \
+	    --include rmsd rg sasa \
+	    --options configs/slide_ready.yaml \
+	    --slides reports/trp_cage_slides.pptx
+
+Example ``options`` excerpt:
+
+.. code-block:: yaml
+
+	rmsf:
+	  tick_step: 3
+	  rotate: 45
+	sasa:
+	  tick_step_avg: 5
+	  color_total: "#2c3e50"
+	dimred:
+	  title_pca: "PCA (Publication)"
 
 Example session
 ---------------
@@ -70,8 +110,8 @@ Example session
 2. Clustering with multiple algorithms, mirroring the manuscript benchmarks::
 
 		fastmda cluster \
-			--trajectory data/ubiquitin.dcd \
-			--topology data/ubiquitin.pdb \
+			--trajectory data/trp_cage.dcd \
+			--topology data/trp_cage.pdb \
 			--methods dbscan hierarchical \
 			--n_clusters 5 \
 			--eps 0.3 \
@@ -84,8 +124,8 @@ Example session
 3. Dimensionality reduction for rapid visualisation::
 
 	fastmda dimred \
-		--trajectory data/ubiquitin.dcd \
-		--topology data/ubiquitin.pdb \
+		--trajectory data/trp_cage.dcd \
+		--topology data/trp_cage.pdb \
 		--methods pca mds tsne \
 		--atoms "protein and name CA"
 
@@ -104,4 +144,4 @@ Batch execution tips
   before publishing plots.
 
 For advanced configuration and the analysis APIs behind each subcommand, see
-:doc:`analysis/index` and :doc:`usage/api`.
+:doc:`analysis/index`, :doc:`usage/api`, and :doc:`usage/plotting`.

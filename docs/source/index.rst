@@ -15,6 +15,10 @@ Highlights
 * **All-in-one analyses.** Built-in modules cover RMSD, RMSF, radius of
    gyration, hydrogen bonds, secondary structure, SASA, clustering, and
    dimensionality reduction – the same portfolio described in the paper.
+* **Publication-ready figures by default.** A shared styling toolkit trims
+   ticks, balances fonts, pads zero-based axes, and keeps colorbars synced so
+   the PNGs that ship with each analysis are usable directly in manuscripts and
+   slide decks.
 * **One trajectory load.** ``FastMDAnalysis.FastMDAnalysis`` caches the
    trajectory once, applies optional frame and atom selections, and reuses those
    slices across analyses to avoid redundant I/O.
@@ -22,16 +26,17 @@ Highlights
    publication-ready PNGs, and a timestamped log inside ``<analysis>_output`` by
    default, promoting reproducibility.
 * **Friendly interfaces.** Choose the Python API for scripted workflows or the
-   ``fastmda`` CLI for quick batch runs; both routes exercise the same analysis
-   classes.
+   ``fastmda`` CLI for batch runs; both routes share the same analysis classes
+   and plotting options.
 
 Workflow at a glance
 --------------------
 
 1. Install the package (editable or standard) and optional doc requirements.
 2. Load a trajectory plus topology through the API or provide them to the CLI.
-3. Run analyses, inspect the saved artifacts, or compose new ones using the
-    base-class pattern.
+3. Run analyses directly (``fastmda.<analysis>()`` or ``fastmda analyze``), or
+   compose new modules using the base-class pattern; generated plots inherit
+   the publication-focused styling defaults automatically.
 4. Regenerate these docs locally with Sphinx or publish to Read the Docs using
     the supplied configuration.
 
@@ -47,6 +52,8 @@ details.
    getting-started
    usage/api
    usage/cli
+   usage/plotting
+   usage/outputs
    datasets
    contributing
 

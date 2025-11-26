@@ -49,45 +49,41 @@ We **strongly recommend** installing ``FastMDAnalysis`` in a **virtual environme
 
 ### Install from conda-forge (Recommended)
 
-Create a conda environment
 ```bash
 conda create -n fastmda_env python=3.9
 ```
-Activate the environment
 ```bash
 conda activate fastmda_env
 ```
-Install FastMDAnalysis
 ```bash
 pip install fastmdanalysis
 ```
-Verify installation
+
+### Verify installation
 ```bash
 fastmda analyze -h
 ```
 
 ### [Alternatively] Install from PyPI 
 
-Create a virtual environment
 ```bash
 python -m venv fastmda_env
 ```
-Activate the virtual environment
+
 ```bash
 # On Linux/macOS:
 source fastmda_env/bin/activate
-```
-```bash
-# On Windows:
+
+# Or on Windows:
 # fastmda_env\Scripts\activate
 ```
-Install FastMDAnalysis
 ```bash
 pip install fastmdanalysis
 ```
-Verify installation
+
+### Verify installation
 ```bash
-fastmda analyze --h
+fastmda analyze -h
 ```
 
 ---

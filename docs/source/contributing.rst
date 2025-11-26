@@ -14,12 +14,16 @@ Development setup
 		python -m pip install -e .
 		python -m pip install -r docs/requirements.txt  # optional, for docs
 
-3. Run the unit tests regularly::
+3. Run the test suite with ``pytest``::
 
-		python -m unittest tests.tests
+		pytest
 
 	The suite exercises every analysis on the bundled Trp-cage dataset and
-	mirrors the validation described in the manuscript.
+	mirrors the validation described in the manuscript. Plot-styling regressions
+	are guarded by dedicated tests – run them explicitly if you modify plotting
+	utilities or analysis figures::
+
+		pytest tests/test_utils_plotting.py tests/test_analysis_plotting_styles.py
 
 Coding guidelines
 -----------------
@@ -31,7 +35,8 @@ Coding guidelines
   ``print``.
 * Keep plots backend-agnostic (``matplotlib`` is already forced to ``Agg``).
 * Provide docstrings and update the relevant ``docs/source`` page when adding
-  new functionality.
+	new functionality. If a change emits new files or folders, keep the layout
+	consistent with :doc:`usage/outputs` so helper scripts continue to work.
 
 Adding a new analysis module
 ----------------------------
@@ -59,7 +64,9 @@ Documentation contributions
 
 		python -m sphinx_autobuild docs/source docs/build/html --open-browser
 
-* Keep prose concise and reference the manuscript where context helps readers.
+* Keep prose concise, reference the manuscript where context helps readers, and
+	cross-link new content from :doc:`usage/plotting`, :doc:`usage/outputs`, or
+	:doc:`datasets` when applicable.
 
 Reporting issues
 ----------------
@@ -68,7 +75,8 @@ Open GitHub issues with the following details:
 
 * Operating system and Python version
 * Exact command or API call
-* Full traceback or log file (``<analysis>_output/<command>.log``)
+* Full traceback or log file (``<analysis>_output/<command>.log`` – see
+	:doc:`usage/outputs` for directory details)
 * Steps to reproduce using the bundled datasets when possible
 
 Community values

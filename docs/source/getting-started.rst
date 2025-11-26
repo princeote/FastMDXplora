@@ -8,10 +8,17 @@ bundled benchmark datasets, and demonstrates one-minute API and CLI workflows.
 Prerequisites
 -------------
 
-FastMDAnalysis targets Python 3.8 or newer and depends on
+FastMDAnalysis targets Python 3.9 or newer and depends on
 ``mdtraj``, ``numpy``, ``matplotlib``, and ``scikit-learn``. The optional
 documentation toolchain requires Sphinx and the Read the Docs theme. GPU
 hardware is **not** required; all analyses run on a standard laptop.
+
+Recommended environment
+-----------------------
+
+Create a virtual environment (``python -m venv`` or Conda) before installing so
+that the ``fastmda`` CLI lands on your ``PATH`` and dependencies stay isolated
+from system packages. The README walks through both workflows step by step.
 
 
 Installation
@@ -58,10 +65,10 @@ site locally – live in ``docs/requirements.txt``:
 Sample data
 -----------
 
-Small trajectories for ubiquitin and Trp-cage ship with the project under
-``data/``. The helper objects ``FastMDAnalysis.datasets.ubiquitin`` and
-``FastMDAnalysis.datasets.trp_cage`` expose absolute paths to these files so
-tests and tutorials run without extra downloads.
+The project ships with a Trp-cage trajectory under ``data/``. Import
+``FastMDAnalysis.datasets`` to retrieve absolute paths (e.g.,
+``from fastmdanalysis.datasets import trp_cage``) so tests and tutorials run
+without extra downloads.
 
 Quick start (Python API)
 ------------------------
@@ -78,7 +85,9 @@ Quick start (Python API)
 
 The call caches the trajectory (honouring the frame stride and atom selection),
 computes RMSD relative to frame 0, stores the results in ``rmsd.data`` and saves
-``rmsd_output/rmsd.dat`` plus ``rmsd_output/rmsd.png``.
+``rmsd_output/rmsd.dat`` plus ``rmsd_output/rmsd.png``. All plots pass through
+the shared styling helpers, so tick density, font sizes, and colorbars are
+publication-ready without manual Matplotlib edits.
 
 Quick start (CLI)
 -----------------
@@ -103,4 +112,5 @@ Where to next
 * Read :doc:`datasets` for metadata about the bundled trajectories.
 * Follow :doc:`usage/api` and :doc:`usage/cli` for deeper walkthroughs.
 * Explore :doc:`analysis/index` to understand how each analysis module is
-  implemented and which figures it produces.
+   implemented, which figures it produces, and which styling options it exposes
+   for publication-ready figures.

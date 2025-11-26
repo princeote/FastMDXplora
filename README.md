@@ -40,13 +40,6 @@
 | ``sasa`` | Solvent Accessible Surface Area with total, per-residue, and average per-residue |
 | ``dimred`` | Dimensionality reduction using PCA, MDS, and t-SNE methods |
 
-> **Slide-ready plots**
-> Every analysis route now delegates to a shared styling toolkit that:
-> - Automatically thins tick labels (integer-safe) and pads zero-based axes when helpful.
-> - Balances tick/title fonts for large or sparse datasets so figures stay legible on presentation slides.
-> - Keeps colorbars synchronized with the active axis labels, even when the primary axis is hidden.
-> These behaviors are enabled by default for both CLI and Python API runs—no manual Matplotlib editing required.
-
 ---
 
 ## Installation
@@ -147,15 +140,6 @@ rmsd:
 cluster:
   methods: [kmeans, hierarchical]
   n_clusters: 5
-ss:
-  max_y_ticks: 12           # thin residue labels for dense systems
-sasa:
-  tick_step_avg: 5          # show every 5th residue on average SASA plot
-rmsf:
-  tick_step: 4
-  rotate: 45                # rotate x tick labels when crowded
-dimred:
-  title_pca: "PCA (slide-ready)"
 ```
 JSON is also supported. If using YAML, ensure PyYAML is installed.
 
@@ -163,12 +147,7 @@ JSON is also supported. If using YAML, ensure PyYAML is installed.
 - ``--slides`` creates ``fastmda_slides_<ddmmyy.HHMM>.pptx`` in the current working directory.
 - ``--slides path/to/deck.pptx`` writes to an explicit filename.
 
-**Single-analysis commands (legacy, still available)**
-```bash
-fastmda rmsd   -traj traj.dcd -top top.pdb --ref 0     # aliases: --reference-frame, -ref
-fastmda ss -traj traj.dcd -top top.pdb
-fastmda cluster -traj traj.dcd -top top.pdb --methods kmeans hierarchical --n_clusters 5
-```
+
 
 
 ### Python API
@@ -192,24 +171,6 @@ result = fastmda.analyze(
     slides=True                             # or slides="results.pptx"
 )
 ```
-**(Optional) Access per-analysis outputs**
-```python
-rmsd_result = result["rmsd"].value          # object/type depends on analysis
-slides   = result.get("slides")             # AnalysisResult; .ok and .value (path)
-```
-
-**Customize figures per analysis**
-```python
-fastmda.analyze(
-  include=["sasa", "rmsf"],
-  options={
-    "sasa": {"tick_step_avg": 5, "color_total": "#2c3e50"},
-    "rmsf": {"tick_step": 3, "rotate": 45},
-    "dimred": {"title_pca": "PCA Projection (Slides)", "max_ticks": 6},
-  },
-)
-```
-All plotting options available in the modules are shared between the CLI options file and the API `options` dict, so you can keep slide decks stylistically consistent without editing Matplotlib code.
 
 > **Notes** 
 > - Figures are saved during each analysis; slide decks include all figures produced in the run.
@@ -250,18 +211,6 @@ pip install -e ".[test]"
 fastmda -h
 fastmda analyze -h
 ```
-
-**Tests**
-
-Run the full suite before opening a PR:
-```bash
-pytest
-```
-Plot styling regressions are guarded by dedicated suites—run them explicitly if you touch plotting code:
-```bash
-pytest tests/test_utils_plotting.py tests/test_analysis_plotting_styles.py
-```
-
 ---
 
 ## Citation

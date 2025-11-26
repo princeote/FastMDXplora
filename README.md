@@ -11,7 +11,8 @@
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ---
-# Highlights
+
+## Highlights
 - Perform complex **molecular dynamics analyses** with intuitive, **single-line commands**
 - Automatically generate **slide-ready, publication-quality figures** with consistent axes, fonts, and colorbars  
 - Seamlessly switch between **Python API** for advanced workflows and **CLI** for rapid batch processing
@@ -24,10 +25,10 @@
 <!-- [![Documentation](https://readthedocs.org/projects/fastmdanalysis/badge/?version=latest)](https://fastmdanalysis.readthedocs.io) 
 <!-- [![Monthly PyPI downloads](https://pepy.tech/badge/fastmdanalysis/month)](https://pepy.tech/project/fastmdanalysis) --> 
 
+---
 
 
-
-# Analysis Modules
+## Analysis Modules
 | Analysis | Description |
 |----------|-------------|
 | ``rmsd`` | Root-Mean-Square Deviation relative to a reference frame |
@@ -40,58 +41,63 @@
 | ``dimred`` | Dimensionality reduction using PCA, MDS, and t-SNE methods |
 
 > **Slide-ready plots**
-> Every analysis route now delegates to a shared slide-styling toolkit that:
+> Every analysis route now delegates to a shared styling toolkit that:
 > - Automatically thins tick labels (integer-safe) and pads zero-based axes when helpful.
 > - Balances tick/title fonts for large or sparse datasets so figures stay legible on presentation slides.
 > - Keeps colorbars synchronized with the active axis labels, even when the primary axis is hidden.
 > These behaviors are enabled by default for both CLI and Python API runs—no manual Matplotlib editing required.
 
+---
+
+## Installation
+
+We **strongly recommend** installing ``FastMDAnalysis`` in a **virtual environment** to avoid conflicts with system packages and ensure the ``fastmda`` command is available in your PATH.
 
 
-# Installation
-<!-- ## From PyPI (Recommended for users) -->
-**Recommended: Install in a Virtual Environment**
+### Install from conda-forge (Recommended)
 
-We strongly recommend installing ``FastMDAnalysis`` in a virtual environment to avoid conflicts with system packages and ensure the ``fastmda`` command is available in your PATH.
-
-Using ``venv`` (Python's built-in virtual environment):
 ```bash
-# Create a virtual environment
-python -m venv fastmda_env
-
-# Activate the virtual environment
-# On Linux/macOS:
-source fastmda_env/bin/activate
-# On Windows:
-# fastmda_env\Scripts\activate
-
-# Install FastMDAnalysis
-pip install fastmdanalysis
-
-# Verify installation
-fastmda -h
-fastmda analyze --h
-```
-Using conda:
-```bash
-# Create a conda environment
 conda create -n fastmda_env python=3.9
-
-# Activate the environment
+```
+```bash
 conda activate fastmda_env
-
-# Install FastMDAnalysis
+```
+```bash
 pip install fastmdanalysis
+```
 
-# Verify installation
-fastmda -h
+### Verify installation
+```bash
 fastmda analyze -h
 ```
 
+### [Alternatively] Install from PyPI 
 
-# Usage
+```bash
+python -m venv fastmda_env
+```
 
-## Command-Line Interface (CLI) 
+```bash
+# On Linux/macOS:
+source fastmda_env/bin/activate
+
+# Or on Windows:
+# fastmda_env\Scripts\activate
+```
+```bash
+pip install fastmdanalysis
+```
+
+### Verify installation
+```bash
+fastmda analyze -h
+```
+
+---
+
+## Usage
+
+### Command-Line Interface (CLI) 
 After installation, you can run ``FastMDAnalysis`` from the command line using the `fastmda` command. Global options allow you to specify the trajectory and topology file paths.
 Optionally, specify frame selection and atom selection. Frame selection is provided as a tuple (start, stop, stride). Negative indices (e.g., -1 for the last frame) are supported. If no options are provided, the entire trajectory and all atoms are used by default.
 
@@ -165,7 +171,7 @@ fastmda cluster -traj traj.dcd -top top.pdb --methods kmeans hierarchical --n_cl
 ```
 
 
-## Python API
+### Python API
 Instantiate a `FastMDAnalysis` object with your trajectory and topology file paths. 
 
 **Run the ``analyze`` orchestrator to execute all available analyses.**
@@ -209,17 +215,20 @@ All plotting options available in the modules are shared between the CLI options
 > - Figures are saved during each analysis; slide decks include all figures produced in the run.
 > - MDTraj may emit benign warnings (e.g., dummy CRYST1 records); they do not affect results.
 
-
+---
 
 ## Output
 Output includes data tables, figures (already stylized for slides), slide deck, log file ...
 
+---
 
-# Documentation
+
+## Documentation
 The documentation [under development] (with an extensive User Guide) is available [here](https://fastmdanalysis.readthedocs.io).
 
+---
 
-# Contributing
+## Contributing
 Contributions are welcome. Please submit a Pull Request. 
 
 **Development Installation**
@@ -253,7 +262,9 @@ Plot styling regressions are guarded by dedicated suites—run them explicitly i
 pytest tests/test_utils_plotting.py tests/test_analysis_plotting_styles.py
 ```
 
-# Citation
+---
+
+## Citation
 If you use `FastMDAnalysis` in your work, please cite:
 
 Aina, A. and Kwan, D. (2025) “FastMDAnalysis: Software for Automated Analysis of Molecular Dynamics Trajectories”. ChemRxiv. https://doi.org/10.26434/chemrxiv-2025-x8xnq
@@ -270,11 +281,15 @@ Aina, A. and Kwan, D. (2025) “FastMDAnalysis: Software for Automated Analysis 
 }
 ```
 
-# License
+---
+
+## License
 
 `FastMDAnalysis` is licensed under the MIT license. 
 
-# Acknowledgements
+---
+
+## Acknowledgements
 
 ``FastMDAnalysis`` builds upon excellent open-source libraries to provide its high-performance analysis capabilities and to improve workflow efficiency, usability, and reproducibility in molecular dynamics trajectory analysis. We gratefully acknowledge:
 

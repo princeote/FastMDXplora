@@ -56,7 +56,7 @@ conda create -n fastmda_env python=3.9
 conda activate fastmda_env
 ```
 ```bash
-pip install fastmdanalysis
+conda install -c conda-forge fastmdanalysis
 ```
 
 ### Verify installation

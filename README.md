@@ -141,7 +141,6 @@ cluster:
   methods: [kmeans, hierarchical]
   n_clusters: 5
 ```
-JSON is also supported. If using YAML, ensure PyYAML is installed.
 
 **Slides:**
 - ``--slides`` creates ``fastmda_slides_<ddmmyy.HHMM>.pptx`` in the current working directory.

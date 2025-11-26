@@ -35,7 +35,7 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 
 from .base import BaseAnalysis, AnalysisError
 from ..utils.options import OptionsForwarder
-from ..utils.plotting import apply_slide_style, auto_ticks
+from ..utils.plotting import apply_slide_style, auto_ticks, match_colorbar_font
 
 
 # Order matters: numeric codes 0..7 map to these labels/colors
@@ -346,6 +346,7 @@ class SSAnalysis(BaseAnalysis):
             interpolation="none",
             cmap=(cmap if cmap is not None else SS_CMAP),
             norm=SS_NORM,
+            origin="lower",
         )
         ax.set_title(title)
         ax.set_xlabel(xlabel)
@@ -355,13 +356,16 @@ class SSAnalysis(BaseAnalysis):
         cbar.set_ticklabels(SS_TICK_LABELS)
         cbar.set_label("SS Code")
 
-        frames = np.arange(Z.shape[1], dtype=int)
+        frames = np.arange(1, Z.shape[1] + 1, dtype=int)
         residues = np.arange(n_residues, dtype=int)
         if n_residues <= 60:
             res_ticks = residues
         else:
-            auto = auto_ticks(residues, max_ticks=30, integer=True)
-            res_ticks = auto.astype(int) if auto is not None and auto.size > 0 else residues[:: max(1, n_residues // 30)]
+            desired_ticks = 12
+            step = max(5, int(np.ceil(n_residues / desired_ticks)))
+            res_ticks = np.arange(0, n_residues, step, dtype=int)
+            if res_ticks.size == 0 or res_ticks[-1] != n_residues - 1:
+                res_ticks = np.append(res_ticks, n_residues - 1)
 
         apply_slide_style(
             ax,
@@ -369,7 +373,9 @@ class SSAnalysis(BaseAnalysis):
             y_ticks=res_ticks,
             integer_x=True,
             integer_y=True,
+            zero_x=True,
         )
+
         tick_font = ax.get_yticklabels()[0].get_fontsize() if ax.get_yticklabels() else None
         ax.set_yticks(res_ticks)
         ax.set_yticklabels(
@@ -377,6 +383,7 @@ class SSAnalysis(BaseAnalysis):
             rotation_mode="anchor",
             fontsize=tick_font,
         )
+        match_colorbar_font(cbar, ax)
 
         fig.tight_layout()
 

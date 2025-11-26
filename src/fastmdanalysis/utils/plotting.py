@@ -6,10 +6,11 @@ from typing import Dict, Optional, Sequence, Union
 import numpy as np
 from matplotlib.axes import Axes
 from matplotlib.ticker import FixedLocator, MaxNLocator
+from matplotlib.colorbar import Colorbar
 
 NumericSeq = Optional[Union[Sequence[float], np.ndarray]]
 
-__all__ = ["auto_ticks", "apply_slide_style"]
+__all__ = ["auto_ticks", "apply_slide_style", "match_colorbar_font"]
 
 
 def _as_clean_array(values: NumericSeq) -> Optional[np.ndarray]:
@@ -130,6 +131,17 @@ def _to_tick_array(data: NumericSeq) -> Optional[np.ndarray]:
     return arr
 
 
+def _ensure_tick_value(ticks: Optional[np.ndarray], value: Optional[float]) -> Optional[np.ndarray]:
+    if value is None:
+        return ticks
+    if ticks is None or ticks.size == 0:
+        return np.array([float(value)], dtype=float)
+    if not np.any(np.isclose(ticks, value)):
+        ticks = np.append(ticks, float(value))
+        ticks = np.sort(ticks)
+    return ticks
+
+
 def apply_slide_style(
     ax: Axes,
     *,
@@ -150,6 +162,10 @@ def apply_slide_style(
 ) -> Dict[str, np.ndarray]:
     applied: Dict[str, np.ndarray] = {}
 
+    x_data = _as_clean_array(x_values)
+    x_min_val = float(np.min(x_data)) if x_data is not None else None
+    x_max_val = float(np.max(x_data)) if x_data is not None else None
+
     ticks_x = _to_tick_array(x_ticks)
     if ticks_x is None:
         ticks_x = auto_ticks(
@@ -158,6 +174,7 @@ def apply_slide_style(
             integer=integer_x,
             include_zero=zero_x,
         )
+    ticks_x = _ensure_tick_value(ticks_x, x_max_val if integer_x else None)
     if ticks_x is not None and ticks_x.size:
         ax.xaxis.set_major_locator(FixedLocator(ticks_x))
         applied["x"] = ticks_x
@@ -186,7 +203,6 @@ def apply_slide_style(
         tick_size_y = _adaptive_font_size(tick_count_y)
     else:
         tick_size_x = tick_size_y = float(tick_size)
-
     if label_size is None:
         label_size_x = max(tick_size_x * 1.25, 20.0)
         label_size_y = max(tick_size_y * 1.25, 20.0)
@@ -208,10 +224,82 @@ def apply_slide_style(
         title_size=title_size_val,
     )
 
+    # Stash sizes for downstream helpers (e.g., colorbar font syncing)
+    ax._fastmda_tick_size_x = tick_size_x  # type: ignore[attr-defined]
+    ax._fastmda_label_size_x = label_size_x  # type: ignore[attr-defined]
+    ax._fastmda_tick_size_y = tick_size_y  # type: ignore[attr-defined]
+    ax._fastmda_label_size_y = label_size_y  # type: ignore[attr-defined]
+
     if x_tick_rotation is not None:
         for label in ax.get_xticklabels():
             label.set_rotation(x_tick_rotation)
             if x_tick_rotation and abs(x_tick_rotation) > 0:
                 label.set_horizontalalignment("right")
 
+    if x_max_val is not None:
+        current_left, current_right = ax.get_xlim()
+        new_left = current_left
+        new_right = max(current_right, x_max_val)
+        if zero_x:
+            if x_min_val is None or x_min_val >= 0:
+                span_base = x_max_val - (x_min_val if x_min_val is not None else 0.0)
+                span = max(1.0, span_base)
+                pad_min = max(0.5 if integer_x else 0.1, span * 0.01)
+                existing_pad = max(current_right - x_max_val, 0.0)
+                pad = max(existing_pad, pad_min)
+                new_left = -pad
+                new_right = x_max_val + pad
+            else:
+                new_left = min(current_left, 0.0)
+                new_right = max(new_right, x_max_val)
+        if not np.isclose(new_left, current_left) or not np.isclose(new_right, current_right):
+            ax.set_xlim(new_left, new_right)
+
     return applied
+
+
+def match_colorbar_font(colorbar: Colorbar, ax: Axes) -> None:
+    """Align colorbar fonts with the active axis, falling back to the other axis if hidden."""
+
+    def _axis_fonts(axis_name: str) -> tuple[Optional[float], Optional[float]]:
+        tick_size_val = getattr(ax, f"_fastmda_tick_size_{axis_name}", None)
+        label_size_val = getattr(ax, f"_fastmda_label_size_{axis_name}", None)
+        ticks = getattr(ax, f"get_{axis_name}ticks")()
+        has_ticks = bool(len(ticks))
+        if not has_ticks:
+            tick_size_val = None
+        elif tick_size_val is None:
+            for label in getattr(ax, f"get_{axis_name}ticklabels")():
+                size = label.get_fontsize()
+                if size:
+                    tick_size_val = float(size)
+                    break
+
+        axis = getattr(ax, f"{axis_name}axis")
+        label_text = axis.get_label_text() or ""
+        has_label = bool(label_text.strip())
+        if not has_label:
+            label_size_val = None
+        elif label_size_val is None and axis.label:
+            label_size_val = float(axis.label.get_fontsize())
+
+        return tick_size_val, label_size_val
+
+    primary_axis = "y" if colorbar.orientation != "horizontal" else "x"
+    secondary_axis = "x" if primary_axis == "y" else "y"
+
+    tick_size_primary, label_size_primary = _axis_fonts(primary_axis)
+    tick_size_secondary, label_size_secondary = _axis_fonts(secondary_axis)
+
+    tick_size = tick_size_primary or tick_size_secondary
+    label_size = label_size_primary or label_size_secondary
+
+    if tick_size is None and label_size is None:
+        return
+
+    axis_name = "y" if colorbar.orientation != "horizontal" else "x"
+    if tick_size is not None:
+        colorbar.ax.tick_params(axis=axis_name, labelsize=tick_size)
+    if label_size is not None:
+        axis = getattr(colorbar.ax, f"{axis_name}axis")
+        axis.label.set_fontsize(label_size)

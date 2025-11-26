@@ -166,7 +166,7 @@ class RGAnalysis(BaseAnalysis):
             raise AnalysisError("No RG data available to plot. Run the analysis first.")
 
         y = np.asarray(data, dtype=float).reshape(-1)
-        x = np.arange(y.size, dtype=int)
+        x = np.arange(1, y.size + 1, dtype=int)
 
         title = kwargs.get("title", "Radius of Gyration vs Frame")
         xlabel = kwargs.get("xlabel", "Frame")

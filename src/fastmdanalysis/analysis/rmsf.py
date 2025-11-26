@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from .base import BaseAnalysis, AnalysisError
 from ..utils.options import OptionsForwarder
-from ..utils.plotting import apply_slide_style, auto_ticks
+from ..utils.plotting import apply_slide_style
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +161,7 @@ class RMSFAnalysis(BaseAnalysis):
         *,
         max_ticks: int = 30,        # hard cap on number of labeled x ticks
         tick_step: Optional[int] = None,  # show every Nth tick (overrides max_ticks)
-        rotate: int = 45,           # tick label rotation
+        rotate: int = 0,            # tick label rotation (default horizontal)
         figsize=(12, 6),
         title: str = "RMSF per Atom",
         xlabel: str = "Atom Index",
@@ -198,8 +198,8 @@ class RMSFAnalysis(BaseAnalysis):
         n = int(y.size)
         x = np.arange(n)
 
-        # Numeric-only atom indices for x-axis (1-based for readability)
-        labels_all = [str(i + 1) for i in x]
+        # Numeric-only atom indices for x-axis (now zero-based to align with other plots)
+        labels_all = [str(i) for i in x]
 
         # Plot
         fig, ax = plt.subplots(figsize=figsize)
@@ -215,32 +215,59 @@ class RMSFAnalysis(BaseAnalysis):
         ax.grid(axis="y", alpha=0.3)
         ax.grid(axis="x", alpha=0.12)
 
+        x_tick_cap = max(4, min(max_ticks, 12))
+
         if tick_step is not None:
             step = max(1, int(tick_step))
-            tick_positions = x[::step]
+            tick_positions = np.arange(0, n, step, dtype=float)
+            if tick_positions.size == 0 or tick_positions[-1] != n - 1:
+                tick_positions = np.append(tick_positions, float(n - 1))
         else:
-            tick_positions = auto_ticks(x, max_ticks=max_ticks, integer=True)
-            if tick_positions is None or tick_positions.size == 0:
-                tick_positions = x
-        tick_positions = np.asarray(tick_positions, dtype=float)
-        tick_positions = np.clip(tick_positions, 0, n - 1)
-        ticklabels = [labels_all[int(pos)] for pos in tick_positions.astype(int)]
+            tick_positions = None
 
-        ax.set_xticks(tick_positions)
-        apply_slide_style(
+        applied = apply_slide_style(
             ax,
-            x_ticks=tick_positions,
+            x_values=x,
             y_values=y,
+            x_ticks=tick_positions,
+            x_max_ticks=x_tick_cap,
             integer_x=True,
             zero_x=True,
             zero_y=True,
             x_tick_rotation=rotate,
         )
+
+        xticks_after = np.asarray(ax.get_xticks(), dtype=float)
+        xticks_after = np.clip(np.rint(xticks_after).astype(int), 0, n - 1)
+        xticks_after = np.unique(xticks_after)
+
+        if not np.any(xticks_after == 0):
+            xticks_after = np.insert(xticks_after, 0, 0)
+
+        if (
+            tick_step is None
+            and xticks_after.size >= 3
+            and xticks_after[-1] == n - 1
+        ):
+            diffs = np.diff(xticks_after.astype(float))
+            if diffs.size >= 2:
+                typical = float(np.median(diffs[:-1]))
+            else:
+                typical = float(diffs[0]) if diffs.size else 0.0
+
+            last_gap = float(diffs[-1]) if diffs.size else 0.0
+            if typical > 0 and last_gap < typical * 0.65:
+                xticks_after = xticks_after[:-1]
+
+        ticklabels = [labels_all[idx] for idx in xticks_after]
+
         tick_font = ax.get_xticklabels()[0].get_fontsize() if ax.get_xticklabels() else None
+        ha = "center" if rotate == 0 else "right"
+        ax.set_xticks(xticks_after)
         ax.set_xticklabels(
             ticklabels,
             rotation=rotate,
-            ha="right",
+            ha=ha,
             rotation_mode="anchor",
             fontsize=tick_font,
         )

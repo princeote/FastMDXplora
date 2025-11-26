@@ -30,12 +30,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm, to_hex
 from matplotlib.cm import ScalarMappable
+from matplotlib.ticker import FixedLocator, FuncFormatter
 
 from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
 
 from .base import BaseAnalysis, AnalysisError
 from ..utils.options import OptionsForwarder
-from ..utils.plotting import apply_slide_style, auto_ticks
+from ..utils.plotting import apply_slide_style, auto_ticks, match_colorbar_font
 
 CLUSTER_AXIS_LABEL = "Cluster ID"
 CLUSTER_TITLE_SIZE = 26.0
@@ -347,23 +348,22 @@ class ClusterAnalysis(BaseAnalysis):
         )
         cbar.ax.set_yticklabels([str(u) for u in unique])
         cbar.set_label(CLUSTER_AXIS_LABEL)
+        frame_values = np.arange(1, image_data.shape[1] + 1, dtype=int)
         apply_slide_style(
             ax,
-            x_values=np.arange(image_data.shape[1], dtype=int),
+            x_values=frame_values,
             integer_x=True,
             x_max_ticks=10,
             zero_x=True,
             title_size=kwargs.get("title_size", CLUSTER_TITLE_SIZE),
         )
         ax.set_yticks([])
-        label_size = ax.xaxis.label.get_fontsize()
-        cbar.ax.yaxis.label.set_fontsize(label_size)
-        cbar.ax.tick_params(labelsize=label_size)
+        match_colorbar_font(cbar, ax)
         return self._save_plot(fig, filename)
 
     def _plot_cluster_trajectory_scatter(self, labels, filename, **kwargs):
         logger.info("Plotting trajectory scatter...")
-        frames = np.arange(len(labels))
+        frames = np.arange(1, len(labels) + 1, dtype=int)
         fig, ax = plt.subplots(figsize=(10, 4))
         unique = np.sort(np.unique(labels))
         cmap = get_cluster_cmap(len(unique))
@@ -395,21 +395,28 @@ class ClusterAnalysis(BaseAnalysis):
             title_size=kwargs.get("title_size", CLUSTER_TITLE_SIZE),
         )
         ax.set_yticks([])
-        label_size = ax.xaxis.label.get_fontsize()
-        cbar.ax.yaxis.label.set_fontsize(label_size)
-        cbar.ax.tick_params(labelsize=label_size)
+        match_colorbar_font(cbar, ax)
         return self._save_plot(fig, filename)
 
     def _plot_distance_matrix(self, distances, filename, **kwargs):
         logger.info("Plotting distance matrix heatmap...")
         fig, ax = plt.subplots(figsize=(10, 8))
-        im = ax.imshow(distances, aspect="auto", interpolation="none", cmap=kwargs.get("cmap", "viridis"))
+        im = ax.imshow(
+            distances,
+            aspect="auto",
+            interpolation="none",
+            cmap=kwargs.get("cmap", "viridis"),
+        )
         ax.set_title(kwargs.get("title", "RMSD Distance Matrix (nm)"))
         ax.set_xlabel(kwargs.get("xlabel", "Frame"))
         ax.set_ylabel(kwargs.get("ylabel", "Frame"))
         cbar = fig.colorbar(im, ax=ax)
         cbar.set_label("RMSD (nm)")
-        frames = np.arange(distances.shape[0], dtype=int)
+        n_frames = int(distances.shape[0])
+        ax.set_xlim(0, n_frames)
+        ax.set_ylim(n_frames, 0)
+
+        frames = np.arange(0, n_frames + 1, dtype=int)
         apply_slide_style(
             ax,
             x_values=frames,
@@ -419,6 +426,27 @@ class ClusterAnalysis(BaseAnalysis):
             zero_x=True,
             zero_y=True,
         )
+        ax.set_xlim(0, n_frames)
+        ax.set_ylim(n_frames, 0)
+
+        def _ensure_endpoint(axis_obj, endpoint: float) -> np.ndarray:
+            ticks = np.asarray(axis_obj.get_majorticklocs(), dtype=float)
+            if ticks.size == 0:
+                ticks = np.array([0.0, endpoint], dtype=float)
+            elif not np.any(np.isclose(ticks, endpoint)):
+                ticks = np.append(ticks, endpoint)
+                ticks = np.sort(np.unique(ticks))
+            else:
+                return ticks
+            axis_obj.set_major_locator(FixedLocator(ticks))
+            return ticks
+
+        _ensure_endpoint(ax.xaxis, float(n_frames))
+        _ensure_endpoint(ax.yaxis, float(n_frames))
+        formatter = FuncFormatter(lambda value, _: f"{int(round(value))}")
+        ax.xaxis.set_major_formatter(formatter)
+        ax.yaxis.set_major_formatter(formatter)
+        match_colorbar_font(cbar, ax)
         return self._save_plot(fig, filename)
 
     def _plot_dendrogram(self, linkage_matrix, labels, filename, **kwargs):

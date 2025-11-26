@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 
 from .base import BaseAnalysis, AnalysisError
 from ..utils.options import OptionsForwarder
-from ..utils.plotting import apply_slide_style, auto_ticks
+from ..utils.plotting import apply_slide_style, auto_ticks, match_colorbar_font
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +226,7 @@ class SASAAnalysis(BaseAnalysis):
 
     def _plot_total_sasa(self, total_sasa: np.ndarray, **kwargs):
         """Total SASA vs frame."""
-        x = np.arange(total_sasa.shape[0], dtype=int)
+        x = np.arange(1, total_sasa.shape[0] + 1, dtype=int)
         title = kwargs.get("title_total", "Total SASA vs Frame")
         xlabel = kwargs.get("xlabel_total", "Frame")
         ylabel = kwargs.get("ylabel_total", "Total SASA (nm²)")
@@ -251,8 +251,8 @@ class SASAAnalysis(BaseAnalysis):
             integer_x=True,
             x_max_ticks=10,
             y_max_ticks=6,
-             zero_x=True,
-             zero_y=True,
+            zero_x=True,
+            zero_y=True,
         )
         fig.tight_layout()
         out = self._save_plot(fig, "total_sasa")
@@ -280,29 +280,58 @@ class SASAAnalysis(BaseAnalysis):
         cbar = fig.colorbar(im, ax=ax)
         cbar.set_label("SASA (nm²)")
 
+        residues_zero_based = np.arange(R, dtype=int)
         if tick_step is not None:
             step = max(1, int(tick_step))
             res_ticks = np.arange(0, R, step, dtype=int)
+            if res_ticks.size == 0 or res_ticks[-1] != R - 1:
+                res_ticks = np.append(res_ticks, R - 1)
         else:
-            auto = auto_ticks(np.arange(R, dtype=int), max_ticks=max_y_ticks, integer=True)
-            res_ticks = auto.astype(int) if auto is not None and auto.size > 0 else np.arange(R, dtype=int)
+            res_ticks = None
 
+        y_tick_cap = max(4, min(max_y_ticks, 30))
+
+        frame_values = np.arange(1, residue_sasa.shape[0] + 1, dtype=int)
         apply_slide_style(
             ax,
-            x_values=np.arange(residue_sasa.shape[0], dtype=int),
+            x_values=frame_values,
             y_ticks=res_ticks,
+            y_max_ticks=y_tick_cap,
             integer_x=True,
             integer_y=True,
             zero_x=True,
             zero_y=True,
         )
+
+        yticks_after = np.asarray(ax.get_yticks(), dtype=float)
+        yticks_after = np.clip(np.rint(yticks_after).astype(int), 0, R - 1)
+        yticks_after = np.unique(yticks_after)
+
+        if (
+            tick_step is None
+            and yticks_after.size >= 3
+            and yticks_after[-1] == R - 1
+        ):
+            diffs = np.diff(yticks_after.astype(float))
+            if diffs.size >= 2:
+                typical = float(np.median(diffs[:-1]))
+            else:
+                typical = float(diffs[0]) if diffs.size else 0.0
+            last_gap = float(diffs[-1]) if diffs.size else 0.0
+            if typical > 0 and last_gap < typical * 0.65:
+                yticks_after = yticks_after[:-1]
+
+        ticklabels = [str(int(v) + 1) for v in yticks_after]
+
         tick_font = ax.get_yticklabels()[0].get_fontsize() if ax.get_yticklabels() else None
-        ax.set_yticks(res_ticks)
+        ax.set_yticks(yticks_after)
         ax.set_yticklabels(
-            [str(int(v) + 1) for v in res_ticks],
+            ticklabels,
+            rotation=0,
             rotation_mode="anchor",
             fontsize=tick_font,
         )
+        match_colorbar_font(cbar, ax)
 
         fig.tight_layout()
         out = self._save_plot(fig, "residue_sasa")
@@ -331,27 +360,55 @@ class SASAAnalysis(BaseAnalysis):
         ax.set_ylabel(ylabel)
         ax.grid(axis="y", alpha=0.3)
 
+        residue_positions = np.arange(1, R + 1, dtype=int)
+        y_values = average_sasa.flatten()
+
         if tick_step is not None:
             step = max(1, int(tick_step))
-            ticks = np.arange(1, R + 1, step, dtype=int)
+            tick_positions = np.arange(1, R + 1, step, dtype=int)
+            if tick_positions.size == 0 or tick_positions[-1] != R:
+                tick_positions = np.append(tick_positions, R)
         else:
-            auto = auto_ticks(np.arange(1, R + 1, dtype=int), max_ticks=max_x_ticks, integer=True)
-            ticks = auto.astype(int) if auto is not None and auto.size > 0 else np.arange(1, R + 1, dtype=int)
+            tick_positions = None
+
+        x_tick_cap = max(4, min(max_x_ticks, 12))
 
         apply_slide_style(
             ax,
-            x_ticks=ticks,
-            y_values=average_sasa.flatten(),
+            x_values=residue_positions,
+            y_values=y_values,
+            x_ticks=tick_positions,
+            x_max_ticks=x_tick_cap,
             integer_x=True,
             zero_y=True,
-            x_tick_rotation=45,
         )
+
+        xticks_after = np.asarray(ax.get_xticks(), dtype=float)
+        xticks_after = np.clip(np.rint(xticks_after).astype(int), 1, R)
+        xticks_after = np.unique(xticks_after)
+
+        if (
+            tick_step is None
+            and xticks_after.size >= 3
+            and xticks_after[-1] == R
+        ):
+            diffs = np.diff(xticks_after.astype(float))
+            if diffs.size >= 2:
+                typical = float(np.median(diffs[:-1]))
+            else:
+                typical = float(diffs[0]) if diffs.size else 0.0
+            last_gap = float(diffs[-1]) if diffs.size else 0.0
+            if typical > 0 and last_gap < typical * 0.65:
+                xticks_after = xticks_after[:-1]
+
+        ticklabels = [str(int(v)) for v in xticks_after]
+
         tick_font = ax.get_xticklabels()[0].get_fontsize() if ax.get_xticklabels() else None
-        ax.set_xticks(ticks)
+        ax.set_xticks(xticks_after)
         ax.set_xticklabels(
-            [str(int(v)) for v in ticks],
-            rotation=45,
-            ha="right",
+            ticklabels,
+            rotation=0,
+            ha="center",
             rotation_mode="anchor",
             fontsize=tick_font,
         )

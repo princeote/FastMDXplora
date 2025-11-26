@@ -44,7 +44,7 @@
 
 ## Installation
 
-We **strongly recommend** installing ``FastMDAnalysis`` in a **virtual environment** to avoid conflicts with system packages and ensure the ``fastmda`` command is available in your PATH.
+We **strongly recommend installing ``FastMDAnalysis`` in a virtual environment** to avoid conflicts with system packages and ensure the ``fastmda`` command is available in your PATH.
 
 
 ### Install from conda-forge (Recommended)

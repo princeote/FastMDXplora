@@ -1,4 +1,6 @@
 # FastMDAnalysis/src/fastmdanalysis/analysis/rg.py
+
+
 """
 Radius of Gyration (RG) Analysis Module
 
@@ -95,13 +97,20 @@ class RGAnalysis(BaseAnalysis):
         self.data: Optional[np.ndarray] = None
         self.results: Dict[str, np.ndarray] = {}
 
+        logger.info("Initialized RG analysis: atoms=%s, mass_weighted=%s",
+                   self.atoms if self.atoms else "ALL", self.mass_weighted)
+
     def _subset_traj(self):
         """Return trajectory sliced by atom selection if provided."""
         if self.atoms:
+            logger.debug("Selecting atoms: %s", self.atoms)
             sel = self.traj.topology.select(self.atoms)
             if sel is None or len(sel) == 0:
                 raise AnalysisError(f"No atoms selected using: '{self.atoms}'")
-            return self.traj.atom_slice(sel)
+            subtraj = self.traj.atom_slice(sel)
+            logger.debug("Atom selection yielded %d atoms", len(sel))
+            return subtraj
+        logger.debug("Using all %d atoms", self.traj.n_atoms)
         return self.traj
 
     def run(self) -> Dict[str, np.ndarray]:
@@ -115,27 +124,34 @@ class RGAnalysis(BaseAnalysis):
         """
         try:
             subtraj = self._subset_traj()
+            
             logger.info(
-                "RG: starting (atoms=%s, n_frames=%d, n_atoms=%d)",
+                "Starting RG calculation: atoms=%s, n_frames=%d, n_atoms=%d",
                 self.atoms if self.atoms else "ALL",
                 subtraj.n_frames,
                 subtraj.n_atoms,
             )
 
+            logger.debug("Computing radius of gyration...")
             rg_values = md.compute_rg(subtraj)  # shape (N,), units nm
             self.data = np.asarray(rg_values, dtype=float).reshape(-1, 1)
             self.results = {"rg": self.data}
 
             # Save data and default plot
+            logger.info("Saving RG data...")
             self._save_data(self.data, "rg", header="rg_nm", fmt="%.6f")
+            
+            logger.info("Generating RG plot...")
             self.plot()
 
-            logger.info("RG: done.")
+            rg_range = (self.data.min(), self.data.max())
+            logger.info("RG analysis complete: range [%.3f, %.3f] nm", rg_range[0], rg_range[1])
             return self.results
 
         except AnalysisError:
             raise
         except Exception as e:
+            logger.exception("Radius of gyration analysis failed")
             raise AnalysisError(f"Radius of gyration analysis failed: {e}")
 
     def plot(self, data: Optional[np.ndarray] = None, **kwargs):
@@ -165,6 +181,7 @@ class RGAnalysis(BaseAnalysis):
         if data is None:
             raise AnalysisError("No RG data available to plot. Run the analysis first.")
 
+        logger.debug("Generating RG plot")
         y = np.asarray(data, dtype=float).reshape(-1)
         x = np.arange(1, y.size + 1, dtype=int)
 
@@ -190,7 +207,6 @@ class RGAnalysis(BaseAnalysis):
             ax,
             x_values=x,
             y_values=y,
-            integer_x=True,
             x_max_ticks=8,
             y_max_ticks=6,
             zero_x=True,
@@ -200,5 +216,12 @@ class RGAnalysis(BaseAnalysis):
 
         out = self._save_plot(fig, "rg")
         plt.close(fig)
+        logger.debug("RG plot saved to %s", out)
         return out
 
+    def _save_plot(self, fig, name: str):
+        """Save the figure as a PNG file in the output directory and log its path."""
+        plot_path = self.outdir / f"{name}.png"
+        fig.savefig(plot_path, bbox_inches="tight")
+        logger.info("Plot saved to %s", plot_path)
+        return plot_path

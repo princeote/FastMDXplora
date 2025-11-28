@@ -1,18 +1,32 @@
+# FastMDAnalysis/src/fastmdanalysis/analysis/dimred.py
+
+"""
+Dimensionality Reduction Analysis Module
+
+Main orchestrator for dimensionality reduction methods.
+Delegates to specialized modules: pca, mds, tsne.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+import logging
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
-from sklearn.decomposition import PCA
-from sklearn.manifold import MDS, TSNE
 
-from .base import BaseAnalysis
+from .base import BaseAnalysis, AnalysisError
 from ..utils.options import OptionsForwarder
 from ..utils.plotting import apply_slide_style, match_colorbar_font, auto_ticks
 
+# Import the modularized dimensionality reduction methods
+from .pca import PCAAnalysis
+from .mds import MDSAnalysis
+from .tsne import TSNEAnalysis
+
+logger = logging.getLogger(__name__)
 
 PathLike = Union[str, Path]
 
@@ -35,20 +49,6 @@ def _as_list(methods: Union[str, Sequence[str]]) -> List[str]:
     order = ["pca", "mds", "tsne"]
     items_set = set(items)
     return [m for m in order if m in items_set]
-
-
-def _auto_tsne_perplexity(n_frames: int, user_value: Optional[int] = None) -> int:
-    """
-    Choose a sensible t-SNE perplexity. Clamp to [5, 30] and < n_frames.
-    """
-    if user_value is not None:
-        p = int(user_value)
-    else:
-        # simple heuristic: ~ min(30, max(5, n/10))
-        p = max(5, min(30, n_frames // 10 if n_frames > 0 else 30))
-    # t-SNE requires perplexity < n_samples
-    p = min(p, max(1, n_frames - 1))
-    return max(5, p)
 
 
 class DimRedAnalysis(BaseAnalysis):
@@ -163,6 +163,13 @@ class DimRedAnalysis(BaseAnalysis):
         self.mds_metric = metric
         self.strict = strict
 
+        logger.info("Initialized dimensionality reduction analysis")
+        logger.info("Methods: %s, n_components=%d, atoms=%s", 
+                   self.methods, self.n_components, self.atoms if self.atoms else "ALL")
+        if "tsne" in self.methods:
+            logger.info("t-SNE parameters: max_iter=%d, perplexity=%s", 
+                       self.tsne_max_iter, self.tsne_perplexity)
+
         # Results: method -> ndarray of shape (n_frames, 2)
         self.results: Dict[str, np.ndarray] = {}
 
@@ -174,23 +181,30 @@ class DimRedAnalysis(BaseAnalysis):
         """
         t = self.traj
         if self.atoms:
+            logger.info("Selecting atoms: %s", self.atoms)
             idx = t.topology.select(self.atoms)
             if idx.size == 0:
-                raise ValueError(f"Atom selection returned 0 atoms: {self.atoms}")
+                raise AnalysisError(f"Atom selection returned 0 atoms: {self.atoms}")
             t = t.atom_slice(idx, inplace=False)
+            logger.info("Atom selection yielded %d atoms", len(idx))
 
         # (n_frames, n_atoms, 3) -> (n_frames, n_atoms * 3)
         X = t.xyz.astype(np.float32).reshape((t.n_frames, -1), order="C")
+        logger.debug("Flattened coordinates: shape=%s", X.shape)
         return X
 
     def _save_array(self, name: str, arr: np.ndarray) -> Path:
         """Save array to file using BaseAnalysis method."""
-        return self._save_data(arr, f"dimred_{name}")
+        logger.debug("Saving %s coordinates to file", name)
+        path = self._save_data(arr, f"dimred_{name}")
+        logger.info("%s coordinates saved to %s", name.upper(), path)
+        return path
 
     def _plot_one(self, name: str, emb: np.ndarray) -> Path:
         """
         Scatter colored by frame index; returns the saved PNG path.
         """
+        logger.debug("Generating %s projection plot", name)
         fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
 
         # Color by frame index with a colorbar
@@ -208,19 +222,32 @@ class DimRedAnalysis(BaseAnalysis):
         )
         cb = fig.colorbar(sc, ax=ax)
         cb.set_label("Frame Index")
-        if frame_colors.size == 1:
-            ticks = np.asarray([0.0, float(frame_colors[-1])])
+        
+        # Fixed: Use auto_ticks directly without manually adding endpoints
+        # This prevents duplicate ticks at boundaries
+        if n_frames <= 1:
+            ticks = np.asarray([0.0, float(n_frames)])
         else:
+            # Let auto_ticks handle the tick generation properly
             ticks = auto_ticks(
                 np.array([0.0, float(n_frames)], dtype=float),
                 max_ticks=6,
-                integer=True,
                 include_zero=True,
             )
+            # Ensure we have reasonable fallback if auto_ticks returns None
             if ticks is None or ticks.size == 0:
-                ticks = np.linspace(0.0, float(n_frames), num=6)
-        ticks = np.unique(np.append(ticks, [0.0, float(n_frames)]))
-        ticks.sort()
+                ticks = np.linspace(0.0, float(n_frames), num=min(6, n_frames + 1))
+        
+        # Remove any ticks that are very close to each other (within 1% of range)
+        if ticks.size > 1:
+            tick_range = float(n_frames)
+            min_tick_separation = tick_range * 0.01  # 1% of total range
+            unique_ticks = [ticks[0]]
+            for i in range(1, len(ticks)):
+                if abs(ticks[i] - unique_ticks[-1]) > min_tick_separation:
+                    unique_ticks.append(ticks[i])
+            ticks = np.array(unique_ticks)
+        
         cb.set_ticks(ticks)
         cb.set_ticklabels([f"{int(round(t))}" for t in ticks])
 
@@ -255,6 +282,7 @@ class DimRedAnalysis(BaseAnalysis):
         # Save plot using BaseAnalysis method
         out = self._save_plot(fig, f"dimred_{name}")
         plt.close(fig)
+        logger.debug("%s projection plot saved to %s", name.upper(), out)
         return out
 
     # --------------------------------- API -----------------------------------
@@ -262,56 +290,88 @@ class DimRedAnalysis(BaseAnalysis):
     def run(self) -> "DimRedAnalysis":
         """
         Compute the requested embeddings and save numeric outputs immediately.
-        Also logs brief progress via BaseAnalysis logger (if configured).
         """
-        X_flat = self._flatten_xyz()
-        n_frames = X_flat.shape[0]
+        try:
+            logger.info("Starting dimensionality reduction analysis...")
+            X_flat = self._flatten_xyz()
+            n_frames = X_flat.shape[0]
+            n_features = X_flat.shape[1]
+            
+            logger.info("Input data: %d frames, %d features", n_frames, n_features)
 
-        # PCA
-        if "pca" in self.methods:
-            pca = PCA(n_components=self.n_components, random_state=self.random_state)
-            emb = pca.fit_transform(X_flat)
-            self.results["pca"] = emb.astype(np.float32)
-            self._save_array("pca", self.results["pca"])
+            # Use modularized methods
+            for method in self.methods:
+                logger.info("Running dimensionality reduction method: %s", method)
 
-        # MDS (silence FutureWarning by setting n_init explicitly)
-        if "mds" in self.methods:
-            mds = MDS(
-                n_components=self.n_components,
-                n_init=4,  # default value today; avoids FutureWarning("...will change...")
-                random_state=self.random_state,
-                normalized_stress="auto",
-                dissimilarity=self.mds_metric,
-            )
-            emb = mds.fit_transform(X_flat)
-            self.results["mds"] = emb.astype(np.float32)
-            self._save_array("mds", self.results["mds"])
+                if method == "pca":
+                    # Use PCA module
+                    pca = PCAAnalysis(
+                        n_components=self.n_components,
+                        random_state=self.random_state
+                    )
+                    emb = pca.fit_transform(X_flat)
+                    self.results["pca"] = emb
+                    self._save_array("pca", emb)
+                    logger.info("PCA explained variance ratio: %s", pca.explained_variance_ratio_)
 
-        # t-SNE
-        if "tsne" in self.methods:
-            perplexity = _auto_tsne_perplexity(n_frames, self.tsne_perplexity)
-            tsne = TSNE(
-                n_components=self.n_components,
-                perplexity=perplexity,
-                max_iter=self.tsne_max_iter,  # use max_iter (not deprecated n_iter)
-                random_state=self.random_state,
-                init="pca",
-                learning_rate="auto",
-            )
-            emb = tsne.fit_transform(X_flat)
-            self.results["tsne"] = emb.astype(np.float32)
-            self._save_array("tsne", self.results["tsne"])
+                elif method == "mds":
+                    # Use MDS module
+                    mds = MDSAnalysis(
+                        n_components=self.n_components,
+                        random_state=self.random_state,
+                        metric=self.mds_metric
+                    )
+                    emb = mds.fit_transform(X_flat)
+                    self.results["mds"] = emb
+                    self._save_array("mds", emb)
 
-        # Generate plots automatically after computation
-        self.plot()
-        
-        return self
+                elif method == "tsne":
+                    # Use t-SNE module
+                    tsne = TSNEAnalysis(
+                        n_components=self.n_components,
+                        random_state=self.random_state,
+                        perplexity=self.tsne_perplexity,
+                        max_iter=self.tsne_max_iter
+                    )
+                    emb = tsne.fit_transform(X_flat)
+                    self.results["tsne"] = emb
+                    self._save_array("tsne", emb)
+
+                else:
+                    raise AnalysisError(f"Unknown dimensionality reduction method: {method}")
+
+            # Generate plots automatically after computation
+            logger.info("Generating projection plots...")
+            self.plot()
+
+            logger.info("Dimensionality reduction analysis complete. Methods computed: %s", 
+                       list(self.results.keys()))
+            return self
+
+        except AnalysisError:
+            raise
+        except Exception as e:
+            logger.exception("Dimensionality reduction failed")
+            raise AnalysisError(f"Dimensionality reduction failed: {e}")
 
     def plot(self) -> Dict[str, Path]:
         """
         Generate and save plots for each computed embedding, returning a {method: Path} map.
         """
+        if not self.results:
+            raise AnalysisError("No dimensionality reduction results available. Run the analysis first.")
+
+        logger.info("Generating projection plots for methods: %s", list(self.results.keys()))
         out: Dict[str, Path] = {}
         for name, emb in self.results.items():
             out[name] = self._plot_one(name, emb)
+        
+        logger.info("All projection plots generated: %s", list(out.keys()))
         return out
+
+    def _save_plot(self, fig, name: str):
+        """Save the figure as a PNG file in the output directory and log its path."""
+        plot_path = self.outdir / f"{name}.png"
+        fig.savefig(plot_path, bbox_inches="tight")
+        logger.info("Plot saved to %s", plot_path)
+        return plot_path

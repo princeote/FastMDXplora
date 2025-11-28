@@ -1,4 +1,5 @@
 # FastMDAnalysis/src/fastmdanalysis/analysis/rmsd.py
+
 """
 RMSD Analysis Module
 
@@ -132,13 +133,19 @@ class RMSDAnalysis(BaseAnalysis):
         self.data: Optional[np.ndarray] = None
         self.results: Dict[str, np.ndarray] = {}
 
+        logger.info("Initialized RMSD analysis: reference_frame=%d, align=%s, atoms=%s",
+                   self.reference_frame, self.align, self.atoms if self.atoms else "ALL")
+
     def _select_atoms(self) -> Optional[np.ndarray]:
         """Return atom indices for selection, or None for all atoms."""
         if self.atoms:
+            logger.debug("Selecting atoms: %s", self.atoms)
             sel = self.traj.topology.select(self.atoms)
             if sel is None or len(sel) == 0:
                 raise AnalysisError(f"No atoms selected using the selection: '{self.atoms}'")
+            logger.debug("Atom selection yielded %d atoms", len(sel))
             return sel
+        logger.debug("Using all %d atoms", self.traj.n_atoms)
         return None
 
     def run(self) -> Dict[str, np.ndarray]:
@@ -154,13 +161,14 @@ class RMSDAnalysis(BaseAnalysis):
             # Reference frame (mdtraj supports negative indices)
             try:
                 ref = self.traj[self.reference_frame]
+                logger.debug("Reference frame %d loaded successfully", self.reference_frame)
             except Exception as e:
                 raise AnalysisError(f"Invalid reference frame index: {self.reference_frame}") from e
 
             atom_indices = self._select_atoms()
 
             logger.info(
-                "RMSD: starting (ref=%d, atoms=%s, align=%s, n_frames=%d, n_atoms=%d)",
+                "Starting RMSD calculation: ref=%d, atoms=%s, align=%s, n_frames=%d, n_atoms=%d",
                 self.reference_frame,
                 self.atoms if self.atoms else "ALL",
                 self.align,
@@ -169,9 +177,11 @@ class RMSDAnalysis(BaseAnalysis):
             )
 
             if self.align:
+                logger.debug("Computing aligned RMSD")
                 # md.rmsd performs optimal superposition internally
                 rmsd_values = md.rmsd(self.traj, ref, atom_indices=atom_indices)
             else:
+                logger.debug("Computing no-fit RMSD")
                 # No-fit RMSD
                 rmsd_values = _rmsd_no_fit(self.traj, ref, atom_indices=atom_indices)
 
@@ -179,15 +189,20 @@ class RMSDAnalysis(BaseAnalysis):
             self.results = {"rmsd": self.data}
 
             # Save data and default plot
+            logger.info("Saving RMSD data...")
             self._save_data(self.data, "rmsd", header="rmsd_nm", fmt="%.6f")
+            
+            logger.info("Generating RMSD plot...")
             self.plot()
 
-            logger.info("RMSD: done.")
+            rmsd_range = (self.data.min(), self.data.max())
+            logger.info("RMSD analysis complete: range [%.3f, %.3f] nm", rmsd_range[0], rmsd_range[1])
             return self.results
 
         except AnalysisError:
             raise
         except Exception as e:
+            logger.exception("RMSD analysis failed")
             raise AnalysisError(f"RMSD analysis failed: {e}")
 
     def plot(self, data: Optional[np.ndarray] = None, **kwargs):
@@ -217,6 +232,7 @@ class RMSDAnalysis(BaseAnalysis):
         if data is None:
             raise AnalysisError("No RMSD data available to plot. Please run the analysis first.")
 
+        logger.debug("Generating RMSD plot")
         y = np.asarray(data, dtype=float).reshape(-1)
         x = np.arange(1, y.size + 1, dtype=int)
 
@@ -241,7 +257,6 @@ class RMSDAnalysis(BaseAnalysis):
             ax,
             x_values=x,
             y_values=y,
-            integer_x=True,
             x_max_ticks=8,
             y_max_ticks=6,
             zero_x=True,
@@ -251,5 +266,12 @@ class RMSDAnalysis(BaseAnalysis):
 
         out = self._save_plot(fig, "rmsd")
         plt.close(fig)
+        logger.debug("RMSD plot saved to %s", out)
         return out
 
+    def _save_plot(self, fig, name: str):
+        """Save the figure as a PNG file in the output directory and log its path."""
+        plot_path = self.outdir / f"{name}.png"
+        fig.savefig(plot_path, bbox_inches="tight")
+        logger.info("Plot saved to %s", plot_path)
+        return plot_path

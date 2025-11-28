@@ -1,4 +1,6 @@
 # FastMDAnalysis/src/fastmdanalysis/analysis/rmsf.py
+
+
 """
 RMSF Analysis Module
 
@@ -66,6 +68,10 @@ class RMSFAnalysis(BaseAnalysis):
         kwargs : dict
             Passed through to BaseAnalysis (e.g., output).
         """
+        logger.info("Initializing RMSF analysis")
+        logger.debug("Input parameters: atoms=%s, per_residue=%s, strict=%s", 
+                    atoms, per_residue, strict)
+        
         warn_unknown = kwargs.pop("_warn_unknown", False)
 
         analysis_opts = {
@@ -97,6 +103,13 @@ class RMSFAnalysis(BaseAnalysis):
         # Populated during run()
         self.data: Optional[np.ndarray] = None              # shape (N, 1)
         self.results: Dict[str, np.ndarray] = {}
+        
+        logger.info("RMSF analysis initialized with %d frames, %d atoms", 
+                   trajectory.n_frames, trajectory.n_atoms)
+        if atoms:
+            logger.info("Atom selection: %s", atoms)
+        if per_residue:
+            logger.info("Per-residue aggregation enabled")
 
     def run(self) -> Dict[str, np.ndarray]:
         """
@@ -108,26 +121,37 @@ class RMSFAnalysis(BaseAnalysis):
             {"rmsf": (N, 1) array of per-atom RMSF values in nm}
             If per_residue=True, also includes {"rmsf_per_residue": (R, 1) array}
         """
+        logger.info("Starting RMSF analysis")
         try:
             # Atom selection (global indices)
             if self.atoms:
+                logger.debug("Selecting atoms with: %s", self.atoms)
                 sel = self.traj.topology.select(self.atoms)
                 if sel is None or len(sel) == 0:
                     raise AnalysisError(f"No atoms selected using selection: '{self.atoms}'")
                 subtraj = self.traj.atom_slice(sel)
+                logger.info("Selected %d atoms from trajectory", subtraj.n_atoms)
             else:
                 subtraj = self.traj
+                logger.debug("Using all %d atoms", subtraj.n_atoms)
 
             # Average structure as reference
+            logger.debug("Computing average structure from %d frames", subtraj.n_frames)
             avg_xyz = np.mean(subtraj.xyz, axis=0, keepdims=True)
             ref = md.Trajectory(avg_xyz, subtraj.topology)
 
             # Per-atom RMSF (nm) relative to average structure
+            logger.info("Computing RMSF values")
             rmsf_values = md.rmsf(subtraj, ref)  # shape (N,)
             self.data = np.asarray(rmsf_values, dtype=float).reshape(-1, 1)
             self.results = {"rmsf": self.data}
+            
+            logger.info("RMSF computation completed - mean: %.4f nm, std: %.4f nm, range: [%.4f, %.4f] nm",
+                       np.mean(rmsf_values), np.std(rmsf_values), 
+                       np.min(rmsf_values), np.max(rmsf_values))
 
             if self.per_residue:
+                logger.debug("Computing per-residue RMSF aggregation")
                 atom_to_residue = np.array([a.residue.index for a in subtraj.topology.atoms], dtype=int)
                 n_residues = int(max(atom_to_residue) + 1) if atom_to_residue.size else 0
                 per_residue_rmsf = np.zeros(n_residues, dtype=float)
@@ -143,23 +167,32 @@ class RMSFAnalysis(BaseAnalysis):
                     header="rmsf_per_residue_nm",
                     fmt="%.6f",
                 )
-                logger.info("RMSF: per-residue aggregation computed (%d residues)", n_residues)
+                logger.info("Per-residue RMSF computed for %d residues - mean: %.4f nm, range: [%.4f, %.4f] nm",
+                           n_residues, np.mean(per_residue_rmsf), 
+                           np.min(per_residue_rmsf), np.max(per_residue_rmsf))
 
             # Save data and a default plot
+            logger.debug("Saving RMSF data")
             self._save_data(self.data, "rmsf")
-            self.plot()
+            
+            logger.info("Generating RMSF plot")
+            plot_path = self.plot()
+            logger.info("RMSF plot saved to: %s", plot_path)
 
             return self.results
+            
         except AnalysisError:
+            logger.error("RMSF analysis failed with AnalysisError")
             raise
         except Exception as e:
+            logger.error("RMSF analysis failed with unexpected error: %s", str(e))
             raise AnalysisError(f"RMSF analysis failed: {e}")
 
     def plot(
         self,
         data: Optional[Union[Sequence[float], np.ndarray]] = None,
         *,
-        max_ticks: int = 30,        # hard cap on number of labeled x ticks
+        max_ticks: int = 8,        # Consistent with RMSD
         tick_step: Optional[int] = None,  # show every Nth tick (overrides max_ticks)
         rotate: int = 0,            # tick label rotation (default horizontal)
         figsize=(12, 6),
@@ -176,7 +209,7 @@ class RMSFAnalysis(BaseAnalysis):
         data
             RMSF values to plot. If None, uses computed data from run().
         max_ticks
-            Target maximum number of x tick labels (used when tick_step is None).
+            Target maximum number of x tick labels (consistent with RMSD).
         tick_step
             Force showing every Nth tick. If provided, overrides max_ticks heuristic.
         rotate
@@ -189,23 +222,28 @@ class RMSFAnalysis(BaseAnalysis):
         Path
             File path of the saved plot image.
         """
+        logger.debug("Generating RMSF plot with parameters: max_ticks=%d, tick_step=%s, rotate=%d",
+                    max_ticks, tick_step, rotate)
+        
         if data is None:
             data = self.data
         if data is None:
+            logger.error("No RMSF data available for plotting")
             raise AnalysisError("No RMSF data available to plot. Run the analysis first.")
 
         y = np.asarray(data, dtype=float).flatten()
         n = int(y.size)
         x = np.arange(n)
-
-        # Numeric-only atom indices for x-axis (now zero-based to align with other plots)
-        labels_all = [str(i) for i in x]
+        
+        logger.debug("Plotting %d RMSF values", n)
 
         # Plot
         fig, ax = plt.subplots(figsize=figsize)
         bar_kwargs = {"width": 0.9}
         if color is not None:
             bar_kwargs["color"] = color
+            logger.debug("Using custom color: %s", color)
+            
         ax.bar(x, y, **bar_kwargs)
 
         ax.set_title(title)
@@ -215,65 +253,42 @@ class RMSFAnalysis(BaseAnalysis):
         ax.grid(axis="y", alpha=0.3)
         ax.grid(axis="x", alpha=0.12)
 
-        x_tick_cap = max(4, min(max_ticks, 12))
-
+        # Use tick_step if provided, otherwise let auto_ticks handle it
         if tick_step is not None:
             step = max(1, int(tick_step))
             tick_positions = np.arange(0, n, step, dtype=float)
             if tick_positions.size == 0 or tick_positions[-1] != n - 1:
                 tick_positions = np.append(tick_positions, float(n - 1))
+            logger.debug("Using manual tick step: %d, resulting in %d tick positions", 
+                        step, len(tick_positions))
         else:
             tick_positions = None
+            logger.debug("Using automatic tick positioning with max_ticks=%d", max_ticks)
 
+        # Let apply_slide_style handle tick generation cleanly
         applied = apply_slide_style(
             ax,
             x_values=x,
             y_values=y,
             x_ticks=tick_positions,
-            x_max_ticks=x_tick_cap,
-            integer_x=True,
+            x_max_ticks=max_ticks,
             zero_x=True,
             zero_y=True,
             x_tick_rotation=rotate,
         )
+        logger.debug("Applied slide style with %d x-tick labels", len(ax.get_xticklabels()))
 
-        xticks_after = np.asarray(ax.get_xticks(), dtype=float)
-        xticks_after = np.clip(np.rint(xticks_after).astype(int), 0, n - 1)
-        xticks_after = np.unique(xticks_after)
-
-        if not np.any(xticks_after == 0):
-            xticks_after = np.insert(xticks_after, 0, 0)
-
-        if (
-            tick_step is None
-            and xticks_after.size >= 3
-            and xticks_after[-1] == n - 1
-        ):
-            diffs = np.diff(xticks_after.astype(float))
-            if diffs.size >= 2:
-                typical = float(np.median(diffs[:-1]))
-            else:
-                typical = float(diffs[0]) if diffs.size else 0.0
-
-            last_gap = float(diffs[-1]) if diffs.size else 0.0
-            if typical > 0 and last_gap < typical * 0.65:
-                xticks_after = xticks_after[:-1]
-
-        ticklabels = [labels_all[idx] for idx in xticks_after]
-
-        tick_font = ax.get_xticklabels()[0].get_fontsize() if ax.get_xticklabels() else None
-        ha = "center" if rotate == 0 else "right"
-        ax.set_xticks(xticks_after)
-        ax.set_xticklabels(
-            ticklabels,
-            rotation=rotate,
-            ha=ha,
-            rotation_mode="anchor",
-            fontsize=tick_font,
-        )
+        # Apply rotation to x-tick labels if needed
+        if rotate != 0:
+            for label in ax.get_xticklabels():
+                label.set_rotation(rotate)
+                label.set_horizontalalignment("right")
+            logger.debug("Applied %d degree rotation to x-tick labels", rotate)
 
         fig.tight_layout()
         outpath = self._save_plot(fig, "rmsf")
         plt.close(fig)
+        
+        logger.debug("RMSF plot saved to: %s", outpath)
         return Path(outpath)
 

@@ -1,3 +1,5 @@
+# FastMDAnalysis/src/fastmdanalysis/analysis/hbonds.py
+
 """
 Hydrogen Bonds Analysis Module
 
@@ -77,6 +79,11 @@ class HBondsAnalysis(BaseAnalysis):
         kwargs : dict
             Additional keyword arguments passed to BaseAnalysis.
         """
+        log.info("Initializing hydrogen bonds analysis")
+        log.debug("Input parameters: atoms=%s, distance=%.3f nm, angle=%.1f°, periodic=%s, "
+                 "sidechain_only=%s, exclude_water=%s, strict=%s",
+                 atoms, distance, angle, periodic, sidechain_only, exclude_water, strict)
+        
         warn_unknown = kwargs.pop("_warn_unknown", False)
 
         analysis_opts = {
@@ -128,12 +135,21 @@ class HBondsAnalysis(BaseAnalysis):
         self.strict = strict
         self.data: Optional[np.ndarray] = None
         self.results: Dict[str, object] = {}
+        
+        log.info("HBonds analysis initialized with %d frames, %d atoms", 
+                trajectory.n_frames, trajectory.n_atoms)
+        if atoms:
+            log.info("Atom selection: %s", atoms)
 
     @staticmethod
     def _has_bonds(traj: md.Trajectory) -> bool:
+        """Check if trajectory has bonds defined."""
         try:
-            return traj.topology.n_bonds > 0
-        except Exception:
+            has_bonds = traj.topology.n_bonds > 0
+            log.debug("Topology bond check: %d bonds found", traj.topology.n_bonds)
+            return has_bonds
+        except Exception as e:
+            log.debug("Error checking bonds: %s", e)
             return False
 
     def _prepare_work_trajectory(self) -> tuple[md.Trajectory, str, bool]:
@@ -144,53 +160,72 @@ class HBondsAnalysis(BaseAnalysis):
         -------
         (work_traj, selection_label, used_fallback)
         """
+        log.debug("Preparing working trajectory for H-bond detection")
+        
         # First, honor user selection (if any)
         if self.atoms:
+            log.debug("Selecting atoms with: %s", self.atoms)
             sel_idx = self.traj.topology.select(self.atoms)
             if sel_idx is None or len(sel_idx) == 0:
+                log.error("No atoms selected using selection: %s", self.atoms)
                 raise AnalysisError(f"No atoms selected using the selection: '{self.atoms}'")
             work = self.traj.atom_slice(sel_idx)
             selection_label = self.atoms
+            log.info("Selected %d atoms from trajectory", work.n_atoms)
         else:
             work = self.traj
             selection_label = "all atoms"
+            log.debug("Using all %d atoms", work.n_atoms)
+            
         if self.exclude_water and not self.atoms:
             try:
+                log.debug("Attempting to exclude water molecules")
                 non_water_idx = self.traj.topology.select("not water")
                 if non_water_idx is not None and len(non_water_idx) > 0:
                     work = self.traj.atom_slice(non_water_idx)
                     selection_label = "all atoms (excluding water)"
-                    log.info("HBonds: excluding water molecules from analysis")
+                    log.info("Excluded water molecules - %d atoms remaining", work.n_atoms)
             except Exception as e:
-                log.warning("HBonds: failed to exclude water: %s", e)
+                log.warning("Failed to exclude water: %s", e)
 
         # Try to (re)create bonds
+        log.debug("Creating standard bonds for topology")
         try:
             work.topology.create_standard_bonds()
-        except Exception:
-            pass
+            log.debug("Standard bonds created successfully")
+        except Exception as e:
+            log.debug("Could not create standard bonds: %s", e)
 
         # If no bonds (e.g., Cα-only), fall back to protein (or full traj)
         if not self._has_bonds(work):
+            log.warning("Selected atoms have no bonds - attempting fallback to protein/all atoms")
+            
             # Prefer protein subset if present
             try:
                 prot_idx = self.traj.topology.select("protein")
-            except Exception:
+                log.debug("Protein selection found %d atoms", len(prot_idx) if prot_idx is not None else 0)
+            except Exception as e:
+                log.debug("Error selecting protein: %s", e)
                 prot_idx = np.arange(self.traj.n_atoms)
+                
             if prot_idx is None or len(prot_idx) == 0:
                 # Fall back to full trajectory
                 fallback = self.traj
                 fb_label = "all atoms (fallback)"
+                log.info("No protein atoms found - falling back to all %d atoms", fallback.n_atoms)
             else:
                 fallback = self.traj.atom_slice(prot_idx)
                 fb_label = "protein (fallback)"
+                log.info("Falling back to protein selection with %d atoms", fallback.n_atoms)
 
             try:
                 fallback.topology.create_standard_bonds()
-            except Exception:
-                pass
+                log.debug("Standard bonds created for fallback topology")
+            except Exception as e:
+                log.debug("Could not create bonds for fallback: %s", e)
 
             if not self._has_bonds(fallback):
+                log.error("No bonds found even after fallback - topology may be incomplete")
                 raise AnalysisError(
                     "Hydrogen bonds analysis requires a bonded topology. "
                     "Could not infer bonds even after fallback to protein/all atoms. "
@@ -199,6 +234,8 @@ class HBondsAnalysis(BaseAnalysis):
 
             return fallback, fb_label, True
 
+        log.debug("Working trajectory prepared with %d atoms, %d bonds", 
+                 work.n_atoms, work.topology.n_bonds)
         return work, selection_label, False
 
     def run(self) -> dict:
@@ -215,21 +252,22 @@ class HBondsAnalysis(BaseAnalysis):
               "fallback": bool indicating if a fallback selection was needed
             }
         """
+        log.info("Starting hydrogen bonds analysis")
         try:
             # Prepare working trajectory (with auto-fallback if needed)
             work, label, used_fallback = self._prepare_work_trajectory()
             log.info(
-                "HBonds: starting (atoms=%s, n_frames=%d, n_atoms=%d%s)",
-                self.atoms if self.atoms is not None else "None",
-                work.n_frames,
-                work.n_atoms,
-                ", fallback used" if used_fallback else "",
+                "HBonds analysis: using %s (n_frames=%d, n_atoms=%d%s)",
+                label, work.n_frames, work.n_atoms,
+                ", FALLBACK USED" if used_fallback else ""
             )
 
             # Per-frame H-bond detection and counting
+            log.debug("Detecting hydrogen bonds across %d frames", work.n_frames)
             counts = np.zeros(work.n_frames, dtype=int)
             raw_by_frame: List[np.ndarray] = []
             
+            # Prepare Baker-Hubbard parameters
             bh_kwargs = {"periodic": self.periodic}
             try:
                 sig = inspect.signature(md.baker_hubbard)
@@ -238,18 +276,25 @@ class HBondsAnalysis(BaseAnalysis):
                 if 'angle' in sig.parameters:
                     # MDTraj expects angle in radians, we store in degrees
                     bh_kwargs['angle'] = np.deg2rad(self.angle)
-            except Exception:
-                log.debug("Could not inspect baker_hubbard signature, using defaults")
+                log.debug("Using Baker-Hubbard parameters: %s", bh_kwargs)
+            except Exception as e:
+                log.debug("Could not inspect baker_hubbard signature, using defaults: %s", e)
             
+            # Process each frame
             for i in range(work.n_frames):
                 # Baker–Hubbard on a single frame
                 try:
                     hb_i = md.baker_hubbard(work[i], **bh_kwargs)
                 except TypeError:
                     # Fallback if kwargs not supported
+                    log.debug("Baker-Hubbard with custom kwargs failed, using defaults")
                     hb_i = md.baker_hubbard(work[i], periodic=self.periodic)
+                    
                 raw_by_frame.append(hb_i)
                 counts[i] = len(hb_i)
+                
+                if i % max(1, work.n_frames // 10) == 0:  # Log progress every ~10%
+                    log.debug("Processed frame %d/%d: %d H-bonds", i + 1, work.n_frames, counts[i])
 
             self.data = counts.reshape(-1, 1)
             self.results = {
@@ -260,24 +305,34 @@ class HBondsAnalysis(BaseAnalysis):
             }
 
             # Save counts
+            log.debug("Saving H-bond counts data")
             self._save_data(self.data, "hbonds_counts")
+            
             # Write a small note if fallback happened
             if used_fallback:
-                note = Path(self.outdir) / "hbonds_NOTE.txt"
-                note.write_text(
+                note_path = Path(self.outdir) / "hbonds_NOTE.txt"
+                note_path.write_text(
                     "HBonds: your atom selection resulted in a topology with no bonds "
                     "(e.g., C-alpha-only). FastMDAnalysis automatically fell back to 'protein' "
                     "or all atoms to compute hydrogen bonds.\n"
                 )
+                log.info("Fallback note written to: %s", note_path)
 
             # Auto-plot
-            self.plot()
-            log.info("HBonds: done.")
+            log.debug("Generating H-bonds plot")
+            plot_path = self.plot()
+            
+            log.info("HBonds analysis completed - mean: %.2f, std: %.2f, range: [%d, %d]",
+                    np.mean(counts), np.std(counts), np.min(counts), np.max(counts))
+            log.info("H-bonds plot saved to: %s", plot_path)
+            
             return self.results
 
         except AnalysisError:
+            log.error("HBonds analysis failed with AnalysisError")
             raise
         except Exception as e:
+            log.error("HBonds analysis failed with unexpected error: %s", str(e))
             raise AnalysisError(f"Hydrogen bonds analysis failed: {e}")
 
     def plot(self, data=None, **kwargs):
@@ -301,9 +356,12 @@ class HBondsAnalysis(BaseAnalysis):
         Path
             The file path to the saved plot.
         """
+        log.debug("Generating hydrogen bonds plot")
+        
         if data is None:
             data = self.data
         if data is None:
+            log.error("No hydrogen bonds data available for plotting")
             raise AnalysisError("No hydrogen bonds data available to plot. Please run analysis first.")
 
         frames = np.arange(1, len(data) + 1, dtype=int)
@@ -312,6 +370,9 @@ class HBondsAnalysis(BaseAnalysis):
         ylabel = kwargs.get("ylabel", "Number of H-Bonds")
         color = kwargs.get("color")
         linestyle = kwargs.get("linestyle", "-")
+
+        log.debug("Plotting %d frames with custom params: title='%s', color=%s, linestyle=%s",
+                 len(frames), title, color, linestyle)
 
         fig, ax = plt.subplots(figsize=(10, 6))
         plot_kwargs = {"marker": "o", "linestyle": linestyle}
@@ -328,8 +389,6 @@ class HBondsAnalysis(BaseAnalysis):
             ax,
             x_values=frames,
             y_values=y_vals,
-            integer_x=True,
-            integer_y=True,
             x_max_ticks=8,
             y_max_ticks=6,
             zero_x=True,
@@ -338,5 +397,7 @@ class HBondsAnalysis(BaseAnalysis):
 
         plot_path = self._save_plot(fig, "hbonds")
         plt.close(fig)
+        
+        log.debug("H-bonds plot saved to: %s", plot_path)
         return plot_path
 

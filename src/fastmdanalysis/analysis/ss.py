@@ -1,4 +1,5 @@
 # FastMDAnalysis/src/fastmdanalysis/analysis/ss.py
+
 """
 SS Analysis Module
 
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Tuple
 from pathlib import Path
+import logging
 
 import numpy as np
 import mdtraj as md
@@ -35,8 +37,9 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 
 from .base import BaseAnalysis, AnalysisError
 from ..utils.options import OptionsForwarder
-from ..utils.plotting import apply_slide_style, auto_ticks, match_colorbar_font
+from ..utils.plotting import apply_slide_style, match_colorbar_font
 
+logger = logging.getLogger(__name__)
 
 # Order matters: numeric codes 0..7 map to these labels/colors
 SS_MAP: Dict[str, int] = {
@@ -146,15 +149,22 @@ class SSAnalysis(BaseAnalysis):
         self.strict = strict
         self.data: Optional[np.ndarray] = None  # will hold letter codes (n_frames, n_residues)
 
+        logger.info("Initialized SS analysis: algorithm=%s, atoms=%s", 
+                   self.algorithm, self.atoms if self.atoms else "ALL")
+
     # -------------------------- helpers --------------------------
 
     def _subset_trajectory(self):
         """Return the trajectory (subselected by atoms if provided)."""
         if self.atoms:
+            logger.info("Selecting atoms: %s", self.atoms)
             idx = self.traj.topology.select(self.atoms)
             if idx is None or len(idx) == 0:
                 raise AnalysisError(f"No atoms selected using selection: '{self.atoms}'")
-            return self.traj.atom_slice(idx)
+            subtraj = self.traj.atom_slice(idx)
+            logger.info("Atom selection yielded %d atoms", len(idx))
+            return subtraj
+        logger.info("Using all %d atoms", self.traj.n_atoms)
         return self.traj
 
     @staticmethod
@@ -163,38 +173,47 @@ class SSAnalysis(BaseAnalysis):
         Map (n_frames, n_residues) array of DSSP letters to numeric codes 0..7.
         Unknown letters fall back to 0 (coil).
         """
+        logger.debug("Converting DSSP letters to numeric codes")
         numeric = np.zeros_like(dssp_letters, dtype=int)
         # Vectorized map via dict: slower for truly huge arrays, but fine here
         # We iterate per frame to avoid building a giant object array
         for i in range(dssp_letters.shape[0]):
             # Convert row of single-char strings -> ints
             numeric[i, :] = [SS_MAP.get(ch, 0) for ch in dssp_letters[i, :]]
+        logger.debug("Numeric conversion complete: shape=%s, unique values=%s", 
+                    numeric.shape, np.unique(numeric))
         return numeric
 
     def _write_letters_dat(self, dssp_letters: np.ndarray) -> Path:
         """
         Write per-frame letters to ss_letters.dat (comma-separated).
         """
+        logger.debug("Writing SS letters data file")
         out = self.outdir / "ss_letters.dat"
         with open(out, "w") as f:
             for frame_idx in range(dssp_letters.shape[0]):
                 row = ",".join(dssp_letters[frame_idx, :].tolist())
                 f.write(row + "\n")
+        logger.info("SS letters saved to %s", out)
         return out
 
     def _write_numeric_dat(self, numeric: np.ndarray) -> Path:
         """
         Write per-frame numeric codes to ss_numeric.dat as a dense table.
         """
+        logger.debug("Writing SS numeric data file")
         # Header like: res1 res2 ... resN
         n_res = numeric.shape[1]
         header = " ".join([f"res{i+1}" for i in range(n_res)])
-        return self._save_data(numeric, "ss_numeric", header=header, fmt="%d")
+        path = self._save_data(numeric, "ss_numeric", header=header, fmt="%d")
+        logger.info("SS numeric data saved to %s", path)
+        return path
 
     def _generate_readme(self) -> Path:
         """
         Generate ss_README.md with the legend of DSSP codes.
         """
+        logger.debug("Generating SS README file")
         lines = [
             "# Secondary Structure (SS) Letter Codes",
             "",
@@ -210,12 +229,14 @@ class SSAnalysis(BaseAnalysis):
         path = self.outdir / "ss_README.md"
         with open(path, "w") as f:
             f.write(text)
+        logger.info("SS README saved to %s", path)
         return path
 
     def _generate_reference_image(self) -> Path:
         """
         Create a PNG table summarizing DSSP codes.
         """
+        logger.debug("Generating SS reference image")
         fig, ax = plt.subplots(figsize=(10, 4.5))
         ax.axis("off")
         fig.suptitle("Secondary Structure (SS) Letter Codes", fontsize=14, fontweight="bold", y=0.95)
@@ -244,6 +265,7 @@ class SSAnalysis(BaseAnalysis):
 
         out = self._save_plot(fig, "ss_letter_codes")
         plt.close(fig)
+        logger.info("SS reference image saved to %s", out)
         return out
 
     # ---------------------------- run/plot ----------------------------
@@ -263,37 +285,53 @@ class SSAnalysis(BaseAnalysis):
             # Some topologies need inferred bonds for proper geometry handling
             try:
                 subtraj.topology.create_standard_bonds()
-            except Exception:
-                pass
+                logger.debug("Standard bonds created for SS analysis")
+            except Exception as e:
+                logger.debug("Could not create standard bonds: %s", e)
 
+            logger.info("Computing DSSP secondary structure for %d frames, %d residues...", 
+                       subtraj.n_frames, subtraj.n_residues)
+            
             # md.compute_dssp returns array of shape (n_frames, n_residues) with single-char strings
             dssp_letters = md.compute_dssp(subtraj)
             if not isinstance(dssp_letters, np.ndarray) or dssp_letters.ndim != 2:
                 raise AnalysisError("Unexpected DSSP output shape; expected (n_frames, n_residues).")
 
+            logger.info("DSSP computation complete: shape=%s", dssp_letters.shape)
+            
+            # Count SS types for logging
+            unique_letters, counts = np.unique(dssp_letters, return_counts=True)
+            ss_counts = dict(zip(unique_letters, counts))
+            logger.info("SS type counts: %s", ss_counts)
+
             self.data = dssp_letters
             self.results = {"ss_data": self.data}
 
             # Persist data tables
+            logger.info("Saving SS data files...")
             letters_path = self._write_letters_dat(dssp_letters)
             numeric = self._letters_to_numeric(dssp_letters)
             numeric_path = self._write_numeric_dat(numeric)
             self.results.update({"ss_letters_file": letters_path, "ss_numeric_file": numeric_path})
 
             # Legend artifacts
+            logger.info("Generating SS documentation...")
             readme_path = self._generate_readme()
             codes_png_path = self._generate_reference_image()
             self.results.update({"ss_readme": readme_path, "ss_codes_plot": codes_png_path})
 
             # Default heatmap
+            logger.info("Generating SS heatmap...")
             self.plot()
 
+            logger.info("SS analysis complete: %d frames × %d residues", 
+                       dssp_letters.shape[0], dssp_letters.shape[1])
             return self.results
         except AnalysisError:
             raise
         except Exception as e:
+            logger.exception("SS analysis failed")
             raise AnalysisError(f"SS analysis failed: {e}")
-
     def plot(
         self,
         data: Optional[np.ndarray] = None,
@@ -328,16 +366,23 @@ class SSAnalysis(BaseAnalysis):
         if data is None:
             raise AnalysisError("No SS data available to plot. Please run analysis first.")
 
+        logger.info("Generating SS heatmap...")
+        
         if data.dtype.kind in ("U", "S", "O"):
             # Convert letters to numeric for plotting
             numeric = self._letters_to_numeric(data)
+            logger.debug("Converted letter data to numeric for plotting")
         else:
             # Assume already numeric
             numeric = np.asarray(data, dtype=int)
+            logger.debug("Using existing numeric data for plotting")
 
         # Transpose so rows -> residues, columns -> frames
         Z = numeric.T  # shape: (n_residues, n_frames)
         n_residues = Z.shape[0]
+        n_frames = Z.shape[1]
+        
+        logger.debug("Heatmap data shape: %d residues × %d frames", n_residues, n_frames)
 
         fig, ax = plt.subplots(figsize=(12, 8))
         im = ax.imshow(
@@ -355,35 +400,54 @@ class SSAnalysis(BaseAnalysis):
         cbar = fig.colorbar(im, ax=ax, ticks=SS_TICKS)
         cbar.set_ticklabels(SS_TICK_LABELS)
         cbar.set_label("SS Code")
+        
+        # Apply consistent colorbar font sizes
+        match_colorbar_font(cbar, ax)
+        logger.debug("Applied consistent colorbar font sizes")
 
         frames = np.arange(1, Z.shape[1] + 1, dtype=int)
-        residues = np.arange(n_residues, dtype=int)
-        if n_residues <= 60:
-            res_ticks = residues
+        
+        # Improved residue tick generation to prevent overlapping
+        # Use adaptive tick spacing based on number of residues
+        max_ticks = 20  # Maximum number of y-axis ticks to prevent overlap
+        
+        if n_residues <= max_ticks:
+            # For small proteins, show all residues
+            res_ticks = np.arange(0, n_residues, dtype=int)
+            logger.debug("Using all %d residue ticks (<=%d residues)", n_residues, max_ticks)
         else:
-            desired_ticks = 12
-            step = max(5, int(np.ceil(n_residues / desired_ticks)))
+            # For larger proteins, calculate step size to get approximately max_ticks
+            step = max(1, int(np.ceil(n_residues / max_ticks)))
             res_ticks = np.arange(0, n_residues, step, dtype=int)
+            
+            # Ensure we include the last residue
             if res_ticks.size == 0 or res_ticks[-1] != n_residues - 1:
                 res_ticks = np.append(res_ticks, n_residues - 1)
+            
+            # If we still have too many ticks, increase step size
+            while len(res_ticks) > max_ticks + 5:  # Allow some flexibility
+                step += 1
+                res_ticks = np.arange(0, n_residues, step, dtype=int)
+                if res_ticks.size == 0 or res_ticks[-1] != n_residues - 1:
+                    res_ticks = np.append(res_ticks, n_residues - 1)
+            
+            logger.debug("Using %d residue ticks with step %d", len(res_ticks), step)
 
+        # Apply slide style with the calculated ticks
         apply_slide_style(
             ax,
             x_values=frames,
             y_ticks=res_ticks,
-            integer_x=True,
-            integer_y=True,
             zero_x=True,
         )
 
-        tick_font = ax.get_yticklabels()[0].get_fontsize() if ax.get_yticklabels() else None
+        # Set y-ticks with 1-based residue numbering
         ax.set_yticks(res_ticks)
         ax.set_yticklabels(
             [str(int(v) + 1) for v in res_ticks],
+            rotation=0,
             rotation_mode="anchor",
-            fontsize=tick_font,
         )
-        match_colorbar_font(cbar, ax)
 
         fig.tight_layout()
 
@@ -395,5 +459,15 @@ class SSAnalysis(BaseAnalysis):
             out = self._save_plot(fig, filename)
 
         plt.close(fig)
+        logger.info("SS heatmap saved to %s", out)
         return Path(out)
+
+    def _save_plot(self, fig, name: str, filename: Optional[str] = None):
+        """Save the figure as a PNG file in the output directory and log its path."""
+        if filename is None:
+            filename = f"{name}.png"
+        plot_path = self.outdir / filename
+        fig.savefig(plot_path, bbox_inches="tight")
+        logger.info("Plot saved to %s", plot_path)
+        return plot_path
 

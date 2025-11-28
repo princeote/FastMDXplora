@@ -304,12 +304,89 @@ class ClusterAnalysis(BaseAnalysis):
         return self._save_plot(fig, filename)
 
     def _plot_distance_matrix(self, distances, filename, **kwargs):
-        # ... (keep exactly the same, it's quite long)
-        pass
+        logger.info("Plotting distance matrix heatmap...")
+        fig, ax = plt.subplots(figsize=(10, 8))
+        im = ax.imshow(distances, aspect="auto", interpolation="none", cmap=kwargs.get("cmap", "viridis"))
+        ax.set_title(kwargs.get("title", "RMSD Distance Matrix (nm)"), fontsize=20)
+        ax.set_xlabel(kwargs.get("xlabel", "Frame"), fontsize=20)
+        ax.set_ylabel(kwargs.get("ylabel", "Frame"), fontsize=20)
+        cbar = fig.colorbar(im, ax=ax)
+        cbar.set_label("RMSD (nm)", fontsize=20)
+        cbar.ax.tick_params(labelsize=18)
+        
+        n_frames = distances.shape[0]
+        frame_values = np.arange(n_frames, dtype=int)
+        
+        apply_slide_style(
+            ax,
+            x_values=frame_values,
+            y_values=frame_values,
+            tick_size=18,
+            label_size=20,
+            title_size=20,
+            zero_x=True,
+            zero_y=True,
+        )
+        match_colorbar_font(cbar, ax)
+        
+        # Make tight - remove white space on all sides
+        ax.set_xlim(-0.5, n_frames - 0.5)
+        ax.set_ylim(-0.5, n_frames - 0.5)
+        fig.tight_layout(pad=0)
+        
+        return self._save_plot(fig, filename)
 
     def _plot_dendrogram(self, linkage_matrix, labels, filename, **kwargs):
-        # ... (keep exactly the same)
-        pass
+        logger.info("Plotting dendrogram...")
+        N = len(labels)
+
+        def color_func(i):
+            leaves = get_leaves(linkage_matrix, i, N)
+            if not leaves:
+                logger.error("No leaves found for internal node %d", i)
+                return "#808080"
+            branch_labels = labels[leaves]
+            if np.all(branch_labels == branch_labels[0]):
+                unique = np.sort(np.unique(labels))
+                cmap_local = get_cluster_cmap(len(unique))
+                norm_local = get_discrete_norm(unique)
+                return to_hex(cmap_local(norm_local(branch_labels[0])))
+            return "#808080"
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        dendro = dendrogram(
+            linkage_matrix,
+            ax=ax,
+            color_threshold=0,
+            above_threshold_color="k",
+            no_labels=True,           # no default labels
+            link_color_func=color_func,
+        )
+
+        ax.set_title(kwargs.get("title", "Hierarchical Clustering Dendrogram"), fontsize=20)
+        ax.set_xlabel(kwargs.get("xlabel", "Frame"), fontsize=20)
+        ax.set_ylabel(kwargs.get("ylabel", "Distance"), fontsize=20)
+
+        # No x tick labels; just a clean axis
+        ax.set_xticks([])
+
+        # Tidy up y-axis only
+        ax.tick_params(axis="y", labelsize=18)
+        ax.yaxis.label.set_fontsize(20)
+        ax.xaxis.label.set_fontsize(20)
+        ax.title.set_fontsize(20)
+
+        # Ensure the tree starts at y = 0 and there is no space below it
+        ymin, ymax = ax.get_ylim()
+        ax.set_ylim(bottom=0.0, top=ymax)
+
+        fig.tight_layout(pad=0)
+        return self._save_plot(fig, filename)
+
+
+
+
 
     def _save_plot(self, fig, name: str):
         """Save the figure as a PNG file in the output directory and log its path."""

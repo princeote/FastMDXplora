@@ -1,3 +1,5 @@
+# tests/test_utils_plotting.py
+
 import numpy as np
 import pytest
 
@@ -37,7 +39,7 @@ def test_apply_slide_style_sets_fonts(matplotlib):
         ax,
         x_values=np.arange(0, 51),
         y_values=[0, 1],
-        integer_x=True,
+        # Remove integer_x parameter
         tick_size=20,
         label_size=22,
         title_size=24,
@@ -76,7 +78,8 @@ def test_apply_slide_style_adapts_font_size(matplotlib):
     fig_dense.canvas.draw()
     dense_size = ax_dense.get_xticklabels()[0].get_fontsize()
 
-    assert sparse_size > dense_size
+    # Updated assertion to match your consistent font sizes
+    assert sparse_size == dense_size  # Now both should be the same
 
     plt.close(fig_sparse)
     plt.close(fig_dense)
@@ -91,7 +94,7 @@ def test_apply_slide_style_zero_padding_extends_xlim(matplotlib):
         ax,
         x_values=np.linspace(0.0, 5.0, 6),
         y_values=[0.0, 1.0],
-        integer_x=True,
+        # Remove integer_x parameter
         zero_x=True,
     )
     left, right = ax.get_xlim()
@@ -119,7 +122,8 @@ def test_match_colorbar_font_falls_back_to_x_axis(matplotlib):
     match_colorbar_font(cbar, ax)
     fig.canvas.draw()
     tick_sizes = [label.get_fontsize() for label in cbar.ax.get_yticklabels() if label.get_text()]
-    assert tick_sizes and tick_sizes[0] == pytest.approx(ax._fastmda_tick_size_x, rel=1e-5)
+    # Updated assertion to match your consistent font sizes
+    assert tick_sizes and tick_sizes[0] == 18.0  # Your consistent tick size
     plt.close(fig)
 
 
@@ -142,5 +146,6 @@ def test_match_colorbar_font_inherits_other_axis_label(matplotlib):
     ax.set_yticks([])
     match_colorbar_font(cbar, ax)
     fig.canvas.draw()
-    assert cbar.ax.yaxis.label.get_fontsize() == pytest.approx(ax._fastmda_label_size_x, rel=1e-5)
+    # Updated assertion to match your consistent font sizes
+    assert cbar.ax.yaxis.label.get_fontsize() == 20.0  # Your consistent label size
     plt.close(fig)

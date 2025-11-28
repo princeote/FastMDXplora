@@ -213,19 +213,21 @@ class ClusterAnalysis(BaseAnalysis):
         )
         return self._save_plot(fig, filename)
 
+
     def _plot_cluster_trajectory_histogram(self, labels, filename, **kwargs):
-        # ... (keep exactly the same)
         logger.info("Plotting trajectory histogram for %d frames...", len(labels))
         unique = np.sort(np.unique(labels))
         image_data = np.array(labels).reshape(1, -1)
         cmap = get_cluster_cmap(len(unique))
         norm = get_discrete_norm(unique)
         fig, ax = plt.subplots(figsize=(12, 4))
-        im = ax.imshow(image_data, aspect="auto", interpolation="nearest", cmap=cmap, norm=norm)
+        im = ax.imshow(image_data, aspect="auto", interpolation="nearest", cmap=cmap, norm=norm, 
+                      extent=[0.5, len(labels) + 0.5, -0.5, 0.5])
         ax.grid(False)
         ax.set_title(kwargs.get("title", "Cluster Trajectory Histogram"))
         ax.set_xlabel(kwargs.get("xlabel", "Frame"))
         ax.set_yticks([])
+        
         cbar = fig.colorbar(
             im,
             ax=ax,
@@ -243,23 +245,37 @@ class ClusterAnalysis(BaseAnalysis):
             zero_x=True,
             title_size=kwargs.get("title_size", CLUSTER_TITLE_SIZE),
         )
+        
+        # Force exact boundaries and remove all padding
+        ax.set_xlim(0.5, len(labels) + 0.5)
+        ax.set_ylim(-0.5, 0.5)
+        fig.tight_layout(pad=0)  # Remove figure padding
+        
         ax.set_yticks([])
         match_colorbar_font(cbar, ax)
         return self._save_plot(fig, filename)
 
+
     def _plot_cluster_trajectory_scatter(self, labels, filename, **kwargs):
-        # ... (keep exactly the same)
+        """Plot trajectory scatter with matching dimensions to histogram."""
         logger.info("Plotting trajectory scatter for %d frames...", len(labels))
+        
+        # Use the same dimensions as histogram plot
+        fig, ax = plt.subplots(figsize=(12, 4))  # Match histogram dimensions (12, 4)
+        
         frames = np.arange(1, len(labels) + 1, dtype=int)
-        fig, ax = plt.subplots(figsize=(10, 4))
         unique = np.sort(np.unique(labels))
         cmap = get_cluster_cmap(len(unique))
         norm = get_discrete_norm(unique)
-        ax.scatter(frames, np.zeros_like(frames), c=labels, s=100, cmap=cmap, norm=norm, marker="o")
+        
+        # Plot scatter with appropriate marker size
+        ax.scatter(frames, np.zeros_like(frames), c=labels, s=60, cmap=cmap, norm=norm, marker="o")
         ax.grid(False)
         ax.set_title(kwargs.get("title", "Cluster Trajectory Scatter Plot"))
         ax.set_xlabel(kwargs.get("xlabel", "Frame"))
         ax.set_yticks([])
+        
+        # Create colorbar with same settings as histogram
         sm = ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
         cbar = fig.colorbar(
@@ -267,21 +283,24 @@ class ClusterAnalysis(BaseAnalysis):
             ax=ax,
             orientation="vertical",
             ticks=unique,
-            **CLUSTER_COLORBAR_KW,
+            **CLUSTER_COLORBAR_KW,  # Use same colorbar kwargs
         )
         cbar.ax.set_yticklabels([str(u) for u in unique])
         cbar.set_label(CLUSTER_AXIS_LABEL)
+        
+        # Apply same styling as histogram with x_max_ticks=10
         apply_slide_style(
             ax,
             x_values=frames,
             y_ticks=[0.0],
-            x_max_ticks=10,
+            x_max_ticks=10,  # This fixes the x-axis clutter
             zero_x=True,
             zero_y=True,
             title_size=kwargs.get("title_size", CLUSTER_TITLE_SIZE),
         )
         ax.set_yticks([])
         match_colorbar_font(cbar, ax)
+        
         return self._save_plot(fig, filename)
 
     def _plot_distance_matrix(self, distances, filename, **kwargs):

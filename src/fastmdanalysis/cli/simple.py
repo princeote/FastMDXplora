@@ -44,6 +44,12 @@ def register_simple(subparsers: argparse._SubParsersAction, common_parser: argpa
             "args": _args_dimred,
             "call": _call_dimred,
         },
+        {
+            "name": "q_value",
+            "help": "Fraction of native contacts (Q-value) analysis",
+            "args": _args_q_value,
+            "call": _call_q_value,
+        },
     ]
 
     for spec in specs:
@@ -128,6 +134,40 @@ def _args_dimred(p: argparse.ArgumentParser) -> None:
 
 def _call_dimred(fastmda, args: argparse.Namespace):
     return fastmda.dimred(methods=args.methods, atoms=getattr(args, "atoms", None), output=args.output)
+
+
+def _args_q_value(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--reference-frame", "--ref",
+        dest="reference_frame", type=int, default=0,
+        help="Reference frame index for native state (default: 0)",
+    )
+    p.add_argument(
+        "--beta",
+        dest="beta_const", type=float, default=50.0,
+        help="Beta constant in nm^-1 (default: 50.0)",
+    )
+    p.add_argument(
+        "--lambda",
+        dest="lambda_const", type=float, default=1.8,
+        help="Lambda constant (default: 1.8)",
+    )
+    p.add_argument(
+        "--cutoff",
+        dest="native_cutoff", type=float, default=0.45,
+        help="Native contact cutoff distance in nm (default: 0.45)",
+    )
+
+
+def _call_q_value(fastmda, args: argparse.Namespace):
+    return fastmda.q_value(
+        reference_frame=args.reference_frame,
+        beta_const=args.beta_const,
+        lambda_const=args.lambda_const,
+        native_cutoff=args.native_cutoff,
+        atoms=getattr(args, "atoms", None),
+        output=args.output
+    )
 
 
 def _call_passthrough(method_name: str):

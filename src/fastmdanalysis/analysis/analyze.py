@@ -38,6 +38,7 @@ _DEFAULT_ORDER: Tuple[str, ...] = (
     "hbonds",
     "ss",
     "sasa",
+    "q_value",
     "dimred",
     "cluster",
 )

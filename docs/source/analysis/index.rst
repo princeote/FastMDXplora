@@ -18,4 +18,5 @@ details, and usage patterns for each analysis.
    cluster
    sasa
    ss
+   q_value
    dimred

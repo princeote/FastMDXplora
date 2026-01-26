@@ -24,7 +24,7 @@ import logging
 # Optional dependency import to ensure availability at import time (not used directly here).
 import mdtraj as md  # noqa: F401
 
-from .analysis import rmsd, rmsf, rg, hbonds, cluster, ss, dimred, sasa
+from .analysis import rmsd, rmsf, rg, hbonds, cluster, ss, dimred, sasa, q_value
 from .utils import load_trajectory  # Extended utility supporting multiple files.
 from .utils.logging import setup_library_logging, log_run_header  # convenient re-exports
 
@@ -73,6 +73,7 @@ ClusterAnalysis = cluster.ClusterAnalysis
 SSAnalysis = ss.SSAnalysis
 DimRedAnalysis = dimred.DimRedAnalysis
 SASAAnalysis = sasa.SASAAnalysis
+QAnalysis = q_value.QAnalysis
 
 __all__ = [
     "__version__",
@@ -85,6 +86,7 @@ __all__ = [
     "SSAnalysis",
     "DimRedAnalysis",
     "SASAAnalysis",
+    "QAnalysis",
     "load_trajectory",
     "setup_library_logging",
     "log_run_header",
@@ -373,6 +375,28 @@ class FastMDAnalysis:
     def dimred(self, methods="all", atoms: Optional[str] = None, **kwargs):
         a = self._get_atoms(atoms)
         analysis = DimRedAnalysis(self.traj, methods=methods, atoms=a, **kwargs)
+        analysis.run()
+        return analysis
+
+    def q_value(
+        self,
+        reference_frame: int = 0,
+        beta_const: float = 50.0,
+        lambda_const: float = 1.8,
+        native_cutoff: float = 0.45,
+        atoms: Optional[str] = None,
+        **kwargs,
+    ):
+        a = self._get_atoms(atoms)
+        analysis = QAnalysis(
+            self.traj,
+            reference_frame=reference_frame,
+            beta_const=beta_const,
+            lambda_const=lambda_const,
+            native_cutoff=native_cutoff,
+            atom_selection=a if a else None,
+            **kwargs,
+        )
         analysis.run()
         return analysis
 

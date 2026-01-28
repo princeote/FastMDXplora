@@ -64,7 +64,7 @@ conda install -c conda-forge fastmdanalysis
 fastmda analyze -h
 ```
 
-### [Alternatively] Install from PyPI 
+### (Alternatively) Install from PyPI 
 Make sure you have Python 3.9+ installed and available as 'python'.
 ```bash
 python -m venv fastmda_env

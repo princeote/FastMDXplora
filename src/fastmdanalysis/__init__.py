@@ -24,7 +24,7 @@ import logging
 # Optional dependency import to ensure availability at import time (not used directly here).
 import mdtraj as md  # noqa: F401
 
-from .analysis import rmsd, rmsf, rg, hbonds, cluster, ss, dimred, sasa, q_value
+from .analysis import rmsd, rmsf, rg, hbonds, cluster, ss, dimred, sasa, q_value, dihedrals
 from .utils import load_trajectory  # Extended utility supporting multiple files.
 from .utils.logging import setup_library_logging, log_run_header  # convenient re-exports
 
@@ -74,6 +74,10 @@ SSAnalysis = ss.SSAnalysis
 DimRedAnalysis = dimred.DimRedAnalysis
 SASAAnalysis = sasa.SASAAnalysis
 QAnalysis = q_value.QAnalysis
+PhiAnalysis = dihedrals.PhiAnalysis
+PsiAnalysis = dihedrals.PsiAnalysis
+OmegaAnalysis = dihedrals.OmegaAnalysis
+DihedralsAnalysis = dihedrals.DihedralsAnalysis
 
 __all__ = [
     "__version__",
@@ -87,6 +91,10 @@ __all__ = [
     "DimRedAnalysis",
     "SASAAnalysis",
     "QAnalysis",
+    "PhiAnalysis",
+    "PsiAnalysis",
+    "OmegaAnalysis",
+    "DihedralsAnalysis",
     "load_trajectory",
     "setup_library_logging",
     "log_run_header",
@@ -397,6 +405,26 @@ class FastMDAnalysis:
             atom_selection=a if a else None,
             **kwargs,
         )
+        analysis.run()
+        return analysis
+
+    def phi(self, residues: Optional[Union[int, Sequence[int]]] = None, units: str = "degrees", **kwargs):
+        analysis = PhiAnalysis(self.traj, residues=residues, units=units, **kwargs)
+        analysis.run()
+        return analysis
+
+    def psi(self, residues: Optional[Union[int, Sequence[int]]] = None, units: str = "degrees", **kwargs):
+        analysis = PsiAnalysis(self.traj, residues=residues, units=units, **kwargs)
+        analysis.run()
+        return analysis
+
+    def omega(self, residues: Optional[Union[int, Sequence[int]]] = None, units: str = "degrees", **kwargs):
+        analysis = OmegaAnalysis(self.traj, residues=residues, units=units, **kwargs)
+        analysis.run()
+        return analysis
+
+    def dihedrals(self, types: Sequence[str] = ["phi", "psi", "omega"], residues: Optional[Union[int, Sequence[int]]] = None, units: str = "degrees", **kwargs):
+        analysis = DihedralsAnalysis(self.traj, types=types, residues=residues, units=units, **kwargs)
         analysis.run()
         return analysis
 

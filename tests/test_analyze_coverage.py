@@ -24,7 +24,11 @@ def test_discover_available(minimal_md_files):
     from fastmdanalysis.analysis.analyze import _discover_available
     
     available = _discover_available(fa)
-    expected = ['rmsd', 'rmsf', 'rg', 'hbonds', 'ss', 'sasa', 'q_value', 'dimred', 'cluster']
+    expected = [
+        'rmsd', 'rmsf', 'rg', 'hbonds', 'ss',
+        'phi', 'psi', 'omega', 'dihedrals',
+        'sasa', 'q_value', 'dimred', 'cluster'
+    ]
     assert set(available) == set(expected)
 
 

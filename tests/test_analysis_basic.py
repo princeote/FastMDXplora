@@ -30,3 +30,32 @@ def test_sasa_basic(fastmda):
     a = fastmda.sasa(probe_radius=0.14)
     assert hasattr(a, "data")
 
+def test_phi_basic(fastmda):
+    a = fastmda.phi()
+    assert hasattr(a, "data")
+    assert isinstance(a.data, np.ndarray)
+    assert a.data.size > 0
+    assert np.isfinite(a.data).all()
+
+def test_psi_basic(fastmda):
+    a = fastmda.psi()
+    assert hasattr(a, "data")
+    assert isinstance(a.data, np.ndarray)
+    assert a.data.size > 0
+    assert np.isfinite(a.data).all()
+
+def test_omega_basic(fastmda):
+    a = fastmda.omega()
+    assert hasattr(a, "data")
+    assert isinstance(a.data, np.ndarray)
+    assert a.data.size > 0
+    assert np.isfinite(a.data).all()
+
+def test_dihedrals_basic(fastmda):
+    a = fastmda.dihedrals()
+    assert hasattr(a, "data")
+    assert isinstance(a.data, dict)
+    assert "phi_avg" in a.data
+    assert "psi_avg" in a.data
+    assert "omega_avg" in a.data
+

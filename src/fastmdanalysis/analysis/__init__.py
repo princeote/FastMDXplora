@@ -12,4 +12,5 @@ from .ss import SSAnalysis  # Changed from secondary_structure to ss; class rena
 from .dimred import DimRedAnalysis
 from .sasa import SASAAnalysis
 from .q_value import QAnalysis
+from .dihedrals import PhiAnalysis, PsiAnalysis, OmegaAnalysis, DihedralsAnalysis
 

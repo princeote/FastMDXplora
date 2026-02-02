@@ -8,6 +8,7 @@ MDS Analysis Module
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Dict
 
 import numpy as np
@@ -36,14 +37,17 @@ class MDSAnalysis:
         """Fit MDS and transform data."""
         logger.info("Computing MDS with metric='%s'...", self.metric)
         
-        self.model = MDS(
-            n_components=self.n_components,
-            n_init=4,  # avoids FutureWarning
-            random_state=self.random_state,
-            normalized_stress="auto",
-            dissimilarity=self.metric,
-        )
-        emb = self.model.fit_transform(X)
+        # Suppress sklearn 1.10 FutureWarning about init parameter
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning, message=".*init.*")
+            self.model = MDS(
+                n_components=self.n_components,
+                n_init=4,  # avoids FutureWarning
+                random_state=self.random_state,
+                normalized_stress="auto",
+                dissimilarity=self.metric,
+            )
+            emb = self.model.fit_transform(X)
         
         logger.info("MDS completed")
         return emb.astype(np.float32)

@@ -3,7 +3,7 @@ name: test
 on:
   push:
     branches: [ main ]
-    tags: [ 'v*' ]  # ← ADD THIS LINE
+    tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
@@ -38,6 +38,7 @@ jobs:
         if: ${{ matrix.python-version != '3.11' }}
         env:
           MPLBACKEND: Agg
+          PYTHONWARNINGS: ignore  # ← ADDED
         run: pytest -q -m "not slow"
 
       # Coverage only on Python 3.11
@@ -45,6 +46,7 @@ jobs:
         if: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' }}
         env:
           MPLBACKEND: Agg
+          PYTHONWARNINGS: ignore  # ← ADDED
         run: |
           pytest -q -m "not slow" \
             --cov=fastmdanalysis \
@@ -101,6 +103,7 @@ jobs:
       - name: Smoke test import and CLI help
         env:
           MPLBACKEND: Agg
+          PYTHONWARNINGS: ignore  # ← ADDED
         run: |
           python -c "import fastmdanalysis as m; print('OK:', getattr(m, '__version__', 'unknown'))"
           python -m fastmdanalysis.cli.main -h

@@ -43,50 +43,125 @@ class MDSAnalysis:
         }
         
         # Try different API combinations in order of preference
+        # Each combination tries to suppress specific warnings
         param_combinations = [
-            # 1. Try with n_init=4 to suppress warning (sklearn >= 1.9)
-            {**base_params, 'metric': self.metric, 'n_init': 4},
-            # 2. Try with n_init=4 and dissimilarity (middle API)
-            {**base_params, 'dissimilarity': self.metric, 'n_init': 4},
-            # 3. Try with n_init=4 and new API (metric=bool, dissimilarity=str)
+            # Combination 1: Full suppression (n_init=4, init='random') + new API
+            {
+                **base_params,
+                'metric': True if self.metric == "euclidean" else False,
+                'dissimilarity': 'precomputed' if self.metric == "precomputed" else 'euclidean',
+                'n_init': 4,
+                'init': 'random',
+                'normalized_stress': 'auto',
+            },
+            # Combination 2: Full suppression + middle API
+            {
+                **base_params,
+                'dissimilarity': self.metric,
+                'n_init': 4,
+                'init': 'random',
+                'normalized_stress': 'auto',
+            },
+            # Combination 3: Full suppression + old API
+            {
+                **base_params,
+                'metric': self.metric,
+                'n_init': 4,
+                'init': 'random',
+                'normalized_stress': 'auto',
+            },
+            # Combination 4: Just init='random' + new API
+            {
+                **base_params,
+                'metric': True if self.metric == "euclidean" else False,
+                'dissimilarity': 'precomputed' if self.metric == "precomputed" else 'euclidean',
+                'init': 'random',
+            },
+            # Combination 5: Just init='random' + middle API
+            {
+                **base_params,
+                'dissimilarity': self.metric,
+                'init': 'random',
+            },
+            # Combination 6: Just init='random' + old API
+            {
+                **base_params,
+                'metric': self.metric,
+                'init': 'random',
+            },
+            # Combination 7: Just n_init=4 + new API
             {
                 **base_params,
                 'metric': True if self.metric == "euclidean" else False,
                 'dissimilarity': 'precomputed' if self.metric == "precomputed" else 'euclidean',
                 'n_init': 4,
             },
-            # 4. Try without n_init (older sklearn)
-            {**base_params, 'metric': self.metric},
-            {**base_params, 'dissimilarity': self.metric},
+            # Combination 8: Just n_init=4 + middle API
+            {
+                **base_params,
+                'dissimilarity': self.metric,
+                'n_init': 4,
+            },
+            # Combination 9: Just n_init=4 + old API
+            {
+                **base_params,
+                'metric': self.metric,
+                'n_init': 4,
+            },
+            # Combination 10: Basic new API
             {
                 **base_params,
                 'metric': True if self.metric == "euclidean" else False,
                 'dissimilarity': 'precomputed' if self.metric == "precomputed" else 'euclidean',
             },
-            # 5. Bare minimum (should always work)
+            # Combination 11: Basic middle API
+            {
+                **base_params,
+                'dissimilarity': self.metric,
+            },
+            # Combination 12: Basic old API
+            {
+                **base_params,
+                'metric': self.metric,
+            },
+            # Combination 13: Bare minimum (no metric/dissimilarity at all)
             base_params,
         ]
         
         # Try each combination until one works
         self.model = None
+        successful_params = None
+        
         for params in param_combinations:
             try:
-                self.model = MDS(**params)
+                # Remove None values if any parameter checking added them
+                clean_params = {k: v for k, v in params.items() if v is not None}
+                self.model = MDS(**clean_params)
+                
                 # Quick test with minimal data to validate parameters
-                test_data = X[:min(3, len(X))]
-                _ = self.model.fit(test_data)
-                logger.debug("MDS initialized successfully with params: %s", params)
+                test_size = min(3, len(X))
+                if test_size > 0:
+                    test_data = X[:test_size]
+                    _ = self.model.fit(test_data)
+                
+                successful_params = clean_params
+                logger.debug("MDS initialized successfully with params: %s", clean_params)
                 break  # Success!
+                
             except (TypeError, ValueError, AttributeError) as e:
-                logger.debug("MDS params failed %s: %s", params, str(e)[:100])
+                # Log only first few failures to avoid spam
+                if param_combinations.index(params) < 5:
+                    logger.debug("MDS params failed %s: %s", list(params.keys())[:3], str(e)[:80])
                 continue
         
-        # If all combinations failed, use bare minimum
+        # If all combinations failed, use bare minimum (should never happen)
         if self.model is None:
             logger.warning("All MDS parameter combinations failed, using bare minimum")
             self.model = MDS(**base_params)
+            successful_params = base_params
         
-        # Fit and transform
+        # Fit and transform with the successful parameters
+        logger.debug("Final MDS parameters: %s", successful_params)
         emb = self.model.fit_transform(X)
         
         logger.info("MDS completed")

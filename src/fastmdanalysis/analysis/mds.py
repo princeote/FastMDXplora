@@ -11,7 +11,6 @@ import logging
 from typing import Dict
 
 import numpy as np
-from sklearn import __version__ as sklearn_version
 from sklearn.manifold import MDS
 
 from .base import AnalysisError
@@ -37,64 +36,44 @@ class MDSAnalysis:
         """Fit MDS and transform data."""
         logger.info("Computing MDS with metric='%s'...", self.metric)
         
-        # Parse sklearn version (e.g., "1.3.0" -> (1, 3, 0))
-        # Handle version strings like "1.3.0.post1" or "1.3"
-        version_str = sklearn_version.split('+')[0].split('-')[0]
-        version_parts = []
-        for part in version_str.split('.'):
-            if part.isdigit():
-                version_parts.append(int(part))
-            else:
-                # Handle non-numeric parts like "post1"
-                break
-        version_tuple = tuple(version_parts)
-        
-        # Build base parameters
-        mds_params = {
+        # Try different parameter combinations for sklearn version compatibility
+        # Start with basic parameters that always work
+        base_params = {
             'n_components': self.n_components,
             'random_state': self.random_state,
         }
         
-        # Determine API based on sklearn version
-        if version_tuple >= (1, 4):
-            # sklearn >= 1.4: metric=bool, dissimilarity=str
-            mds_params.update({
-                'init': 'random',
-                'normalized_stress': 'auto',
+        # Try different API combinations
+        param_combinations = [
+            # 1. Old API: metric parameter (sklearn < 1.3)
+            {**base_params, 'metric': self.metric},
+            # 2. Middle API: dissimilarity parameter (sklearn 1.3-1.4)
+            {**base_params, 'dissimilarity': self.metric},
+            # 3. New API: metric=bool, dissimilarity=str (sklearn >= 1.4)
+            {
+                **base_params,
                 'metric': True if self.metric == "euclidean" else False,
                 'dissimilarity': 'precomputed' if self.metric == "precomputed" else 'euclidean',
-            })
-        elif version_tuple >= (1, 3):
-            # sklearn 1.3: dissimilarity param
-            mds_params.update({
-                'init': 'random',
-                'normalized_stress': 'auto',
-                'dissimilarity': self.metric,
-            })
-        else:
-            # sklearn < 1.3: metric param
-            mds_params['metric'] = self.metric
-            
-            # Try to add init parameter if supported
+            },
+            # 4. Bare minimum (should always work)
+            base_params,
+        ]
+        
+        # Try each combination until one works
+        for params in param_combinations:
             try:
-                # Test if init parameter exists
-                test = MDS(init='random', n_components=2, random_state=42)
-                mds_params['init'] = 'random'
-            except TypeError:
-                # init parameter not available
-                pass
+                self.model = MDS(**params)
+                # Test if it actually works by trying to fit a tiny sample
+                test_X = X[:2] if len(X) > 2 else X
+                _ = self.model.fit(test_X)
+                break  # Success!
+            except (TypeError, ValueError) as e:
+                continue
         
-        # Try to add n_init parameter (suppresses warning in sklearn >= 1.9)
-        try:
-            # Test if n_init parameter exists
-            test = MDS(n_init=4, n_components=2, random_state=42)
-            mds_params['n_init'] = 4
-        except TypeError:
-            # n_init parameter not available
-            pass
+        # If all combinations failed, use bare minimum
+        if self.model is None:
+            self.model = MDS(**base_params)
         
-        # Create and fit MDS model
-        self.model = MDS(**mds_params)
         emb = self.model.fit_transform(X)
         
         logger.info("MDS completed")

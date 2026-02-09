@@ -11,6 +11,7 @@ import logging
 from typing import Dict
 
 import numpy as np
+from sklearn import __version__ as sklearn_version
 from sklearn.manifold import MDS
 
 from .base import AnalysisError
@@ -36,132 +37,74 @@ class MDSAnalysis:
         """Fit MDS and transform data."""
         logger.info("Computing MDS with metric='%s'...", self.metric)
         
-        # Base parameters that should always work
+        # Parse sklearn version (handle versions like "1.3.0" or "1.3.0.post1")
+        version_str = sklearn_version.split('+')[0].split('-')[0]  # Remove +local or -dev suffixes
+        version_parts = []
+        for part in version_str.split('.'):
+            if part.isdigit():
+                version_parts.append(int(part))
+            else:
+                # Stop at non-numeric part like "post1"
+                break
+        
+        # Ensure we have at least major.minor
+        while len(version_parts) < 2:
+            version_parts.append(0)
+        
+        version_tuple = tuple(version_parts[:2])  # Use only major.minor
+        
+        # Base parameters that always work
         base_params = {
             'n_components': self.n_components,
             'random_state': self.random_state,
         }
         
-        # Try different API combinations in order of preference
-        # Each combination tries to suppress specific warnings
-        param_combinations = [
-            # Combination 1: Full suppression (n_init=4, init='random') + new API
-            {
-                **base_params,
-                'metric': True if self.metric == "euclidean" else False,
-                'dissimilarity': 'precomputed' if self.metric == "precomputed" else 'euclidean',
-                'n_init': 4,
-                'init': 'random',
-                'normalized_stress': 'auto',
-            },
-            # Combination 2: Full suppression + middle API
-            {
-                **base_params,
-                'dissimilarity': self.metric,
-                'n_init': 4,
-                'init': 'random',
-                'normalized_stress': 'auto',
-            },
-            # Combination 3: Full suppression + old API
-            {
-                **base_params,
-                'metric': self.metric,
-                'n_init': 4,
-                'init': 'random',
-                'normalized_stress': 'auto',
-            },
-            # Combination 4: Just init='random' + new API
-            {
-                **base_params,
-                'metric': True if self.metric == "euclidean" else False,
-                'dissimilarity': 'precomputed' if self.metric == "precomputed" else 'euclidean',
-                'init': 'random',
-            },
-            # Combination 5: Just init='random' + middle API
-            {
-                **base_params,
-                'dissimilarity': self.metric,
-                'init': 'random',
-            },
-            # Combination 6: Just init='random' + old API
-            {
-                **base_params,
-                'metric': self.metric,
-                'init': 'random',
-            },
-            # Combination 7: Just n_init=4 + new API
-            {
-                **base_params,
-                'metric': True if self.metric == "euclidean" else False,
-                'dissimilarity': 'precomputed' if self.metric == "precomputed" else 'euclidean',
-                'n_init': 4,
-            },
-            # Combination 8: Just n_init=4 + middle API
-            {
-                **base_params,
-                'dissimilarity': self.metric,
-                'n_init': 4,
-            },
-            # Combination 9: Just n_init=4 + old API
-            {
-                **base_params,
-                'metric': self.metric,
-                'n_init': 4,
-            },
-            # Combination 10: Basic new API
-            {
-                **base_params,
-                'metric': True if self.metric == "euclidean" else False,
-                'dissimilarity': 'precomputed' if self.metric == "precomputed" else 'euclidean',
-            },
-            # Combination 11: Basic middle API
-            {
-                **base_params,
-                'dissimilarity': self.metric,
-            },
-            # Combination 12: Basic old API
-            {
-                **base_params,
-                'metric': self.metric,
-            },
-            # Combination 13: Bare minimum (no metric/dissimilarity at all)
-            base_params,
+        # Determine which API to use based on sklearn version
+        logger.debug("Sklearn version: %s -> %s", sklearn_version, version_tuple)
+        
+        if version_tuple >= (1, 4):
+            # sklearn >= 1.4: Use new API (metric=bool), avoid deprecated 'dissimilarity'
+            # The 'dissimilarity' param is deprecated in 1.4, removed in 1.10
+            if self.metric == "euclidean":
+                base_params['metric'] = True
+            elif self.metric == "precomputed":
+                base_params['metric'] = False
+            else:
+                # For other metrics, fall back to older API
+                base_params['dissimilarity'] = self.metric
+                
+        elif version_tuple >= (1, 3):
+            # sklearn 1.3: Use 'dissimilarity' parameter (not deprecated yet)
+            base_params['dissimilarity'] = self.metric
+            
+        else:
+            # sklearn < 1.3: Use 'metric' parameter
+            base_params['metric'] = self.metric
+        
+        # Try to add optional parameters to suppress warnings
+        optional_params = [
+            ('n_init', 4),      # Suppresses: "The default value of `n_init` will change..."
+            ('init', 'random'), # Suppresses: "The default value of `init` will change..."
+            ('normalized_stress', 'auto'),
         ]
         
-        # Try each combination until one works
-        self.model = None
-        successful_params = None
-        
-        for params in param_combinations:
+        for param_name, param_value in optional_params:
             try:
-                # Remove None values if any parameter checking added them
-                clean_params = {k: v for k, v in params.items() if v is not None}
-                self.model = MDS(**clean_params)
-                
-                # Quick test with minimal data to validate parameters
-                test_size = min(3, len(X))
-                if test_size > 0:
-                    test_data = X[:test_size]
-                    _ = self.model.fit(test_data)
-                
-                successful_params = clean_params
-                logger.debug("MDS initialized successfully with params: %s", clean_params)
-                break  # Success!
-                
-            except (TypeError, ValueError, AttributeError) as e:
-                # Log only first few failures to avoid spam
-                if param_combinations.index(params) < 5:
-                    logger.debug("MDS params failed %s: %s", list(params.keys())[:3], str(e)[:80])
-                continue
+                # Test if parameter exists by creating a test MDS instance
+                test_params = {param_name: param_value, 'n_components': 2}
+                _ = MDS(**test_params)
+                base_params[param_name] = param_value
+                logger.debug("Added parameter %s=%s", param_name, param_value)
+            except TypeError:
+                logger.debug("Parameter %s not available in this sklearn version", param_name)
+                # Remove if we added it earlier in a different code path
+                base_params.pop(param_name, None)
         
-        # If all combinations failed, use bare minimum (should never happen)
-        if self.model is None:
-            logger.warning("All MDS parameter combinations failed, using bare minimum")
-            self.model = MDS(**base_params)
-            successful_params = base_params
+        # Create the MDS model
+        logger.debug("Creating MDS with parameters: %s", base_params)
+        self.model = MDS(**base_params)
         
-        # Fit and transform with the successful parameters
-        logger.debug("Final MDS parameters: %s", successful_params)
+        # Fit and transform
         emb = self.model.fit_transform(X)
         
         logger.info("MDS completed")

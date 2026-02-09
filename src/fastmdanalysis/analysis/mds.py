@@ -11,6 +11,7 @@ import logging
 from typing import Dict
 
 import numpy as np
+from sklearn import __version__ as sklearn_version
 from sklearn.manifold import MDS
 
 from .base import AnalysisError
@@ -36,38 +37,64 @@ class MDSAnalysis:
         """Fit MDS and transform data."""
         logger.info("Computing MDS with metric='%s'...", self.metric)
         
-        # Try different parameter combinations for sklearn version compatibility
-        for params in [
+        # Parse sklearn version (e.g., "1.3.0" -> (1, 3, 0))
+        # Handle version strings like "1.3.0.post1" or "1.3"
+        version_str = sklearn_version.split('+')[0].split('-')[0]
+        version_parts = []
+        for part in version_str.split('.'):
+            if part.isdigit():
+                version_parts.append(int(part))
+            else:
+                # Handle non-numeric parts like "post1"
+                break
+        version_tuple = tuple(version_parts)
+        
+        # Build base parameters
+        mds_params = {
+            'n_components': self.n_components,
+            'random_state': self.random_state,
+        }
+        
+        # Determine API based on sklearn version
+        if version_tuple >= (1, 4):
             # sklearn >= 1.4: metric=bool, dissimilarity=str
-            {
-                'n_components': self.n_components,
-                'random_state': self.random_state,
+            mds_params.update({
                 'init': 'random',
                 'normalized_stress': 'auto',
                 'metric': True if self.metric == "euclidean" else False,
                 'dissimilarity': 'precomputed' if self.metric == "precomputed" else 'euclidean',
-            },
+            })
+        elif version_tuple >= (1, 3):
             # sklearn 1.3: dissimilarity param
-            {
-                'n_components': self.n_components,
-                'random_state': self.random_state,
+            mds_params.update({
                 'init': 'random',
                 'normalized_stress': 'auto',
                 'dissimilarity': self.metric,
-            },
+            })
+        else:
             # sklearn < 1.3: metric param
-            {
-                'n_components': self.n_components,
-                'random_state': self.random_state,
-                'metric': self.metric,
-            }
-        ]:
+            mds_params['metric'] = self.metric
+            
+            # Try to add init parameter if supported
             try:
-                self.model = MDS(**params)
-                break
-            except (TypeError, ValueError):
-                continue
+                # Test if init parameter exists
+                test = MDS(init='random', n_components=2, random_state=42)
+                mds_params['init'] = 'random'
+            except TypeError:
+                # init parameter not available
+                pass
         
+        # Try to add n_init parameter (suppresses warning in sklearn >= 1.9)
+        try:
+            # Test if n_init parameter exists
+            test = MDS(n_init=4, n_components=2, random_state=42)
+            mds_params['n_init'] = 4
+        except TypeError:
+            # n_init parameter not available
+            pass
+        
+        # Create and fit MDS model
+        self.model = MDS(**mds_params)
         emb = self.model.fit_transform(X)
         
         logger.info("MDS completed")

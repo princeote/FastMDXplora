@@ -182,6 +182,12 @@ Output includes data tables, figures (already stylized for slides), slide deck, 
 
 ---
 
+## Validation and Benchmarks
+- To validate `FastMDAnalysis` go to https://github.com/aai-research-lab/FastMDAnalysis/blob/validation/README.md
+- For benchmarks go to https://github.com/aai-research-lab/FastMDAnalysis/blob/benchmark/README.md
+
+---
+
 
 ## Documentation
 The documentation [under development] (with an extensive User Guide) is available [here](https://fastmdanalysis.readthedocs.io).

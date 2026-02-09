@@ -36,13 +36,38 @@ class MDSAnalysis:
         """Fit MDS and transform data."""
         logger.info("Computing MDS with metric='%s'...", self.metric)
         
-        self.model = MDS(
-            n_components=self.n_components,
-            n_init=4,  # avoids FutureWarning
-            random_state=self.random_state,
-            normalized_stress="auto",
-            dissimilarity=self.metric,
-        )
+        # Try different parameter combinations for sklearn version compatibility
+        for params in [
+            # sklearn >= 1.4: metric=bool, dissimilarity=str
+            {
+                'n_components': self.n_components,
+                'random_state': self.random_state,
+                'init': 'random',
+                'normalized_stress': 'auto',
+                'metric': True if self.metric == "euclidean" else False,
+                'dissimilarity': 'precomputed' if self.metric == "precomputed" else 'euclidean',
+            },
+            # sklearn 1.3: dissimilarity param
+            {
+                'n_components': self.n_components,
+                'random_state': self.random_state,
+                'init': 'random',
+                'normalized_stress': 'auto',
+                'dissimilarity': self.metric,
+            },
+            # sklearn < 1.3: metric param
+            {
+                'n_components': self.n_components,
+                'random_state': self.random_state,
+                'metric': self.metric,
+            }
+        ]:
+            try:
+                self.model = MDS(**params)
+                break
+            except (TypeError, ValueError):
+                continue
+        
         emb = self.model.fit_transform(X)
         
         logger.info("MDS completed")

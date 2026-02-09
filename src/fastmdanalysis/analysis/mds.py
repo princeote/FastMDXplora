@@ -37,8 +37,8 @@ class MDSAnalysis:
         """Fit MDS and transform data."""
         logger.info("Computing MDS with metric='%s'...", self.metric)
         
-        # Parse sklearn version (handle versions like "1.3.0" or "1.3.0.post1")
-        version_str = sklearn_version.split('+')[0].split('-')[0]  # Remove +local or -dev suffixes
+        # Parse sklearn version string (handle "1.3.0", "1.3.0.post1", etc.)
+        version_str = sklearn_version.split('+')[0].split('-')[0]
         version_parts = []
         for part in version_str.split('.'):
             if part.isdigit():
@@ -52,6 +52,7 @@ class MDSAnalysis:
             version_parts.append(0)
         
         version_tuple = tuple(version_parts[:2])  # Use only major.minor
+        logger.debug("Sklearn version: %s -> %s", sklearn_version, version_tuple)
         
         # Base parameters that always work
         base_params = {
@@ -59,49 +60,90 @@ class MDSAnalysis:
             'random_state': self.random_state,
         }
         
-        # Determine which API to use based on sklearn version
-        logger.debug("Sklearn version: %s -> %s", sklearn_version, version_tuple)
+        # ===== HANDLE METRIC/DISSIMILARITY PARAMETER BASED ON SKLEARN VERSION =====
         
-        if version_tuple >= (1, 4):
-            # sklearn >= 1.4: Use new API (metric=bool), avoid deprecated 'dissimilarity'
-            # The 'dissimilarity' param is deprecated in 1.4, removed in 1.10
+        # Try to determine which API to use by testing parameters
+        # Order: newest API first, fall back to older APIs
+        
+        # First, check if metric_mds parameter exists (sklearn >= 1.10)
+        try:
             if self.metric == "euclidean":
-                base_params['metric'] = True
+                test_params = {'metric_mds': True, 'n_components': 2}
+                _ = MDS(**test_params)
+                base_params['metric_mds'] = True
+                logger.debug("Using metric_mds=True (sklearn >= 1.10 API)")
             elif self.metric == "precomputed":
-                base_params['metric'] = False
+                test_params = {'metric_mds': False, 'n_components': 2}
+                _ = MDS(**test_params)
+                base_params['metric_mds'] = False
+                logger.debug("Using metric_mds=False (sklearn >= 1.10 API)")
             else:
-                # For other metrics, fall back to older API
+                # For non-standard metrics, try dissimilarity
+                test_params = {'dissimilarity': self.metric, 'n_components': 2}
+                _ = MDS(**test_params)
                 base_params['dissimilarity'] = self.metric
+                logger.debug("Using dissimilarity='%s'", self.metric)
                 
-        elif version_tuple >= (1, 3):
-            # sklearn 1.3: Use 'dissimilarity' parameter (not deprecated yet)
-            base_params['dissimilarity'] = self.metric
-            
-        else:
-            # sklearn < 1.3: Use 'metric' parameter
-            base_params['metric'] = self.metric
+        except TypeError:
+            # metric_mds not available, try metric=True/False (sklearn 1.4-1.9)
+            try:
+                if self.metric == "euclidean":
+                    test_params = {'metric': True, 'n_components': 2}
+                    _ = MDS(**test_params)
+                    base_params['metric'] = True
+                    logger.debug("Using metric=True (sklearn 1.4-1.9 API)")
+                elif self.metric == "precomputed":
+                    test_params = {'metric': False, 'n_components': 2}
+                    _ = MDS(**test_params)
+                    base_params['metric'] = False
+                    logger.debug("Using metric=False (sklearn 1.4-1.9 API)")
+                else:
+                    # For non-standard metrics, try dissimilarity
+                    test_params = {'dissimilarity': self.metric, 'n_components': 2}
+                    _ = MDS(**test_params)
+                    base_params['dissimilarity'] = self.metric
+                    logger.debug("Using dissimilarity='%s'", self.metric)
+                    
+            except TypeError:
+                # metric=True/False not available, try dissimilarity (sklearn 1.3)
+                try:
+                    test_params = {'dissimilarity': self.metric, 'n_components': 2}
+                    _ = MDS(**test_params)
+                    base_params['dissimilarity'] = self.metric
+                    logger.debug("Using dissimilarity='%s' (sklearn 1.3 API)", self.metric)
+                except TypeError:
+                    # Last resort: try old metric parameter (sklearn < 1.3)
+                    try:
+                        test_params = {'metric': self.metric, 'n_components': 2}
+                        _ = MDS(**test_params)
+                        base_params['metric'] = self.metric
+                        logger.debug("Using metric='%s' (sklearn < 1.3 API)", self.metric)
+                    except TypeError:
+                        # If nothing works, use minimal parameters
+                        logger.warning("Could not determine MDS API, using minimal parameters")
+                        # Don't set any metric/dissimilarity parameter
         
-        # Try to add optional parameters to suppress warnings
+        # ===== ADD OPTIONAL PARAMETERS TO SUPPRESS WARNINGS =====
+        
         optional_params = [
-            ('n_init', 4),      # Suppresses: "The default value of `n_init` will change..."
-            ('init', 'random'), # Suppresses: "The default value of `init` will change..."
+            ('n_init', 4),           # Suppress n_init warning (sklearn >= 1.9)
+            ('init', 'random'),      # Suppress init warning (sklearn >= 1.10)
             ('normalized_stress', 'auto'),
         ]
         
         for param_name, param_value in optional_params:
             try:
-                # Test if parameter exists by creating a test MDS instance
                 test_params = {param_name: param_value, 'n_components': 2}
                 _ = MDS(**test_params)
                 base_params[param_name] = param_value
-                logger.debug("Added parameter %s=%s", param_name, param_value)
+                logger.debug("Added optional parameter %s=%s", param_name, param_value)
             except TypeError:
-                logger.debug("Parameter %s not available in this sklearn version", param_name)
-                # Remove if we added it earlier in a different code path
+                # Parameter not available in this sklearn version
                 base_params.pop(param_name, None)
         
-        # Create the MDS model
-        logger.debug("Creating MDS with parameters: %s", base_params)
+        # ===== CREATE AND FIT MDS MODEL =====
+        
+        logger.debug("Creating MDS with final parameters: %s", base_params)
         self.model = MDS(**base_params)
         
         # Fit and transform

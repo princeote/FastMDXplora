@@ -82,10 +82,12 @@ markers = [
   "slides: tests that require python-pptx/Pillow and create a deck"
 ]
 
-# Silence known benign warnings (MDTraj CRYST1, etc.)
+# Silence known benign warnings (MDTraj CRYST1, pyparsing deprecations, etc.)
 filterwarnings = [
   "ignore:Unlikely unit cell vectors detected.*CRYST1:UserWarning:mdtraj.formats.pdb.pdbfile",
-  "ignore:.*deprecated.*:DeprecationWarning"
+  "ignore:.*deprecated.*:DeprecationWarning",
+  "ignore:'setParseAction' deprecated.*:pyparsing.warnings.PyparsingDeprecationWarning",
+  "ignore:'parseString' deprecated.*:pyparsing.warnings.PyparsingDeprecationWarning"
 ]
 
 # ----------------------------- Coverage config --------------------------------

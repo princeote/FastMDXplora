@@ -39,6 +39,8 @@
 | ``cluster`` | Trajectory clustering using KMeans, DBSCAN, and Hierarchical methods |
 | ``sasa`` | Solvent Accessible Surface Area with total, per-residue, and average per-residue |
 | ``dimred`` | Dimensionality reduction using PCA, MDS, and t-SNE methods |
+| ``q_value`` | Fraction of Native Contacts for protein folding analysis |
+| ``dihedrals`` | Phi, Psi, Omega angle analysis + Ramachandra Plots |
 
 ---
 
@@ -64,7 +66,7 @@ conda install -c conda-forge fastmdanalysis
 fastmda analyze -h
 ```
 
-### [Alternatively] Install from PyPI 
+### (Alternatively) Install from PyPI 
 Make sure you have Python 3.9+ installed and available as 'python'.
 ```bash
 python -m venv fastmda_env

@@ -18,4 +18,6 @@ details, and usage patterns for each analysis.
    cluster
    sasa
    ss
+   dihedrals
+   q_value
    dimred

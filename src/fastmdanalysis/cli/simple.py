@@ -26,6 +26,30 @@ def register_simple(subparsers: argparse._SubParsersAction, common_parser: argpa
         {"name": "rg", "help": "Radius of gyration analysis", "args": None, "call": _call_passthrough("rg")},
         {"name": "hbonds", "help": "Hydrogen bonds analysis", "args": None, "call": _call_passthrough("hbonds")},
         {
+            "name": "phi",
+            "help": "Phi dihedral analysis",
+            "args": _args_dihedral,
+            "call": _call_phi,
+        },
+        {
+            "name": "psi",
+            "help": "Psi dihedral analysis",
+            "args": _args_dihedral,
+            "call": _call_psi,
+        },
+        {
+            "name": "omega",
+            "help": "Omega dihedral analysis",
+            "args": _args_dihedral,
+            "call": _call_omega,
+        },
+        {
+            "name": "dihedrals",
+            "help": "Combined dihedral analysis (phi/psi/omega + Ramachandran)",
+            "args": _args_dihedrals,
+            "call": _call_dihedrals,
+        },
+        {
             "name": "cluster",
             "help": "Clustering analysis",
             "args": _args_cluster,
@@ -43,6 +67,12 @@ def register_simple(subparsers: argparse._SubParsersAction, common_parser: argpa
             "help": "Dimensionality reduction analysis",
             "args": _args_dimred,
             "call": _call_dimred,
+        },
+        {
+            "name": "q_value",
+            "help": "Fraction of native contacts (Q-value) analysis",
+            "args": _args_q_value,
+            "call": _call_q_value,
         },
     ]
 
@@ -128,6 +158,105 @@ def _args_dimred(p: argparse.ArgumentParser) -> None:
 
 def _call_dimred(fastmda, args: argparse.Namespace):
     return fastmda.dimred(methods=args.methods, atoms=getattr(args, "atoms", None), output=args.output)
+
+
+def _args_dihedral(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--residues",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Residue indices to analyze (0-based). Example: --residues 1 5 10",
+    )
+    p.add_argument(
+        "--units",
+        type=str,
+        default="degrees",
+        choices=["degrees", "radians"],
+        help="Units for output angles (default: degrees)",
+    )
+
+
+def _args_dihedrals(p: argparse.ArgumentParser) -> None:
+    _args_dihedral(p)
+    p.add_argument(
+        "--types",
+        type=str,
+        nargs="+",
+        default=["phi", "psi", "omega"],
+        help="Dihedral types to compute (phi, psi, omega)",
+    )
+
+
+def _call_phi(fastmda, args: argparse.Namespace):
+    return fastmda.phi(
+        residues=args.residues,
+        units=args.units,
+        atoms=getattr(args, "atoms", None),
+        output=args.output,
+    )
+
+
+def _call_psi(fastmda, args: argparse.Namespace):
+    return fastmda.psi(
+        residues=args.residues,
+        units=args.units,
+        atoms=getattr(args, "atoms", None),
+        output=args.output,
+    )
+
+
+def _call_omega(fastmda, args: argparse.Namespace):
+    return fastmda.omega(
+        residues=args.residues,
+        units=args.units,
+        atoms=getattr(args, "atoms", None),
+        output=args.output,
+    )
+
+
+def _call_dihedrals(fastmda, args: argparse.Namespace):
+    return fastmda.dihedrals(
+        types=args.types,
+        residues=args.residues,
+        units=args.units,
+        atoms=getattr(args, "atoms", None),
+        output=args.output,
+    )
+
+
+def _args_q_value(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--reference-frame", "--ref",
+        dest="reference_frame", type=int, default=0,
+        help="Reference frame index for native state (default: 0)",
+    )
+    p.add_argument(
+        "--beta",
+        dest="beta_const", type=float, default=50.0,
+        help="Beta constant in nm^-1 (default: 50.0)",
+    )
+    p.add_argument(
+        "--lambda",
+        dest="lambda_const", type=float, default=1.8,
+        help="Lambda constant (default: 1.8)",
+    )
+    p.add_argument(
+        "--cutoff",
+        dest="native_cutoff", type=float, default=0.45,
+        help="Native contact cutoff distance in nm (default: 0.45)",
+    )
+
+
+def _call_q_value(fastmda, args: argparse.Namespace):
+    return fastmda.q_value(
+        reference_frame=args.reference_frame,
+        beta_const=args.beta_const,
+        lambda_const=args.lambda_const,
+        native_cutoff=args.native_cutoff,
+        atoms=getattr(args, "atoms", None),
+        output=args.output
+    )
 
 
 def _call_passthrough(method_name: str):

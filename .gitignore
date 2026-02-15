@@ -69,3 +69,18 @@ NOTE
 coverage.xml
 examples/ubiquitin-md-generated-ensemble/
 hsp90_casestudy_indev.md
+
+# Local validation / scratch
+.venv-pypi-validation/
+validation_output*/
+Ubiquitin/
+
+# Large example data (keep out of git)
+examples/*.dcd
+examples/*.xtc
+examples/*.trr
+examples/*.nc
+examples/*.h5
+examples/*.lh5
+examples/*.pdb
+examples/*.gro

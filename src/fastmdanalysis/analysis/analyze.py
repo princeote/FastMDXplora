@@ -42,7 +42,7 @@ _DEFAULT_ORDER: Tuple[str, ...] = (
     "omega",
     "dihedrals",
     "sasa",
-    "q_value",
+    "qvalue",
     "dimred",
     "cluster",
 )
@@ -95,6 +95,17 @@ def _final_list(
     - Then drop any in exclude.
     """
     avail_set = set(available)
+
+    def _normalize(names: Optional[Sequence[str]]) -> Optional[List[str]]:
+        if names is None:
+            return None
+        out: List[str] = []
+        for name in names:
+            out.append(str(name).lower())
+        return out
+
+    include = _normalize(include)
+    exclude = _normalize(exclude)
 
     if include is None or (len(include) == 1 and str(include[0]).lower() == "all"):
         candidates = [name for name in _DEFAULT_ORDER if name in avail_set]
@@ -226,6 +237,7 @@ def run(
     slides: Optional[Union[bool, str, Path]] = None,
     output: Optional[Union[str, Path]] = None,
     strict: bool = False,
+    compute_stat: bool = False,
 ) -> Dict[str, AnalysisResult]:
     """
     Execute multiple analyses on the current FastMDAnalysis instance and
@@ -239,6 +251,12 @@ def run(
     if strict:
         for analysis in plan:
             opts.setdefault(analysis, {})["strict"] = True
+
+    if compute_stat:
+        stat_analyses = {"rmsd", "rmsf", "rg", "sasa", "qvalue"}
+        for analysis in plan:
+            if analysis in stat_analyses:
+                opts.setdefault(analysis, {}).setdefault("compute_stat", True)
 
     # Inject cluster defaults so kmeans & hierarchical run by default
     _inject_cluster_defaults(self, opts, plan)
@@ -388,6 +406,7 @@ def analyze(
     slides: Optional[Union[bool, str, Path]] = None,
     output: Optional[Union[str, Path]] = None,
     strict: bool = False,
+    compute_stat: bool = False,
 ) -> Dict[str, AnalysisResult]:
     """Public façade so callers can do: fastmda.analyze(...)"""
     return run(
@@ -400,6 +419,7 @@ def analyze(
         slides=slides,
         output=output,
         strict=strict,
+        compute_stat=compute_stat,
     )
 
 

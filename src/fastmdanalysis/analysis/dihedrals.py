@@ -260,6 +260,10 @@ class PhiAnalysis(BaseAnalysis):
             ylabel = f"Phi Angle ({self.units})"
         ax.set_ylabel(ylabel)
 
+        limit = 180.0 if self.units == "degrees" else np.pi
+        pad = 20.0 if self.units == "degrees" else (np.pi / 9.0)
+        ax.set_ylim(-(limit + pad), limit + pad)
+
         # Highlight specific residues
         if highlight_residues is not None:
             if isinstance(highlight_residues, int):
@@ -444,6 +448,10 @@ class PsiAnalysis(BaseAnalysis):
         ax.set_xlabel(kwargs.get("xlabel", "Residue Index"))
         ax.set_ylabel(kwargs.get("ylabel", f"Psi Angle ({self.units})"))
 
+        limit = 180.0 if self.units == "degrees" else np.pi
+        pad = 20.0 if self.units == "degrees" else (np.pi / 9.0)
+        ax.set_ylim(-(limit + pad), limit + pad)
+
         # Highlight specific residues
         highlight_residues = kwargs.get("highlight_residues")
         if highlight_residues is not None:
@@ -627,6 +635,10 @@ class OmegaAnalysis(BaseAnalysis):
         ax.set_xlabel(kwargs.get("xlabel", "Residue Index"))
         ax.set_ylabel(kwargs.get("ylabel", f"Omega Angle ({self.units})"))
 
+        limit = 180.0 if self.units == "degrees" else np.pi
+        pad = 20.0 if self.units == "degrees" else (np.pi / 9.0)
+        ax.set_ylim(-(limit + pad), limit + pad)
+
         # Highlight specific residues
         highlight_residues = kwargs.get("highlight_residues")
         if highlight_residues is not None:
@@ -785,6 +797,12 @@ class DihedralsAnalysis(BaseAnalysis):
                 phi_std = phi_std[mask]
             if psi_std is not None:
                 psi_std = psi_std[mask]
+        avg_matrix = np.column_stack([res_indices, x, y])
+        header = f"residue_index phi_mean_{self.units} psi_mean_{self.units}"
+        if phi_std is not None and psi_std is not None:
+            avg_matrix = np.column_stack([avg_matrix, phi_std, psi_std])
+            header = f"{header} phi_std_{self.units} psi_std_{self.units}"
+        self._save_data(avg_matrix, "ramachandran_avg", header=header)
 
         avg_matrix = np.column_stack([res_indices, x, y])
         header = f"residue_index phi_mean_{self.units} psi_mean_{self.units}"
@@ -815,11 +833,10 @@ class DihedralsAnalysis(BaseAnalysis):
         ax.set_xlabel(f"Phi ({self.units})")
         ax.set_ylabel(f"Psi ({self.units})")
         ax.grid(True, alpha=0.3)
-
         limit = 180.0 if self.units == "degrees" else np.pi
-        ax.set_xlim(-limit, limit)
-        ax.set_ylim(-limit, limit)
-
+        pad = 20.0 if self.units == "degrees" else (np.pi / 9.0)
+        ax.set_xlim(-(limit + pad), limit + pad)
+        ax.set_ylim(-(limit + pad), limit + pad)
         if len(res_indices):
             mappable = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
             cbar = plt.colorbar(mappable, ax=ax)
@@ -855,8 +872,8 @@ class DihedralsAnalysis(BaseAnalysis):
                         ax_res.set_xlabel(f"Phi ({self.units})")
                         ax_res.set_ylabel(f"Psi ({self.units})")
                         ax_res.grid(True, alpha=0.3)
-                        ax_res.set_xlim(-limit, limit)
-                        ax_res.set_ylim(-limit, limit)
+                        ax_res.set_xlim(-(limit + pad), limit + pad)
+                        ax_res.set_ylim(-(limit + pad), limit + pad)
                         fig_res.tight_layout()
 
                         frame_matrix = np.column_stack([phi_angles[:, idx], psi_angles[:, idx]])
@@ -866,7 +883,6 @@ class DihedralsAnalysis(BaseAnalysis):
                             f"ramachandran_res{res}",
                             header=frame_header,
                         )
-
                         per_path = self._save_plot(
                             fig_res,
                             "ramachandran",

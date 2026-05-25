@@ -1,0 +1,87 @@
+{% set name = "fastmdxplora" %}
+{% set version = "0.1.0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  url: https://pypi.org/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
+  sha256: REPLACE_WITH_SHA256_AFTER_PYPI_PUBLISH
+
+build:
+  noarch: python
+  number: 0
+  script: {{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
+  entry_points:
+    - fastmdx = fastmdxplora.cli.main:main
+
+requirements:
+  host:
+    - python >=3.10
+    - pip
+    - setuptools >=64
+    - setuptools-scm >=8
+  run:
+    - python >=3.10
+    # Core pip-installable deps (also in pyproject.toml)
+    - numpy >=1.22
+    - pandas >=1.5
+    - scipy >=1.10
+    - matplotlib-base >=3.6
+    - mdtraj >=1.9.7
+    - scikit-learn >=1.2
+    - requests >=2.28
+    - pyyaml >=6.0
+    # Report phase (python-pptx is a core runtime dependency)
+    - python-pptx >=0.6.21
+    # Setup + simulation phases (conda-forge only — this is the whole
+    # point of distributing through conda-forge: a single install
+    # command makes all four phases work out of the box).
+    - pdbfixer
+    - openmm >=8.0
+
+test:
+  imports:
+    - fastmdxplora
+    - fastmdxplora.setup
+    - fastmdxplora.setup.pdbfix
+    - fastmdxplora.setup.prepare
+    - fastmdxplora.simulation
+    - fastmdxplora.simulation.runner
+    - fastmdxplora.analysis
+    - fastmdxplora.report
+    # Verify the chemistry deps load — conda install of fastmdxplora
+    # is meant to make every phase work, so if these fail the recipe
+    # is broken.
+    - pdbfixer
+    - openmm
+  commands:
+    - fastmdx --version
+    - fastmdx info
+    - fastmdx --cite
+    - pip check
+  requires:
+    - pip
+
+about:
+  home: https://github.com/aai-research-lab/FastMDXplora
+  summary: 'FastMDXplora: Fully Automated SysTem for Molecular Dynamics eXploration'
+  description: |
+    FastMDXplora is a project-level orchestrator for end-to-end molecular
+    dynamics studies. A single invocation coordinates four phases — setup,
+    simulation, analysis, and reporting — producing a publication-quality
+    deliverable from a protein structure or PDB ID.
+
+    The orchestrator pattern extends the design of FastMDAnalysis (Aina &
+    Kwan, J. Comput. Chem. 2026, DOI: 10.1002/jcc.70350) from the trajectory
+    level to the project level.
+  license: MIT
+  license_family: MIT
+  license_file: LICENSE
+  doc_url: https://fastmdxplora.readthedocs.io
+  dev_url: https://github.com/aai-research-lab/FastMDXplora
+
+extra:
+  recipe-maintainers:
+    - aai-research-lab

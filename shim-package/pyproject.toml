@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastmdx"
+version = "2.0.0"
+description = "Alias for FastMDXplora; installs the canonical 'fastmdxplora' package."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Adekunle Aina" },
+    { name = "Derrick Kwan" },
+]
+keywords = ["fastmdxplora", "fastmdx", "molecular-dynamics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "fastmdxplora>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/aai-research-lab/FastMDXplora"
+Repository = "https://github.com/aai-research-lab/FastMDXplora"
+
+[tool.setuptools.packages.find]
+where = ["src"]

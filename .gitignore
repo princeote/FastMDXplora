@@ -1,86 +1,50 @@
-# Virtual environments
-.venv/
-.venv311/
-venv/
-env/
-*_env/
-test_env2/
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
 
-# Build artifacts
+# Distribution / packaging
+.Python
 build/
 dist/
 *.egg-info/
-docs/build/
-docs/source/_build/
+*.egg
+wheels/
+pip-wheel-metadata/
 
-# Packaging metadata
-*.egg-info/
+# Versioning artifact from setuptools-scm
+src/fastmdxplora/_version.py
+shim-package/src/fastmdx/_version.py
 
-# Python cache
-__pycache__/
-*.pyc
-*.py[cod]
-*$py.class
-*.so
-.Python
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+.tox/
+.cache/
 
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-*.so
+# Virtual environments
+.venv/
+venv/
+env/
+.env
 
+# uv
+.uv-cache/
 
-# Output files
-*_output/
-demos/
-
-# Slides
-slides/FastMDAnalysis_demo_slides.pptx
-*.pptx
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# IDE
+# Editor / OS
 .vscode/
 .idea/
 *.swp
 *.swo
+.DS_Store
+Thumbs.db
 
-# Test/backup files
-*.bak
-.pytest_cache/
-.coverage
-htmlcov/
-.python-version
+# Documentation builds
+docs/_build/
+docs/build/
+site/
 
-# Working and Old files
-hsp90_casestudy.md
-**/old_*.py
-**/old_*/
-.github/workflows/old_*.yml
-
-# Note
-NOTE
-coverage.xml
-examples/ubiquitin-md-generated-ensemble/
-hsp90_casestudy_indev.md
-
-# Local validation / scratch
-.venv-pypi-validation/
-validation_output*/
-Ubiquitin/
-
-# Large example data (keep out of git)
-examples/*.dcd
-examples/*.xtc
-examples/*.trr
-examples/*.nc
-examples/*.h5
-examples/*.lh5
-examples/*.pdb
-examples/*.gro
+# FastMDXplora run outputs (do not commit user data)
+fastmdxplora_output_*/

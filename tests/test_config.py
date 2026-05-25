@@ -1,0 +1,469 @@
+"""Tests for the YAML configuration system.
+
+Covers:
+  - Schema registry integrity
+  - Loading + strict validation (unknown keys, did-you-mean, type errors)
+  - include/exclude mutual exclusion
+  - Override precedence (flags/kwargs beat file beat defaults)
+  - Template generation (comprehensive + minimal), and that the generated
+    template is itself valid
+  - Resolved-config dump round-trips
+  - End-to-end through FastMDXplora(config=...) and the CLI
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+import yaml
+
+from fastmdxplora import FastMDXplora
+from fastmdxplora.config import (
+    ConfigError,
+    PHASE_SCHEMAS,
+    generate_template,
+    load_config_file,
+    phase_options,
+    validate_config,
+    write_resolved_config,
+)
+from fastmdxplora.config.schema import TOP_LEVEL, all_schemas
+from fastmdxplora.cli.main import main as cli_main
+
+
+# ---------------------------------------------------------------------------
+# Fixtures / helpers
+# ---------------------------------------------------------------------------
+def _write_yaml(tmp_path: Path, text: str, name: str = "study.yml") -> Path:
+    p = tmp_path / name
+    p.write_text(text)
+    return p
+
+
+# A minimal valid `systems:` list for validation tests (systems is the
+# canonical, required input form).
+SYS = [{"id": "a", "system": "x.pdb"}]
+
+
+@pytest.fixture
+def stub_pdb(tmp_path: Path) -> Path:
+    p = tmp_path / "protein.pdb"
+    p.write_text(
+        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    return p
+
+
+# ===========================================================================
+# Schema integrity
+# ===========================================================================
+class TestSchema:
+    def test_all_phases_present(self):
+        assert set(PHASE_SCHEMAS) == {"setup", "simulation", "analysis", "report"}
+
+    def test_each_field_has_help(self):
+        for schema in all_schemas().values():
+            for fld in schema.fields:
+                assert fld.help, f"{schema.name}.{fld.name} missing help text"
+
+    def test_field_names_unique_within_phase(self):
+        for schema in all_schemas().values():
+            names = [f.name for f in schema.fields]
+            assert len(names) == len(set(names)), f"dup in {schema.name}"
+
+    def test_setup_defaults_match_phase(self):
+        """Schema defaults should match the setup phase's DEFAULTS where set."""
+        from fastmdxplora.setup.pipeline import DEFAULTS as SETUP_DEFAULTS
+        setup = PHASE_SCHEMAS["setup"]
+        # Spot-check a few non-None defaults
+        assert setup.get("ph").default == SETUP_DEFAULTS["ph"]
+        assert setup.get("ion_concentration_M").default == SETUP_DEFAULTS["ion_concentration_M"]
+        assert setup.get("box_shape").default == SETUP_DEFAULTS["box_shape"]
+
+
+# ===========================================================================
+# Loading
+# ===========================================================================
+class TestLoading:
+    def test_load_valid(self, tmp_path):
+        p = _write_yaml(tmp_path, "system: x.pdb\noutput: ./out\n")
+        data = load_config_file(p)
+        assert data["system"] == "x.pdb"
+        assert data["output"] == "./out"
+
+    def test_load_missing_file_raises(self, tmp_path):
+        with pytest.raises(ConfigError, match="not found"):
+            load_config_file(tmp_path / "nope.yml")
+
+    def test_load_empty_file_is_empty_dict(self, tmp_path):
+        p = _write_yaml(tmp_path, "")
+        assert load_config_file(p) == {}
+
+    def test_load_non_mapping_raises(self, tmp_path):
+        p = _write_yaml(tmp_path, "- just\n- a\n- list\n")
+        with pytest.raises(ConfigError, match="mapping at the top level"):
+            load_config_file(p)
+
+    def test_load_bad_yaml_raises(self, tmp_path):
+        p = _write_yaml(tmp_path, "system: [unclosed\n")
+        with pytest.raises(ConfigError, match="Failed to parse YAML"):
+            load_config_file(p)
+
+
+# ===========================================================================
+# Validation
+# ===========================================================================
+class TestValidation:
+    def test_valid_config_passes(self):
+        validate_config({
+            "systems": SYS,
+            "setup": {"ph": 7.4},
+            "simulation": {"duration_ns": 100.0},
+        })
+
+    def test_unknown_top_level_key_raises(self):
+        with pytest.raises(ConfigError, match="Unknown top-level key 'boguskey'"):
+            validate_config({"systems": SYS, "boguskey": 1})
+
+    def test_unknown_top_level_suggests(self):
+        with pytest.raises(ConfigError, match="did you mean 'systems'"):
+            validate_config({"systms": SYS})
+
+    def test_unknown_phase_block_suggests(self):
+        with pytest.raises(ConfigError, match="did you mean 'simulation'"):
+            validate_config({"systems": SYS, "simulaton": {"duration_ns": 1}})
+
+    def test_unknown_phase_option_raises_with_suggestion(self):
+        with pytest.raises(ConfigError, match="did you mean 'ph'"):
+            validate_config({"systems": SYS, "setup": {"pH": 7.4}})
+
+    def test_type_error_raises(self):
+        with pytest.raises(ConfigError, match="should be number"):
+            validate_config({"systems": SYS, "setup": {"ph": "high"}})
+
+    def test_bool_not_accepted_for_numeric(self):
+        """ph: true must not slip through as an int (bool is int subclass)."""
+        with pytest.raises(ConfigError, match="should be number"):
+            validate_config({"systems": SYS, "setup": {"ph": True}})
+
+    def test_int_accepted_for_float_field(self):
+        # temperature_K declared (int, float) — an int must pass
+        validate_config({"systems": SYS, "simulation": {"temperature_K": 300}})
+
+    def test_include_exclude_mutually_exclusive_top(self):
+        with pytest.raises(ConfigError, match="mutually exclusive"):
+            validate_config({
+                "systems": SYS,
+                "include": ["setup"],
+                "exclude": ["report"],
+            })
+
+    def test_analysis_include_exclude_mutually_exclusive(self):
+        with pytest.raises(ConfigError, match="mutually exclusive"):
+            validate_config({
+                "systems": SYS,
+                "analysis": {"include": ["rmsd"], "exclude": ["rg"]},
+            })
+
+    def test_phase_block_must_be_mapping(self):
+        with pytest.raises(ConfigError, match="must be a mapping"):
+            validate_config({"systems": SYS, "setup": "not a dict"})
+
+    def test_null_value_allowed(self):
+        # Explicit null means "use default" — should not type-error
+        validate_config({"systems": SYS, "setup": {"water_model": None}})
+
+    def test_systems_required_when_asked(self):
+        with pytest.raises(ConfigError, match="must define a `systems:` list"):
+            validate_config({"setup": {"ph": 7.0}}, require_systems=True)
+
+    def test_systems_not_required_by_default(self):
+        # Fragment validation (no require_systems) tolerates a missing list
+        validate_config({"setup": {"ph": 7.0}})
+
+    def test_execution_block_validated(self):
+        validate_config({
+            "systems": SYS,
+            "execution": {"mode": "parallel", "workers": 2, "devices": [0, 1]},
+        })
+
+    def test_execution_bad_mode_rejected(self):
+        with pytest.raises(ConfigError, match="execution.mode must be"):
+            validate_config({"systems": SYS, "execution": {"mode": "turbo"}})
+
+
+# ===========================================================================
+# phase_options (per-phase option extraction)
+# ===========================================================================
+class TestPhaseOptions:
+    def test_extracts_phase_blocks(self):
+        opts = phase_options({
+            "systems": SYS,
+            "setup": {"ph": 7.4},
+            "simulation": {"duration_ns": 100.0},
+        })
+        assert opts["setup"] == {"ph": 7.4}
+        assert opts["simulation"] == {"duration_ns": 100.0}
+
+    def test_drops_none_values(self):
+        opts = phase_options({"setup": {"ph": 7.4, "water_model": None}})
+        assert "water_model" not in opts["setup"]
+        assert opts["setup"]["ph"] == 7.4
+
+    def test_ignores_non_phase_keys(self):
+        opts = phase_options({"systems": SYS, "output": "./o", "verbose": True})
+        assert "systems" not in opts
+        assert "output" not in opts
+
+    def test_empty_phase_block_omitted(self):
+        opts = phase_options({"setup": {"ph": None}})
+        assert "setup" not in opts
+
+
+# ===========================================================================
+# Template generation
+# ===========================================================================
+class TestTemplate:
+    def test_comprehensive_template_is_valid_yaml(self):
+        text = generate_template()
+        parsed = yaml.safe_load(text)
+        # The active (uncommented) part should have a systems list
+        assert "systems" in parsed
+        assert parsed["systems"][0]["system"] == "protein.pdb"
+
+    def test_comprehensive_template_validates(self):
+        """The generated template must pass our own validator."""
+        text = generate_template()
+        parsed = yaml.safe_load(text)
+        validate_config(parsed, require_systems=True)  # should not raise
+
+    def test_minimal_template_is_valid(self):
+        text = generate_template(minimal=True)
+        parsed = yaml.safe_load(text)
+        validate_config(parsed, require_systems=True)
+        assert parsed["systems"][0]["system"] == "protein.pdb"
+
+    def test_template_mentions_every_phase(self):
+        text = generate_template()
+        for phase in ("setup", "simulation", "analysis", "report"):
+            assert phase in text
+
+    def test_template_includes_help_comments(self):
+        text = generate_template()
+        # A few representative help strings should appear as comments
+        assert "pH for hydrogen placement" in text
+        assert "Production length in ns" in text
+
+
+# ===========================================================================
+# Resolved-config dump
+# ===========================================================================
+class TestResolvedConfig:
+    def test_writes_file(self, tmp_path):
+        merged = {
+            "system": "x.pdb", "output": str(tmp_path), "verbose": False,
+            "include": ["setup", "analysis"], "exclude": None,
+            "options": {"setup": {"ph": 7.4}},
+        }
+        path = write_resolved_config(merged, tmp_path)
+        assert path.exists()
+        assert path.name == "resolved_config.yml"
+
+    def test_resolved_round_trips(self, tmp_path):
+        """The dump must be a valid config (canonical systems:) that re-validates."""
+        merged = {
+            "system": "x.pdb", "system_id": "trpcage1",
+            "output": str(tmp_path), "verbose": True,
+            "include": ["setup"], "exclude": None,
+            "options": {"setup": {"ph": 6.5}, "simulation": {"duration_ns": 100.0}},
+        }
+        path = write_resolved_config(merged, tmp_path)
+        reparsed = load_config_file(path)
+        validate_config(reparsed, require_systems=True)
+        assert reparsed["systems"][0]["system"] == "x.pdb"
+        assert reparsed["systems"][0]["id"] == "trpcage1"
+        assert reparsed["setup"]["ph"] == 6.5
+
+    def test_omits_none_values(self, tmp_path):
+        merged = {
+            "system": "x.pdb", "output": str(tmp_path), "verbose": False,
+            "include": None, "exclude": None, "options": {},
+        }
+        path = write_resolved_config(merged, tmp_path)
+        reparsed = load_config_file(path)
+        assert "include" not in reparsed
+        assert "exclude" not in reparsed
+        assert "verbose" not in reparsed  # False is omitted
+
+
+# ===========================================================================
+# Single-study orchestrator (explicit args; configs go via BatchExplorer)
+# ===========================================================================
+class TestOrchestrator:
+    def test_explicit_system_and_options(self, tmp_path, stub_pdb):
+        fmdx = FastMDXplora(
+            system=str(stub_pdb),
+            output_dir=str(tmp_path / "run"),
+            options={"setup": {"ph": 6.8}, "analysis": {"include": ["rmsd", "rg"]}},
+            include=["setup", "analysis"],
+        )
+        assert fmdx.system == str(stub_pdb)
+        assert fmdx._config_include == ["setup", "analysis"]
+        assert fmdx.options["setup"]["ph"] == 6.8
+
+    def test_missing_system_raises(self):
+        with pytest.raises(ValueError, match="requires either a `system`"):
+            FastMDXplora()
+
+    def test_writes_resolved_config_after_run(self, tmp_path, stub_pdb):
+        fmdx = FastMDXplora(
+            system=str(stub_pdb),
+            output_dir=str(tmp_path / "run"),
+            options={"setup": {"ph": 6.5}},
+            include=["setup"],
+        )
+        fmdx.explore()
+        resolved = fmdx.output_dir / "resolved_config.yml"
+        assert resolved.exists()
+        reparsed = load_config_file(resolved)
+        validate_config(reparsed, require_systems=True)
+        assert reparsed["setup"]["ph"] == 6.5
+        assert reparsed["systems"][0]["system"] == str(stub_pdb)
+
+
+# ===========================================================================
+# End-to-end via the CLI
+# ===========================================================================
+class TestCLIConfig:
+    def test_init_config_writes_template(self, tmp_path):
+        out = tmp_path / "template.yml"
+        rc = cli_main(["init-config", "-o", str(out)])
+        assert rc == 0
+        assert out.exists()
+        # And it validates (systems is present and required)
+        validate_config(load_config_file(out), require_systems=True)
+
+    def test_init_config_minimal(self, tmp_path):
+        out = tmp_path / "min.yml"
+        rc = cli_main(["init-config", "-o", str(out), "--minimal"])
+        assert rc == 0
+        assert "duration_ns" in out.read_text(encoding="utf-8")
+        assert "systems:" in out.read_text(encoding="utf-8")
+
+    def test_init_config_refuses_overwrite(self, tmp_path):
+        out = tmp_path / "exists.yml"
+        out.write_text("systems: []\n")
+        rc = cli_main(["init-config", "-o", str(out)])
+        assert rc == 2  # refuses without --force
+
+    def test_init_config_force_overwrites(self, tmp_path):
+        out = tmp_path / "exists.yml"
+        out.write_text("old content\n")
+        rc = cli_main(["init-config", "-o", str(out), "--force"])
+        assert rc == 0
+        assert "FastMDXplora configuration" in out.read_text(encoding="utf-8")
+
+    def test_explore_with_config(self, tmp_path, stub_pdb):
+        cfg = _write_yaml(tmp_path, f"""
+output: {tmp_path / 'run'}
+include: [setup, report]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+""")
+        rc = cli_main(["explore", "--config", str(cfg)])
+        assert rc == 0
+        # Single run -> flat output layout, resolved_config at root
+        assert (tmp_path / "run" / "resolved_config.yml").exists()
+
+    def test_config_short_flags(self, tmp_path, stub_pdb):
+        """-c / -config / --config all work on explore."""
+        for flag in ("-c", "-config", "--config"):
+            out = tmp_path / f"out_{flag.strip('-')}"
+            cfg2 = _write_yaml(
+                tmp_path,
+                f"output: {out}\ninclude: [setup]\nsystems:\n  - {{id: a, system: {stub_pdb}}}\n",
+                name=f"c_{flag.strip('-')}.yml",
+            )
+            rc = cli_main(["explore", flag, str(cfg2)])
+            assert rc == 0, f"{flag} failed"
+
+    def test_flag_overrides_config_value(self, tmp_path, stub_pdb):
+        """--setup-ph on the command line beats the config file's ph."""
+        cfg = _write_yaml(tmp_path, f"""
+output: {tmp_path / 'run'}
+include: [setup]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+setup:
+  ph: 7.0
+""")
+        rc = cli_main([
+            "explore", "--config", str(cfg),
+            "--setup-ph", "6.0",   # override
+        ])
+        assert rc == 0
+        manifest = json.loads(
+            (tmp_path / "run" / "setup" / "setup_parameters.json").read_text(encoding="utf-8")
+        )
+        # Flag wins: ph should be 6.0, not the file's 7.0
+        assert manifest["parameters"]["ph"] == 6.0
+
+    def test_cli_config_error_returns_2(self, tmp_path, stub_pdb):
+        cfg = _write_yaml(tmp_path, f"systems:\n  - {{id: a, system: {stub_pdb}}}\nsetup:\n  pH: 7.4\n")
+        rc = cli_main(["explore", "--config", str(cfg)])
+        assert rc == 2  # ConfigError -> exit code 2
+
+
+# ===========================================================================
+# FastMDXplora(config=...) is THE user-facing entry point (one or many)
+# ===========================================================================
+class TestFastMDXploraConfigEntry:
+    def test_single_system_config_flat_output(self, tmp_path, stub_pdb):
+        cfg = _write_yaml(tmp_path, f"""
+output: {tmp_path / 'one'}
+include: [setup]
+systems:
+  - {{id: trpcage, system: {stub_pdb}}}
+""")
+        fmdx = FastMDXplora(config=str(cfg))
+        results = fmdx.explore()
+        assert len(results) == 1
+        assert results[0].status == "ok"
+        # Flat layout for a single run — no runs/ wrapper
+        assert (tmp_path / "one" / "setup").is_dir()
+        assert not (tmp_path / "one" / "runs").exists()
+
+    def test_many_system_config_runs_layout(self, tmp_path, stub_pdb):
+        cfg = _write_yaml(tmp_path, f"""
+output: {tmp_path / 'many'}
+include: [setup]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+sweep:
+  setup.temperature_K: [300, 310]
+""")
+        fmdx = FastMDXplora(config=str(cfg))
+        results = fmdx.explore()
+        assert len(results) == 2
+        assert (tmp_path / "many" / "runs").is_dir()
+        assert (tmp_path / "many" / "batch_manifest.json").exists()
+
+    def test_config_explore_respects_include_override(self, tmp_path, stub_pdb):
+        cfg = _write_yaml(tmp_path, f"""
+output: {tmp_path / 'ov'}
+systems:
+  - {{id: a, system: {stub_pdb}}}
+""")
+        fmdx = FastMDXplora(config=str(cfg))
+        fmdx.explore(include=["setup"])
+        # Only setup ran -> setup dir exists, simulation dir does not
+        assert (tmp_path / "ov" / "setup").is_dir()
+        assert not (tmp_path / "ov" / "simulation").exists()
+
+    def test_system_and_config_conflict_raises(self, tmp_path, stub_pdb):
+        cfg = _write_yaml(tmp_path, f"systems:\n  - {{id: a, system: {stub_pdb}}}\n")
+        with pytest.raises(ValueError, match="not both"):
+            FastMDXplora(system=str(stub_pdb), config=str(cfg))

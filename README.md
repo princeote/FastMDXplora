@@ -1,259 +1,380 @@
-[![DOI](https://img.shields.io/badge/DOI-10.26434/chemrxiv--2025--x8xnq-blue)](https://doi.org/10.26434/chemrxiv-2025-x8xnq)
-[![Total PyPI downloads](https://pepy.tech/badge/fastmdanalysis)](https://pepy.tech/project/fastmdanalysis)
+# FastMDXplora
 
-![FastMDAnalysis](assets/fastmdanalysis_banner.png)
+> **F**ully **A**utomated **Sy**s**T**em for **M**olecular **D**ynamics e**X**ploration
 
-[![Tests](https://github.com/aai-research-lab/FastMDAnalysis/actions/workflows/test.yml/badge.svg)](https://github.com/aai-research-lab/FastMDAnalysis/actions)
-[![codecov](https://codecov.io/gh/aai-research-lab/FastMDAnalysis/branch/main/graph/badge.svg)](https://codecov.io/gh/aai-research-lab/FastMDAnalysis)
-[![Docs](https://img.shields.io/badge/docs-latest-brightgreen.svg)](https://fastmdanalysis.readthedocs.io/en/latest/)
-[![PyPI](https://img.shields.io/pypi/v/fastmdanalysis)](https://pypi.org/project/fastmdanalysis/)
+[![DOI](https://img.shields.io/badge/DOI-10.1002%2Fjcc.70350-blue)](https://doi.org/10.1002/jcc.70350)
+[![PyPI](https://img.shields.io/pypi/v/fastmdxplora.svg)](https://pypi.org/project/fastmdxplora/)
 [![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Tests](https://github.com/aai-research-lab/FastMDXplora/actions/workflows/tests.yml/badge.svg)](https://github.com/aai-research-lab/FastMDXplora/actions)
 
 ---
+
+**FastMDXplora** is a project-level orchestrator for end-to-end molecular dynamics studies. A single command takes a protein structure (or PDB ID) from input to publication-quality deliverable, coordinating four phases:
+
+```
+  setup  →  simulation  →  analysis  →  report
+```
+
+**FastMDXplora is the next generation of FastMDAnalysis** (Aina & Kwan, *J. Comput. Chem.* 2026, [DOI: 10.1002/jcc.70350](https://doi.org/10.1002/jcc.70350)) — the same automated, reproducibility-by-design philosophy, extended from trajectory analysis to the full molecular dynamics study: setup, simulation (including enhanced sampling), protein and protein-ligand analysis, and reporting. It is *not* a generic workflow engine — the workflow is built-in, the domain knowledge is built-in, and the user expresses intent rather than describing a workflow graph (a DAG, or directed acyclic graph, the task-and-dependency model used by tools like Snakemake and Nextflow).
 
 ## Highlights
-- Perform complex **molecular dynamics analyses** with intuitive, **single-line commands**
-- Automatically generate **slide-ready, publication-quality figures** with consistent axes, fonts, and colorbars  
-- Seamlessly switch between **Python API** for advanced workflows and **CLI** for rapid batch processing
-- **Scalable workflows** that handle everything from quick exploratory analysis to large-scale production runs
 
-<!-- Perform a variety of MD trajectory analyses with a single line of code -->
-<!-- Simplify your workflow by loading a trajectory once (with options for frame and atom selection) and then performing multiple analyses without repeating input file details. --> 
-<!--  Automatically generate publication-quality figures (with options for customization) -->
-<!--  Use the Python API or the Command‐Line Interface (CLI) -->
-<!-- [![Documentation](https://readthedocs.org/projects/fastmdanalysis/badge/?version=latest)](https://fastmdanalysis.readthedocs.io) 
-<!-- [![Monthly PyPI downloads](https://pepy.tech/badge/fastmdanalysis/month)](https://pepy.tech/project/fastmdanalysis) --> 
-
----
-
-
-## Analysis Modules
-| Analysis | Description |
-|----------|-------------|
-| ``rmsd`` | Root-Mean-Square Deviation relative to a reference frame |
-| ``rmsf`` | Per-atom Root-Mean-Square Fluctuation |
-| ``rg`` | Radius of Gyration for molecular compactness |
-| ``hbonds`` | Hydrogen bond detection and count using Baker-Hubbard algorithm |
-| ``ss`` | Secondary Structure assignments using DSSP |
-| ``cluster`` | Trajectory clustering using KMeans, DBSCAN, and Hierarchical methods |
-| ``sasa`` | Solvent Accessible Surface Area with total, per-residue, and average per-residue |
-| ``dimred`` | Dimensionality reduction using PCA, MDS, and t-SNE methods |
-| ``qvalue`` | Fraction of Native Contacts for protein folding analysis |
-| ``dihedrals`` | Phi, Psi, Omega angle analysis + Ramachandra Plots |
-
----
+- **Single-command end-to-end MD** — from PDB to slides in one invocation
+- **Protein-ligand ready** — parameterize a small-molecule ligand (OpenFF) from a feasible bound pose; ligand-aware analyses (pose RMSD, contacts, protein-ligand H-bonds) run automatically
+- **Project-level orchestrator pattern** — shared state, registered phases, intelligent defaults, consolidated outputs
+- **Granular control when you want it** — run any single phase independently
+- **Self-contained** — the analysis and report phases have no heavy runtime dependencies
+- **Reproducibility built in** — every run writes a structured manifest of parameters, software versions, and artifact paths
+- **Publication-quality reporting** — automated slide deck, structured Markdown report, self-contained project bundle
 
 ## Installation
 
-We **strongly recommend installing ``FastMDAnalysis`` in a virtual environment** to avoid conflicts with system packages and ensure the ``fastmda`` command is available in your PATH.
+FastMDXplora's four phases have different dependency footprints. The **analysis and report** phases work from pip alone; the **setup and simulation** phases need PDBFixer + OpenMM, which are distributed primarily through conda-forge. So there are two routes — pick by what you need.
 
+### Full install (all four phases) — from the git repo
 
-### Install from conda-forge (Recommended)
-
-```bash
-conda create -n fastmda_env python=3.11
-```
-```bash
-conda activate fastmda_env
-```
-```bash
-conda install -c conda-forge fastmdanalysis
-```
-
-### Verify installation
-```bash
-fastmda analyze -h
-```
-
-### (Alternatively) Install from PyPI 
-Make sure you have Python 3.9+ installed and available as 'python'.
-```bash
-python -m venv fastmda_env
-```
+The setup/simulation chemistry stack (OpenMM, PDBFixer) installs most reliably from conda-forge, so the full install uses the bundled `environment.yml`. We recommend `mamba` (a faster conda solver); plain `conda` works too.
 
 ```bash
-# On Linux/macOS:
-source fastmda_env/bin/activate
-
-# Or on Windows:
-# fastmda_env\Scripts\activate
+git clone https://github.com/aai-research-lab/FastMDXplora.git
+cd FastMDXplora
 ```
 ```bash
-pip install fastmdanalysis
+mamba env create -f environment.yml || conda env create -f environment.yml
 ```
-
-### Verify installation
 ```bash
-fastmda analyze -h
+conda activate fastmdxplora
+pip install .
 ```
 
----
+> Don't have `mamba`? Either install Miniforge (see [below](#mamba--miniforge-optional)), or just use `conda` — the `||` above falls back to it automatically.
 
-## Usage
+### Analysis + report only — from PyPI
 
-### Command-Line Interface (CLI) 
-After installation, you can run ``FastMDAnalysis`` from the command line using the `fastmda` command. Global options allow you to specify the trajectory and topology file paths.
-Optionally, specify frame selection and atom selection. Frame selection is provided as a tuple (start, stop, stride). Negative indices (e.g., -1 for the last frame) are supported. If no options are provided, the entire trajectory and all atoms are used by default.
+If you only need to analyze existing trajectories and build reports (no simulation), plain pip is enough — no conda required:
 
-**Run the ``analyze`` orchestrator to execute multiple analyses in one go.**
-
-**Run all available analyses**
 ```bash
-fastmda analyze -traj path/to/trajectory -top path/to/topology
+pip install fastmdxplora              # primary package
+pip install fastmdx                    # alias (resolves to fastmdxplora)
 ```
-**Include specific analyses**
+
+This gives a fully working analysis + report pipeline, slide deck included (`python-pptx` is a core dependency). The setup and simulation phases emit a clear warning and skip gracefully until the chemistry stack is present. Add it via conda-forge (recommended, reliable across platforms):
+
 ```bash
-fastmda analyze -traj traj.dcd -top top.pdb --include rmsd rg
+conda install -c conda-forge pdbfixer openmm
 ```
-**Exclude specific analyses**
+
+or best-effort via the `[md]` pip extras (PDBFixer wheels are unavailable on some platforms, so conda is preferred):
+
 ```bash
-fastmda analyze -traj traj.dcd -top top.pdb --exclude sasa dimred cluster
+pip install "fastmdxplora[md]"
 ```
-**Supply options via file (YAML or JSON)**
+
+### Development install
+
 ```bash
-fastmda analyze -traj traj.dcd -top top.pdb --options options.yaml
+git clone https://github.com/aai-research-lab/FastMDXplora.git
+cd FastMDXplora
+mamba env create -f environment.yml || conda env create -f environment.yml
+conda activate fastmdxplora
+pip install -e ".[test]"               # editable, with the test dependencies
 ```
-**Create a slide deck from generated figures**
+
+### Verify
+
 ```bash
-fastmda analyze -traj traj.dcd -top top.pdb  --slides
+fastmdx --version
+fastmdx info                           # versions + detected backends (OpenMM/PDBFixer)
 ```
 
+Check which OpenMM platforms are available (CPU/CUDA/OpenCL):
 
-**Global flags:**
-- ``--frames start,stop,stride`` (e.g., ``0,-1,10``)
-- ``--atoms "MDTraj selection"`` (e.g., ``"protein and name CA"``)
-- ``--output DIR`` (output directory name)
-- ``--verbose`` (prints progress and writes logs under ``<command>_output/`` unless ``--output`` is set)
-
-**Show help:**
-- ``fastmda -h``
-- ``fastmda analyze -h``
-
-
-
-**Options file (schema)**
-
-Provide per-analysis keyword arguments in a single file. CLI and Python API share the same schema:
-```yaml
-# options.yaml
-rmsd:
-  ref: 0
-cluster:
-  methods: [kmeans, hierarchical]
-  n_clusters: 5
+```bash
+python - <<'PY'
+import openmm as mm
+plats = [mm.Platform.getPlatform(i).getName() for i in range(mm.Platform.getNumPlatforms())]
+print("Available platforms:", plats)
+print("CUDA available" if "CUDA" in plats else "CPU-only — simulations will run on CPU")
+PY
 ```
 
-**Slides:**
-- ``--slides`` creates ``fastmda_slides_<ddmmyy.HHMM>.pptx`` in the current working directory.
-- ``--slides path/to/deck.pptx`` writes to an explicit filename.
+> **conda-forge package (coming soon).** A single-command `conda install -c conda-forge fastmdxplora` (pulling every dependency, all four phases working out of the box) is planned once the recipe clears review. Until then, use the git + `environment.yml` route above.
 
+### Mamba / Miniforge (optional)
 
+`mamba` is a drop-in, faster replacement for the conda solver — helpful because solving the OpenMM/CUDA stack is exactly where the classic solver is slow. If you don't have it, the easiest source is **Miniforge** (conda + mamba, preconfigured for conda-forge):
 
+```bash
+# Linux (x86_64) — see https://conda-forge.org/miniforge/ for macOS/Windows/ARM
+curl -L -o "$HOME/Miniforge3.sh" \
+  "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
+bash "$HOME/Miniforge3.sh" -b -p "$HOME/miniforge3"
+source "$HOME/miniforge3/etc/profile.d/conda.sh"
+conda init "$(basename "$SHELL")"
+```
+
+If `mamba` still isn't on PATH afterward, add it to the base environment:
+
+```bash
+conda install -n base -c conda-forge mamba
+```
+
+For other operating systems (macOS Intel/Apple Silicon, Linux ARM64, Windows), grab the matching installer from the [Miniforge releases page](https://conda-forge.org/miniforge/).
+
+## Examples
+
+### Command line
+
+**Run the full pipeline** (setup → simulate → analyze → report):
+```bash
+fastmdx explore --system protein.pdb
+```
+**Fetch a structure from the PDB by ID** (auto-detected, fetched from RCSB):
+```bash
+fastmdx explore --system 1L2Y
+```
+**Tune per-phase options** (flags are namespaced by phase):
+```bash
+fastmdx explore -s protein.pdb --setup-ph 7.4 --simulate-duration-ns 100 --simulate-platform CUDA
+```
+**Run only specific phases**:
+```bash
+fastmdx explore -s protein.pdb --include setup simulation
+```
+**Run a single phase** (bare flags, no phase prefix):
+```bash
+fastmdx setup -s protein.pdb --ph 6.5
+fastmdx simulate --output run_001 --duration-ns 50 --platform CUDA
+fastmdx analyze --output run_001 --analyses rmsd rmsf rg
+```
+**Drive a whole study from a config file** (`-c` and `-config` also work):
+```bash
+fastmdx explore --config study.yml
+```
+**Generate a commented config template to edit**:
+```bash
+fastmdx init-config -o study.yml
+```
+
+The `-s`, `-system`, and `--system` forms are equivalent; `xplore` is an alias of `explore`.
 
 ### Python API
-Instantiate a `FastMDAnalysis` object with your trajectory and topology file paths. 
 
-**Run the ``analyze`` orchestrator to execute all available analyses.**
+**Run the full pipeline**:
 ```python
-from fastmdanalysis import FastMDAnalysis
-from fastmdanalysis.datasets import TrpCage  # optional helper
+from fastmdxplora import FastMDXplora
 
-fastmda = FastMDAnalysis(TrpCage.traj, TrpCage.top)
-fastmda.analyze()
+fmdx = FastMDXplora(system="protein.pdb")
+fmdx.explore()
 ```
-
-**Include or Exclude specific analyses; specify options, generate slides**
+**Specify options and select phases**:
 ```python
-fastmda = FastMDAnalysis(TrpCage.traj, TrpCage.top)
-result = fastmda.analyze(
-    include=["rmsd", "rg"],                 # or exclude=[...]; omit to run all
-    options={"rmsd": {"ref": 0, "align": True}},
-    slides=True                             # or slides="results.pptx"
+fmdx = FastMDXplora(system="1L2Y")          # PDB ID, fetched from RCSB
+results = fmdx.explore(
+    include=["setup", "simulation", "analysis"],
+    options={
+        "simulation": {"duration_ns": 100, "temperature_K": 310, "platform": "CUDA"},
+        "analysis":   {"include": ["rmsd", "rg", "cluster"]},
+    },
 )
+# explore() always returns a list of runs (a single study is a list of one)
+for run in results:
+    print(run.run_id, run.status)
+    for phase in run.phases:
+        print("  ", phase.name, phase.status)
+```
+**Run a config file** — one system, many systems, or a parameter sweep, all the same way:
+```python
+fmdx = FastMDXplora(config="study.yml")
+fmdx.explore()
+```
+**Preview a run without executing** (CLI `--dry-run`, or `dry_run=True`):
+```python
+FastMDXplora(config="campaign.yml").explore(dry_run=True)
 ```
 
-> **Notes** 
-> - Figures are saved during each analysis; slide decks include all figures produced in the run.
-> - MDTraj may emit benign warnings (e.g., dummy CRYST1 records); they do not affect results.
+> Recommended alias: `import fastmdxplora as fastmdx`.
 
----
+See [Configuration files](#configuration-files) and [Many systems and parameter sweeps](#many-systems-and-parameter-sweeps) for the YAML format, batches, sweeps, and parallel execution.
 
-## Output
-Output includes data tables, figures (already stylized for slides), slide deck, log file ...
+## Configuration files
 
----
+For anything beyond a quick run, capture the whole study in a single YAML file instead of a long flag list. The same file drives both the CLI and the Python API. Input is always given as a `systems:` list — even for a single system — so the file looks the same whether you study one protein or a dozen.
 
-## Validation and Benchmarks
-- To validate `FastMDAnalysis` go to the [Validation Branch](https://github.com/aai-research-lab/FastMDAnalysis/blob/validation/README.md).
-- For benchmarks go to the  [Benchmark Branch](https://github.com/aai-research-lab/FastMDAnalysis/blob/benchmark/README.md).
+Generate a commented template to start from:
 
----
+```bash
+fastmdx init-config                    # writes fastmdxplora.yml (comprehensive)
+fastmdx init-config --minimal -o study.yml   # short starter
+```
 
+A `study.yml` looks like:
+
+```yaml
+systems:
+  - id: protein1
+    system: protein.pdb        # PDB/CIF path, 4-char PDB ID, or sequence
+
+output: ./my_study
+include: [setup, simulation, analysis, report]
+
+setup:
+  ph: 7.4
+  ion_concentration_M: 0.15
+
+simulation:
+  duration_ns: 100.0         # production length (equilibration is separate)
+  temperature_K: 310.0
+  platform: CUDA
+
+analysis:
+  include: [rmsd, rmsf, rg, cluster]
+  selection: "name CA"
+  options:
+    cluster:
+      methods: [kmeans, hierarchical]
+      n_clusters: 5
+
+report:
+  title: "My MD Study"
+```
+
+Run it from the CLI or the API:
+
+```bash
+fastmdx explore --config study.yml     # also: -c, -config
+```
+
+```python
+from fastmdxplora import FastMDXplora
+FastMDXplora(config="study.yml").explore()
+```
+
+With a single system and no sweep, the output uses the familiar flat layout (`my_study/setup/`, `my_study/simulation/`, …) with the usual `manifest.json` and `resolved_config.yml`. Three things make this robust:
+
+- **Flags override the file.** `fastmdx explore --config study.yml --simulate-duration-ns 50` keeps everything in the file but runs 50 ns. Precedence is: command-line flags / API kwargs > config file > built-in defaults.
+- **Strict validation.** A typo like `pH:` (wrong case) or `simulaton:` is rejected with a did-you-mean suggestion, so a misspelled key never silently runs with the default.
+- **Reproducibility.** Every run writes `resolved_config.yml` — the fully-merged configuration that actually ran (defaults + file + overrides). Feed it straight back to `--config` to reproduce the study exactly.
+
+For a quick command-line one-off, `-s/--system` is shorthand that builds a one-element `systems` list for you:
+
+```bash
+fastmdx explore -s protein.pdb --simulate-duration-ns 50
+```
+
+## Many systems and parameter sweeps
+
+Because input is always a `systems:` list, studying several systems is just adding entries. Add a `sweep:` block to vary parameters, and FastMDXplora runs the full cross-product — each as a complete, self-contained study.
+
+```yaml
+output: ./trpcage_campaign
+include: [setup, simulation, analysis, report]
+
+systems:
+  - id: trpcage1
+    system: trpcage.pdb
+  - id: trpcage2
+    system: trpcage.pdb
+    setup: { ph: 6.5 }                 # optional per-system overrides
+
+sweep:
+  simulation.temperature_K: [300, 310, 320]   # dotted phase.option → values
+  simulation.pressure_bar: [1.0, 1.2]          # multiple axes → cross-product
+```
+
+That config produces 2 systems × 3 temperatures × 2 pressures = **12 runs**. When there is more than one run, each goes in its own `runs/<id>/` subdirectory, indexed by a top-level `batch_manifest.json`, with a cross-run `comparison/` report:
+
+```
+trpcage_campaign/
+  batch_manifest.json
+  comparison/                                        (cross-run report)
+  runs/
+    trpcage1__temperature_K-300__pressure_bar-1.0/   (a full study)
+    trpcage1__temperature_K-300__pressure_bar-1.2/
+    ...
+```
+
+Run it exactly as any other config:
+
+```bash
+fastmdx explore --config campaign.yml
+```
+
+```python
+from fastmdxplora import FastMDXplora
+FastMDXplora(config="campaign.yml").explore()
+```
+
+Each run is identical in structure to a single study (its own `manifest.json`, `resolved_config.yml`, and phase directories), so existing analysis tooling works per-run unchanged. Option precedence within a run is base config < per-system overrides < swept value. Typo'd sweep axes are rejected with the valid-option list, and a failed run is recorded while the others continue.
+
+### Cross-run comparison report
+
+After a multi-run study, FastMDXplora automatically builds a `comparison/` report at the batch root that turns a directory of runs into a single analysis:
+
+- **Overlays** — every run's per-frame trace (RMSD, Rg, Q-value, total SASA) drawn on one set of axes, labelled by its swept value, so divergence across the sweep is visible at a glance.
+- **Trends** — each run reduced to a summary scalar (e.g. mean RMSD over the trajectory) and plotted against the swept parameter, giving a structure-property relationship.
+- **`comparison_summary.csv`** — one row per run with the summary scalars, ready for further analysis.
+- **`comparison_report.md`** — a written report tying the figures together, with a one-line quantitative takeaway per property (e.g. *"across temperature_K 300 → 320, mean RMSD increases 0.21 → 0.23 nm"*).
+
+It degrades gracefully (errored runs and missing analyses are skipped) and can be turned off with `report: { comparison: false }`.
+
+### Parallel execution
+
+By default runs execute sequentially. An optional `execution:` block runs several at once:
+
+```yaml
+execution:
+  mode: parallel          # sequential (default) | parallel
+  workers: 2              # how many runs at once
+  devices: [0, 1]         # GPU indices — one run pinned per device
+  continue_on_error: true
+```
+
+Parallelism is process-based (each run is a subprocess, required because OpenMM contexts and the GIL don't share across threads). On GPU, the safe pattern is **one run per GPU**: list your `devices` and each worker is pinned to a distinct index round-robin. Oversubscribing a single GPU is slower than running sequentially, so `workers` should not exceed the number of devices on GPU. When `workers` is unset it defaults to one per device (GPU) or the CPU count capped at the run count (CPU).
+
+## The four phases
+
+| Phase | Purpose | Key outputs |
+|---|---|---|
+| `setup` | System preparation (fix, protonate, solvate, ionize) | `prepared.pdb`, `solvated.pdb`, `setup_parameters.json` |
+| `simulation` | Minimize, NVT, NPT, production MD | `production.dcd`, `topology.pdb`, `simulation_parameters.json` |
+| `analysis` | RMSD, RMSF, Rg, H-bonds, SS, cluster, SASA, dim-red, Q-value, dihedrals | `<analysis>/*.dat`, `<analysis>/*.png`, `analysis_manifest.json` |
+| `report` | Slides, structured report, project bundle | `report.md`, `slides.pptx`, `project_bundle.zip` |
+
+Each phase writes to a dedicated subdirectory under the project output root and produces a structured parameters manifest, so every artifact is traceable to the exact options that produced it.
 
 ## Documentation
-The documentation [under development] (with an extensive User Guide) is available [here](https://fastmdanalysis.readthedocs.io).
 
----
-
-## Contributing
-Contributions are welcome. Please submit a Pull Request. 
-
-**Development Installation**
-
-If you want to contribute or modify the code:
-```bash
-# Clone the repository
-git clone https://github.com/aai-research-lab/FastMDAnalysis.git
-cd FastMDAnalysis
-
-# Create and activate virtual environment
-python -m venv fastmda_env
-source fastmda_env/bin/activate  # On Windows: fastmda_env\Scripts\activate
-
-# Install in development mode with test dependencies
-pip install -e ".[test]"
-
-# Verify installation
-fastmda -h
-fastmda analyze -h
-```
----
+Documentation is hosted at [fastmdxplora.readthedocs.io](https://fastmdxplora.readthedocs.io) (under development).
 
 ## Citation
-If you use `FastMDAnalysis` in your work, please cite:
 
-Aina, A. and Kwan, D. (2025) “FastMDAnalysis: Software for Automated Analysis of Molecular Dynamics Trajectories”. ChemRxiv. https://doi.org/10.26434/chemrxiv-2025-x8xnq
+If you use FastMDXplora in your work, please cite the foundational FastMDAnalysis paper:
+
+> Aina, A.; Kwan, D. *FastMDAnalysis: Software for Automated Analysis of Molecular Dynamics Trajectories.* J. Comput. Chem. **2026**, 47, e70350. DOI: [10.1002/jcc.70350](https://doi.org/10.1002/jcc.70350)
 
 ```bibtex
-@article{fastmdanalysis,
-  author       = {Adekunle Aina and Derrick Kwan},
-  title        = {FastMDAnalysis: Software for Automated Analysis of Molecular Dynamics Trajectories},
-  year         = {2025},
-  doi          = {10.26434/chemrxiv-2025-x8xnq},
-  publisher    = {ChemRxiv},
-  url          = {https://doi.org/10.26434/chemrxiv-2025-x8xnq},
-  type         = {preprint}
+@article{aina2026fastmd,
+  author  = {Aina, Adekunle and Kwan, Derrick},
+  title   = {FastMDAnalysis: Software for Automated Analysis of Molecular Dynamics Trajectories},
+  journal = {Journal of Computational Chemistry},
+  volume  = {47},
+  number  = {8},
+  pages   = {e70350},
+  year    = {2026},
+  doi     = {10.1002/jcc.70350},
 }
 ```
 
----
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). FastMDXplora follows the [Contributor Covenant](CODE_OF_CONDUCT.md).
 
 ## License
 
-`FastMDAnalysis` is licensed under the MIT license. 
-
----
+MIT — see [LICENSE](LICENSE).
 
 ## Acknowledgements
 
-``FastMDAnalysis`` builds upon excellent open-source libraries to provide its high-performance analysis capabilities and to improve workflow efficiency, usability, and reproducibility in molecular dynamics trajectory analysis. We gratefully acknowledge:
-
-- ``MDTraj`` for foundational trajectory I/O and analysis modules
-- ``NumPy/SciPy`` for efficient numerical computations
-- ``scikit-learn`` for advanced machine learning algorithms
-- ``Matplotlib`` for publication-quality visualization
-
-While leveraging these robust tools, ``FastMDAnalysis`` streamlines analysis for students, professionals, and researchers, especially those new to molecular dynamics. We thank the scientific Python community for their contributions to the ecosystem.
-
-
+FastMDXplora is developed in the [AAI Research Lab](https://aai-research-lab.github.io) at California State University Dominguez Hills. It builds on a deep ecosystem of open-source scientific Python: MDTraj, OpenMM, PDBFixer, NumPy, SciPy, scikit-learn, Matplotlib, python-pptx, and many others.

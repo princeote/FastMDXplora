@@ -1,0 +1,262 @@
+"""Structured study report (Markdown).
+
+Produces a publication-style report from the project state:
+
+  - Header (title, authors, date)
+  - Methods (auto-populated from setup + simulation parameter manifests)
+  - Results (figures + summary tables from the analysis manifest)
+  - Discussion (stub for the user to fill in)
+  - Citation (FastMDXplora + JCC paper)
+  - Reproducibility appendix (command-line invocation, software versions,
+    parameter manifests, input hashes)
+
+PDF rendering of this report is an optional add-on (requires extra
+dependencies); the Markdown source is always produced.
+"""
+
+from __future__ import annotations
+
+import json
+from fastmdxplora.utils.logging import get_logger
+import platform
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from fastmdxplora.orchestrator import FastMDXplora
+
+logger = get_logger("report.document")
+
+
+def _load_json_safely(path: Path) -> dict | None:
+    try:
+        with path.open(encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        logger.warning("Could not parse JSON manifest at %s", path)
+        return None
+
+
+def _methods_section(project_root: Path) -> str:
+    setup = _load_json_safely(project_root / "setup" / "setup_parameters.json") or {}
+    sim = _load_json_safely(project_root / "simulation" / "simulation_parameters.json") or {}
+    setup_params = setup.get("parameters", {})
+    sim_params = sim.get("parameters", {})
+
+    lines = ["## Methods", ""]
+    lines.append("### System preparation")
+    if setup_params:
+        lines.append("")
+        lines.append(
+            "The input system was prepared using FastMDXplora's automated "
+            "setup pipeline with the following parameters:"
+        )
+        lines.append("")
+        for k, v in setup_params.items():
+            lines.append(f"- **{k}**: `{v}`")
+    else:
+        lines.append("")
+        lines.append("Setup parameters were not recorded for this run.")
+
+    lines.append("")
+    lines.append("### Molecular dynamics simulation")
+    if sim_params:
+        lines.append("")
+        lines.append(
+            "Production MD was performed with the following simulation parameters:"
+        )
+        lines.append("")
+        for k, v in sim_params.items():
+            lines.append(f"- **{k}**: `{v}`")
+    else:
+        lines.append("")
+        lines.append("Simulation parameters were not recorded for this run.")
+
+    return "\n".join(lines)
+
+
+def _results_section(project_root: Path) -> str:
+    analysis_manifest = _load_json_safely(
+        project_root / "analysis" / "analysis_manifest.json"
+    ) or {}
+    plan: list[str] = analysis_manifest.get("plan", [])
+    results = analysis_manifest.get("results", {})
+
+    lines = ["## Results", ""]
+    if not plan:
+        lines.append("No analyses were executed in this session.")
+        return "\n".join(lines)
+
+    n_frames = analysis_manifest.get("n_frames")
+    n_residues = analysis_manifest.get("n_residues")
+    if n_frames is not None and n_residues is not None:
+        lines.append(
+            f"Analysis was performed on a trajectory of {n_frames} frames "
+            f"and {n_residues} residues."
+        )
+    lines.append(f"Analyses performed: {', '.join(plan)}.")
+    lines.append("")
+
+    for analysis in plan:
+        # Pretty heading: uppercase short names, title-case longer ones
+        heading = analysis.upper() if len(analysis) <= 4 else analysis.title()
+        lines.append(f"### {heading}")
+        lines.append("")
+
+        # Per-analysis result row from the analysis manifest
+        result_meta = results.get(analysis, {})
+        status = result_meta.get("status", "unknown")
+        if status != "ok":
+            lines.append(
+                f"_This analysis did not complete successfully (status: "
+                f"`{status}`)._"
+            )
+            if result_meta.get("message"):
+                lines.append(f"Reason: {result_meta['message']}")
+            lines.append("")
+            continue
+
+        # Options come from each analysis's own options.json (more reliable
+        # than the manifest because the per-analysis file records the
+        # actual fully-resolved options after defaults are applied).
+        opts_file = project_root / "analysis" / analysis / "options.json"
+        per_analysis = _load_json_safely(opts_file) or {}
+        opts = per_analysis.get("options", {})
+        selection = per_analysis.get("selection")
+
+        if opts or selection:
+            lines.append("**Parameters:**")
+            if selection:
+                lines.append(f"- `selection`: `{selection}`")
+            for k, v in opts.items():
+                lines.append(f"- `{k}`: `{v}`")
+        else:
+            lines.append("_Ran with default options._")
+        lines.append("")
+
+        # Embed all figures in the analysis directory. Multi-method
+        # analyses (cluster, dimred) emit several PNGs; sort them so the
+        # report renders deterministically.
+        figs_dir = project_root / "analysis" / analysis
+        figures = sorted(figs_dir.glob("*.png")) if figs_dir.exists() else []
+        if figures:
+            for fig in figures:
+                # Markdown/HTML image links require forward slashes on every
+                # OS; str(WindowsPath) would emit backslashes and break them.
+                rel = fig.relative_to(project_root).as_posix()
+                caption = f"{analysis} — {fig.stem}"
+                lines.append(f"![{caption}]({rel})")
+                lines.append("")
+        else:
+            lines.append("_No figure was produced for this analysis._")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def _citation_section() -> str:
+    from fastmdxplora import __citation__
+
+    return "\n".join(
+        [
+            "## Citation",
+            "",
+            "If you use FastMDXplora in your work, please cite:",
+            "",
+            f"> {__citation__}",
+            "",
+            "BibTeX:",
+            "",
+            "```bibtex",
+            "@article{aina2026fastmd,",
+            "  author  = {Aina, Adekunle and Kwan, Derrick},",
+            "  title   = {FastMDAnalysis: Software for Automated Analysis of "
+            "Molecular Dynamics Trajectories},",
+            "  journal = {Journal of Computational Chemistry},",
+            "  volume  = {47},",
+            "  number  = {8},",
+            "  pages   = {e70350},",
+            "  year    = {2026},",
+            "  doi     = {10.1002/jcc.70350},",
+            "}",
+            "```",
+        ]
+    )
+
+
+def _reproducibility_section(orchestrator: "FastMDXplora") -> str:
+    from fastmdxplora import __version__
+
+    lines = ["## Reproducibility", ""]
+    lines.append(f"- **FastMDXplora version**: `{__version__}`")
+    lines.append(f"- **Python**: `{sys.version.split()[0]}`")
+    lines.append(f"- **Platform**: `{platform.platform()}`")
+    lines.append(f"- **System input**: `{orchestrator.system}`")
+    lines.append(f"- **Output directory**: `{orchestrator.output_dir}`")
+    lines.append("")
+    lines.append(
+        "Per-phase parameter manifests are preserved at "
+        "`setup/setup_parameters.json`, `simulation/simulation_parameters.json`, "
+        "and `analysis/analysis_manifest.json`. The complete session manifest "
+        "is at `manifest.json` at the project root."
+    )
+    return "\n".join(lines)
+
+
+def build_document(
+    *,
+    orchestrator: "FastMDXplora",
+    output_dir: Path,
+    title: str,
+    author: str | None,
+    include_methods: bool,
+    include_reproducibility: bool,
+) -> list[str]:
+    """Render the Markdown study report.
+
+    Returns
+    -------
+    list of str
+        Artifact paths relative to ``output_dir``.
+    """
+    project_root = orchestrator.output_dir
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    sections: list[str] = []
+    header = [f"# {title}", ""]
+    if author:
+        header.append(f"_Author: {author}_  ")
+    header.append(f"_Generated: {now} (UTC)_  ")
+    header.append(f"_Tool: FastMDXplora_")
+    sections.append("\n".join(header))
+
+    sections.append(
+        "## Summary\n\nThis report was generated automatically by FastMDXplora "
+        "from the outputs of an end-to-end molecular dynamics study."
+    )
+
+    if include_methods:
+        sections.append(_methods_section(project_root))
+
+    sections.append(_results_section(project_root))
+
+    sections.append(
+        "## Discussion\n\n_This section is intended for the user to complete. "
+        "FastMDXplora provides the analytical scaffolding; scientific "
+        "interpretation remains the researcher's responsibility._"
+    )
+
+    sections.append(_citation_section())
+
+    if include_reproducibility:
+        sections.append(_reproducibility_section(orchestrator))
+
+    doc = "\n\n".join(sections) + "\n"
+    md_path = output_dir / "report.md"
+    md_path.write_text(doc, encoding="utf-8")
+
+    return ["report.md"]

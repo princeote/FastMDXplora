@@ -1,0 +1,142 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build
+        run: python -m pip install --upgrade pip build
+
+      - name: Build the canonical package (fastmdxplora)
+        run: python -m build
+
+      - name: Build the fastmdx alias
+        run: cd shim-package && python -m build
+
+      - name: Build the fastmdanalysis redirect
+        run: cd shims/fastmdanalysis && python -m build
+
+      - name: Build the fastmdxplorer redirect
+        run: cd shims/fastmdxplorer && python -m build
+
+      - name: Verify all redirect/alias versions match the release tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          fail=0
+          check() {
+            local path="$1" name="$2"
+            local ver
+            ver=$(python -c "import tomllib; print(tomllib.load(open('$path','rb'))['project']['version'])")
+            echo "$name version: $ver (tag: $TAG)"
+            if [ "$TAG" != "$ver" ]; then
+              echo "::error::$name version ($ver) does not match release tag ($TAG). Bump $path before tagging."
+              fail=1
+            fi
+          }
+          check "shim-package/pyproject.toml" "fastmdx"
+          check "shims/fastmdanalysis/pyproject.toml" "fastmdanalysis"
+          check "shims/fastmdxplorer/pyproject.toml" "fastmdxplorer"
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+
+      - name: Upload fastmdxplora artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-fastmdxplora
+          path: dist/
+
+      - name: Upload fastmdx artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-fastmdx
+          path: shim-package/dist/
+
+      - name: Upload fastmdanalysis artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-fastmdanalysis
+          path: shims/fastmdanalysis/dist/
+
+      - name: Upload fastmdxplorer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-fastmdxplorer
+          path: shims/fastmdxplorer/dist/
+
+  publish-fastmdxplora:
+    name: Publish fastmdxplora to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-fastmdxplora
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+  publish-fastmdx:
+    name: Publish fastmdx (alias) to PyPI
+    needs: publish-fastmdxplora
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-fastmdx
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+  publish-fastmdanalysis:
+    name: Publish fastmdanalysis (redirect) to PyPI
+    needs: publish-fastmdxplora
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-fastmdanalysis
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+  publish-fastmdxplorer:
+    name: Publish fastmdxplorer (redirect) to PyPI
+    needs: publish-fastmdxplora
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-fastmdxplorer
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

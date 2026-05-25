@@ -1,61 +1,103 @@
 # Changelog
-All notable changes to this project will be documented in this file.
 
-This format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
-and the project adheres to [Semantic Versioning](https://semver.org/).
+All notable changes to FastMDXplora are documented in this file.
+
+Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ·
+Versioning: [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
-### Added
-- (Add upcoming features here.)
-### Changed
-- (Add behavior/CLI/API changes here.)
-### Fixed
-- (Add bug fixes here.)
 
-## [1.1.0] - 2026-02-15
-### Added
-- **Dihedral analysis** module with Ramachandran plots, including error bars and per-residue frame plots; expanded CLI support and documentation. (#16, #18, #19, #20)
-- **Fraction of Native Contacts (Q-value)** analysis module; integrated into analysis discovery and workflow execution.
-- **Adaptive plotting helpers** for slide-ready figures and expanded plotting regression coverage (including slide style helpers).
-- **Permissive options passthrough** and test coverage for the options forwarder.
-- **CODE_OF_CONDUCT.md**.
+## [2.0.0] — 2026-05-25
+
+**Project renamed: FastMDAnalysis → FastMDXplora.** This is the next
+generation of FastMDAnalysis (Aina & Kwan, *J. Comput. Chem.* 2026), carrying
+its automated, reproducibility-by-design analysis forward and extending it to
+the full molecular dynamics study — setup, simulation (with enhanced
+sampling), protein and protein-ligand analysis, and reporting. The interim
+`fastmdxplorer` releases (0.1–0.3) are consolidated here under the final name.
 
 ### Changed
-- **MDS dimensionality reduction** updated for robust scikit-learn compatibility via API detection and exhaustive fallback parameter handling; avoids deprecated parameters across versions.
-- Improved clustering and dendrogram plot styling (layout/whitespace reduction; x-axis and label cleanup).
-- Enhanced analysis outputs with `compute_stat` summaries and refined plot bounds/defaults. (#21)
-- Documentation updates for plotting and output formats; README improvements including conda-forge installation notes.
-- Metadata updates for Zenodo DOI (pyproject.toml, CITATION, README).
+- **Package renamed to `fastmdxplora`** (import `fastmdxplora`). The CLI
+  command remains `fastmdx`. See [MIGRATION.md](MIGRATION.md).
+- The former PyPI names remain available as redirect packages that install
+  `fastmdxplora` and re-export its namespace, so existing installs are not
+  broken: `fastmdanalysis` and `fastmdxplorer` (both deprecated, emit a
+  notice), and `fastmdx` (a supported short alias, not deprecated).
+
+### Included from the 0.1–0.3 interim releases
+- End-to-end MD orchestration across four phases (setup, simulation, analysis, report).
+- Named force-field selector; OpenFF ligand/cofactor parameterization with a setup-time pose clash check.
+- Protein-ligand analyses: ligand pose RMSD, protein-ligand contacts + binding-site fingerprint, protein-ligand H-bonds, ligand RMSF — auto-detected for complexes.
+- Analysis scope (`solute`/`protein`/`ligand`/`all`) keeping analyses off solvent.
+- PLUMED enhanced sampling on the production stage (`--simulate-plumed-script`).
+- Cross-platform CI (Linux/macOS/Windows); parallel batch execution and cross-run comparison.
+
+## [0.3.0] — 2026-05-25
+
+Enhanced sampling. FastMDXplora can now drive PLUMED collective-variable
+biasing (metadynamics, umbrella sampling, steered MD, …) on the production
+stage of a run, with equilibration left unbiased per standard protocol.
+
+### Added
+- **PLUMED enhanced sampling** (optional): supply a PLUMED script via `simulation.plumed` (config: `{enabled: true, script: "<inline or path to .dat>"}`) or `--simulate-plumed-script PATH` (CLI) to add collective-variable biasing — metadynamics, umbrella sampling, steered MD, etc. — to the **production** stage. Equilibration (NVT/NPT) runs unbiased, matching standard enhanced-sampling protocol; the biasing force is added just before production and the context reinitialized. PLUMED output files (COLVAR, HILLS, …) are redirected into the run's output directory, and the resolved script is saved as `plumed.dat` for reproducibility. Requires the `plumed` extra (`openmm-plumed`, installed via `conda install -c conda-forge openmm-plumed`); absent, enabling PLUMED raises a clear, actionable error.
+
+### Changed
+- Renamed the `test_md_parity.py` test module to `test_md_engine_controls.py` to match its content (MD engine controls). Trimmed the README (removed the Status and Project-family sections).
+
+## [0.2.0] — 2026-05-25
+
+End-to-end protein-ligand molecular dynamics. FastMDXplora can now set up,
+simulate, and analyze a protein-ligand complex from a feasible bound pose:
+named force fields with an OpenFF small-molecule path, a setup-time pose
+sanity check, and the standard protein-ligand analysis suite, all detected
+and wired automatically.
+
+### Added
+- **Protein-ligand analyses** (run automatically when a ligand is detected; `include`/`exclude` apply): in addition to ligand pose RMSD, three more commonly-reported analyses now run on protein-ligand complexes:
+  - `contacts` — protein-ligand contacts, reported two ways: a per-frame count of protein residues within a cutoff (default 0.4 nm) of the ligand (`contacts.dat`), and a per-residue contact-frequency "interaction fingerprint" identifying the binding-site residues (`contacts_per_residue.csv`, also shown as the figure)
+  - `pl_hbonds` — hydrogen bonds formed specifically between protein and ligand (per frame), distinct from the general intra-solute `hbonds` analysis
+  - `ligand_rmsf` — per-ligand-atom fluctuation after protein alignment: the ligand's internal flexibility in the pocket
+- **Ligand pose RMSD** analysis (`ligand_rmsd`): the headline protein-ligand stability metric. Each frame is rigidly aligned onto the reference using the protein (Cα by default), then RMSD is measured on the ligand atoms of the aligned coordinates — i.e. how far the ligand has moved *relative to the protein frame*, which tells you whether it holds its binding pose or drifts/unbinds. This is distinct from the standard RMSD (which aligns and measures on the same atoms). It runs automatically when a ligand is detected (from `resolved_forcefield.ligand` in the setup manifest) and is skipped for protein-only runs; `include`/`exclude` still apply. Ligand-only analyses are marked with a `requires_ligand` flag on the analysis class, and the orchestrator supplies the detected ligand residue name automatically
+- **Analysis scope** (`analysis.scope` / `--analyze-scope`): a single setting controls which atoms analyses operate on — `solute` (protein + ligand, the default), `protein`, `ligand`, or `all`. It resolves to a default atom selection applied to analyses that don't set their own (the solvent-blind ones: Rg, SASA, secondary structure, Q-value, hydrogen bonds), so they no longer run on solvent/ions by accident. Analyses with a meaningful own default (the Cα-based RMSD, RMSF, clustering, dimensionality reduction) keep it. An explicit per-analysis or orchestrator-wide `selection` still overrides the scope. When a ligand is present (detected from `resolved_forcefield.ligand` in the setup manifest), `solute` and `ligand` scopes include it automatically by residue name
+- **Ligand / cofactor parameterization** (protein-ligand systems): supply a small-molecule ligand as an SDF or MOL2 file via `setup.ligand` (config) or `--setup-ligand` (CLI), parameterized with an OpenFF small-molecule force field through `openmmforcefields`' `SystemGenerator`. Selected with the ligand-capable `amber-openff` named force field (AMBER ff14SB protein + TIP3P water + OpenFF Sage 2.2.1 for the ligand). Net charge is inferred from the SDF formal charges unless set explicitly via `ligand_net_charge`; the ligand residue name (`ligand_name`, default `LIG`) and small-molecule force field (`ligand_forcefield`, e.g. `openff-2.2.1` or `gaff-2.2.20`) are configurable. The supplied ligand coordinates must be a feasible bound pose (from a co-crystal structure or docking); a setup-time clash check (`check_ligand_clashes`, `ligand_clash_threshold_nm`) fails with a clear message if the pose severely overlaps the protein, rather than letting it surface as a divergent simulation later. Incoherent combinations are rejected early with clear errors (a ligand with a non-ligand-capable force field, or with a raw XML list). The resolved ligand parameterization is recorded under `resolved_forcefield.ligand` in `setup_parameters.json`. Requires the `ligand` extra (`pip install 'fastmdxplora[ligand]'`); absent, the phase degrades with an actionable install message. Ligand input is list-shaped in config for future multi-ligand support; single-ligand parameterization is implemented now
+- **Named force-field selector**: pick a force field by a short, documented name via `setup.forcefield` (config) or `--setup-forcefield` (CLI) — `charmm36` (default), `amber14`, `amber-fb15`, or `amber-openff` (ligand-capable) — instead of listing raw OpenMM XML filenames. Each name resolves to the correct protein/water XML set and default water model through a single registry (`setup/forcefields.py`). The raw `force_field` XML list remains as a power-user escape hatch; specifying both a named selector and a raw list is rejected with a clear error, as is an unknown force-field name (the message lists valid choices). The resolved force field (actual XMLs + water model) is recorded under `resolved_forcefield` in `setup_parameters.json` for reproducibility, regardless of which form the user chose
 
 ### Fixed
-- Fixed dihedral residue selection (`--residues`) to properly restrict computation; corrected option aliases and added coverage. (#16, #18)
-- Fixed CLI `-o/--output` flag issue. (#7)
-- Improved warning handling: filtered pyparsing deprecation warnings from MDTraj; fixed pytest warning filter compatibility across pyparsing versions.
-- Updated plotting tests to match the current plotting API; removed outdated clustering utilities test file.
-- CI/test maintenance for scikit-learn compatibility and warning suppression.
+- The ligand residue in the prepared/solvated topology is now named with the configured ligand name (default `LIG`) instead of OpenFF's default `UNK`. Previously the written `topology.pdb` labelled the ligand `UNK` while the manifest recorded `LIG`, so resname-based selection silently failed — ligand-aware analyses found no ligand atoms, and the `solute`/`ligand` analysis scopes silently excluded the ligand. The name is now set on both the ligand topology and the merged topology so it survives `Modeller.add()` across OpenMM versions
+- Clustering on a trajectory with fewer frames than the requested number of clusters now fails with a clear, actionable message ("Clustering needs at least n_clusters=N frames, but the trajectory has only M...") instead of an opaque scikit-learn internals error. k-means and hierarchical clustering are guarded; DBSCAN (which doesn't take a cluster count) is unaffected
+- Analyses that operate on all atoms by default (Rg, SASA, secondary structure, Q-value, hydrogen bonds) now slice the trajectory to the resolved scope/selection *before* computing, rather than processing the full solvated system. Previously several of these passed the whole trajectory straight to the underlying calculation regardless of the selection — so on a solvated complex the Q-value analysis enumerated residue pairs across ~10k water residues (tens of millions of pairs) and effectively hung, and Rg/SASA were computed over water. With the new `solute` default scope and per-analysis slicing they operate on protein (+ ligand) only — a correctness fix for any solvated run and a large speedup
+- **Named force-field selector**: pick a force field by a short, documented name via `setup.forcefield` (config) or `--setup-forcefield` (CLI) — `charmm36` (default), `amber14`, `amber-fb15`, or `amber-openff` (ligand-capable) — instead of listing raw OpenMM XML filenames. Each name resolves to the correct protein/water XML set and default water model through a single registry (`setup/forcefields.py`). The raw `force_field` XML list remains as a power-user escape hatch; specifying both a named selector and a raw list is rejected with a clear error, as is an unknown force-field name (the message lists valid choices). The resolved force field (actual XMLs + water model) is recorded under `resolved_forcefield` in `setup_parameters.json` for reproducibility, regardless of which form the user chose
 
-### Chores
-- Version bump to 1.1.0.
-- Ignored local validation outputs and example data in version control.
+## [0.1.0] — 2026-05-XX
 
-## [1.0.0] - 2025-11-02
+Initial claim-staking release. Establishes the project-level orchestrator
+scaffolding, the four-phase API (setup, simulation, analysis, report), and
+the `fastmdx` CLI.
+
 ### Added
-- **First stable release of FastMDAnalysis**
-- Version header in log files.
+- **Robust auto platform selection**: when `platform=auto`, the simulation runner now verifies a GPU platform (CUDA/OpenCL) can actually create a Context before committing to it, and falls back to the next candidate (ultimately CPU) if not — instead of selecting a *registered-but-unusable* platform that then fails at Context construction with a confusing error. An explicit `platform=CUDA`/`OpenCL` request is still honored as-is (the user sees the real error if their choice is broken)
+- **Clear periodic-box / cutoff guard**: `prepare_system` now raises an actionable error when the nonbonded cutoff exceeds half the smallest periodic box dimension (instead of OpenMM's cryptic `NonbondedForce` message), naming the cutoff, the box, and how to fix it (increase `solvent_padding_nm` or decrease `nonbonded_cutoff_nm`)
+- **`environment.yml` + git install path** — clone the repo and `mamba env create -f environment.yml || conda env create -f environment.yml` then `pip install .` to get all four phases (the OpenMM/PDBFixer chemistry stack from conda-forge) without waiting on the conda-forge package. Plain `pip install fastmdxplora` still gives the analysis + report phases on their own
 
-## [0.0.3] - 2025-10-27
-### Added
-- **First public release of FastMDAnalysis** (non-testing).
-- Command-line workflow: `fastmda analyze --traj <traj> --top <top> --include rmsd rg cluster`
-- Core analyses: RMSD, Rg, RMSF, hydrogen bonds, secondary structure, SASA, clustering, dimensionality reduction.
-- Publication-quality figure generation.
-- Automatic slide generation.
-- Initial documentation/README.
-- Packaging and metadata for citation (`CITATION.cff`) and licensing.
+### Fixed
+- **Parallel execution on Windows**: spawned worker processes now reconfigure their stdout/stderr to UTF-8 (as the CLI entry point does). Previously, because workers are spawned (not forked) on Windows and bypass the CLI entry, their streams stayed on the platform codec (cp1252) and crashed with `UnicodeEncodeError` the moment the presenter printed a status glyph (✓, ▸) — so every run in `mode: parallel` failed on Windows while sequential mode succeeded
+- **Headless plotting**: the analysis package now forces matplotlib's non-interactive `Agg` backend before pyplot is imported (respecting an explicit `MPLBACKEND`). Previously the backend was only forced off-Windows with no `DISPLAY`, so analyses crashed on headless machines that didn't match that gate (notably headless Windows CI) with "Can't find a usable init.tcl". FastMDXplora always writes figures to files, so a non-interactive backend is always correct
+- **Cross-platform paths in reports/manifests**: figure links in the Markdown report, zip archive entry names, and the relative artifact paths recorded in manifests now use forward slashes (`as_posix()`) on every OS. Previously, on Windows these were emitted with backslashes, breaking Markdown/HTML image links and producing non-portable manifests
+- **UTF-8 file/stream encoding everywhere**: all text written by FastMDXplora (reports, comparison markdown, config templates, manifests, PDB/XML artifacts) now specifies `encoding="utf-8"` explicitly, and the CLI reconfigures stdout/stderr to UTF-8 at entry. Previously, on a machine whose default locale encoding was ASCII, writing the comparison report's `→` or the config template's `—` (or printing the banner) raised `UnicodeEncodeError`
+- **FastMDXplora orchestrator class** (`fastmdxplora.FastMDXplora`) — project-level coordinator following a seven-phase orchestration pattern (Aina & Kwan, JCC 2026)
+- **Four phases** under `fastmdxplora.setup`, `.simulation`, `.analysis`, `.report` — each with a `run(orchestrator, output_dir, **options)` entry point and a structured parameters manifest
+- **`fastmdx` CLI** with subcommands `explore` (canonical), `xplore` (X-themed alias), `setup`, `simulate`, `analyze`, `report`, `info`, plus `--version` and `--cite` flags
+- **Report phase artifacts**: Markdown study report, .pptx slide deck, self-contained .zip project bundle
+- **YAML configuration files**: a single config captures an entire study — input is given as a canonical `systems:` list (always a list, even for one system), plus phase selection and all per-phase options; drives both the CLI (`--config` / `-c`) and the Python API (`FastMDXplora(config=...).explore()`); `fastmdx init-config` writes a fully-commented template; strict schema validation rejects typos with did-you-mean suggestions; command-line flags override file values; every run writes a re-runnable `resolved_config.yml` for reproducibility
+- **Full MD engine controls**: integrator selection (`langevin_middle`, `langevin`, `brownian`, `verlet`, `variable_langevin`, `variable_verlet`); pressure in either `pressure_bar` or `pressure_atm` (auto-converted); GPU `device_index` selection; `checkpoint_interval_steps` writing a restart-ready `.chk`; `ForceField.createSystem` pass-throughs (`nonbonded_method`, `ewald_error_tolerance`, `use_switching_function`, `switch_distance_nm`, `dispersion_correction`, `remove_cm_motion`); and `fixed_pdb` to skip PDBFixer when a prepared structure is supplied
+- **Many-system & parameter-sweep mode**: the `systems:` list can hold several systems, and an optional `sweep:` of parameter axes (dotted `phase.option` keys) runs the full cross-product (systems × sweep), each as a complete self-contained study. One run writes the flat output layout; multiple runs go in `runs/<id>/` indexed by a top-level `batch_manifest.json`. Per-system option overrides and swept values merge with correct precedence (base < per-system < sweep); typo'd sweep axes are rejected with the valid-option list. An optional `execution:` block runs studies in parallel (process pool) with round-robin GPU device pinning (one run per device)
+- **Cross-run comparison report**: after a multi-run study, a `comparison/` report is built automatically at the batch root — per-frame **overlays** (RMSD, Rg, Q-value, total SASA across all runs on one axes), **trend** plots of each run's summary scalar against the swept parameter, a `comparison_summary.csv`, and a written `comparison_report.md` with a quantitative takeaway per property. Degrades gracefully (errored runs / missing analyses skipped); disable with `report: { comparison: false }`; (re)build via `FastMDXplora(...).compare()` (optionally `compare(output_dir=…)` for a batch that finished earlier)
+- **Dry-run / plan-only mode**: `fastmdx explore --config … --dry-run` (or `explore(dry_run=True)`) prints every run, its system, swept values, target output directory, and the phases that would execute — then exits without running anything or writing to disk
+- **Uniform return shape**: `FastMDXplora.explore()` always returns a `list[RunResult]` — a single study is a list of one, a sweep is a list of many. Each `RunResult` carries `run_id`, `system`, `status`, `output_dir`, `sweep_values`, and its per-phase `PhaseResult` list in `.phases` (with a `.phase(name)` lookup helper). The single user-facing entry point is always `FastMDXplora`; the batch machinery underneath is private
+- **Reproducibility manifest** (`manifest.json`) written at the project root summarizing phases executed, parameters, software versions, and DOI
+- **Datasets namespace** (`fastmdxplora.datasets`) with a TrpCage placeholder
+- **CI**: matrix tests on ubuntu/macos/windows × Python 3.9–3.12 (GitHub Actions)
+- **PyPI**: dual-name publishing — `fastmdxplora` is the primary package, `fastmdx` is a thin alias that depends on it
 
----
-
-[Unreleased]: https://github.com/aai-research-lab/FastMDAnalysis/compare/v1.1.0...HEAD
-[1.1.0]: https://github.com/aai-research-lab/FastMDAnalysis/compare/v1.0.0...v1.1.0
-[1.0.0]: https://github.com/aai-research-lab/FastMDAnalysis/compare/v0.0.3...v1.0.0
-[0.0.3]: https://github.com/aai-research-lab/FastMDAnalysis/releases/tag/v0.0.3
+### Notes
+- The analysis and report phases are self-contained (no heavy runtime dependencies); the setup and simulation phases require OpenMM + PDBFixer.

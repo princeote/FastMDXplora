@@ -1,95 +1,110 @@
-# FastMDAnalysis Package Structure
+# Repository structure
 
-This document describes how the repository is organized and where to find things.  
-For a compact view of the current layout, see the **[directory tree](./tree.txt)**.
+```
+FastMDXplora/
+├── src/
+│   └── fastmdxplora/
+│       ├── __init__.py            # Top-level exports + metadata
+│       ├── _version.py            # Written by setuptools-scm
+│       ├── orchestrator.py        # FastMDXplora project-level orchestrator
+│       ├── cli/
+│       │   ├── __init__.py
+│       │   └── main.py            # `fastmdx` entry point (explore/xplore/setup/simulate/analyze/report/info)
+│       ├── setup/
+│       │   ├── __init__.py
+│       │   └── pipeline.py        # System preparation: fix, protonate, solvate, ionize
+│       ├── simulation/
+│       │   ├── __init__.py
+│       │   └── pipeline.py        # MD simulation: minimize, NVT, NPT, production
+│       ├── analysis/
+│       │   ├── __init__.py
+│       │   └── analyze.py         # Analysis-level orchestrator (RMSD, RMSF, Rg, …)
+│       ├── report/
+│       │   ├── __init__.py
+│       │   ├── run.py             # Top-level report() entry point
+│       │   ├── document.py        # Structured Markdown report
+│       │   ├── slides.py          # .pptx slide deck (with markdown fallback)
+│       │   └── bundle.py          # Self-contained .zip project archive
+│       ├── datasets/
+│       │   ├── __init__.py
+│       │   └── trp_cage.py        # Reference dataset stub (from FastMDAnalysis)
+│       └── utils/
+│           └── __init__.py
+├── shim-package/                  # `fastmdx` alias on PyPI
+│   ├── pyproject.toml
+│   ├── README.md
+│   └── src/fastmdx/__init__.py
+├── tests/
+│   ├── test_imports.py
+│   ├── test_orchestrator.py
+│   └── test_cli.py
+├── recipes/                       # conda-forge submission packages
+│   ├── fastmdxplora/meta.yaml
+│   └── fastmdx-alias/meta.yaml
+├── .github/workflows/
+│   ├── tests.yml                  # CI: matrix tests + CLI smoke test
+│   └── publish.yml                # PyPI trusted publishing on `v*` tag
+├── docs/
+├── examples/
+├── scripts/
+├── assets/
+├── pyproject.toml                 # Primary package config
+├── README.md
+├── LICENSE
+├── CITATION.cff
+├── CHANGELOG.md
+├── CONTRIBUTING.md
+├── CODE_OF_CONDUCT.md
+├── STRUCTURE.md                   # (this file)
+└── .gitignore
+```
 
----
+## Architectural overview
 
-## Top-level layout
+FastMDXplora is a **project-level orchestrator**. The central class
+`FastMDXplora` holds shared state (system input, output directory,
+per-phase options) and coordinates the four canonical phases:
 
-- **`src/fastmdanalysis/`** – The Python package source (src-layout). This is the importable code that ships on PyPI. 
-- **`tests/`** – Unit tests (pytest). 
-- **`docs/`** – Sphinx/RTD documentation sources; configured by `.readthedocs.yaml`. 
-- **`.github/workflows/`** – Continuous Integration (CI) configs. 
-- **`examples/`** – Example scripts demonstrating API/CLI usage. 
-- **`assets/`** – Project artwork assets. 
-- **`pyproject.toml`** – Build/packaging configuration (PEP 517/518). 
-- Other project files: `README.md`, `CONTRIBUTING.md`, `LICENSE`, `requirements.txt`, `coverage.xml`, `tree.txt`. 
+```
+  setup → simulation → analysis → report
+```
 
-> **Note.** Installation exposes a `fastmda` command-line entry point (documented in the README). 
----
+This continues the orchestrator pattern of **FastMDAnalysis** (Aina & Kwan,
+JCC 2026), which orchestrates analysis modules within a trajectory.
+FastMDXplora applies the same pattern one level up the hierarchy.
 
-## `src/fastmdanalysis/`: the Python package
+### Key design principles
 
-This directory contains the public API, analysis implementations, CLI, and utilities.
+1. **Self-contained.** FastMDXplora has no runtime dependency on
+   external MD-analysis or simulation packages. Each phase is implemented
+   directly under `fastmdxplora.<phase>`.
 
-### Package root
+2. **Intent over DAG.** Users express intent (`include=["setup", "analysis"]`,
+   `exclude=["report"]`, per-phase option overrides). The workflow is
+   built-in — this is not a general-purpose workflow engine.
 
-- **`__init__.py`**  
-  Defines the public API surface (e.g., `FastMDAnalysis` class and top-level helpers). Import paths are designed for clean usage in code and docs.
+3. **Structured I/O at every phase.** Every phase writes a JSON parameters
+   manifest plus its canonical artifacts. The orchestrator writes a
+   top-level `manifest.json` recording the session.
 
-- **`datasets.py`**  
-  Lightweight helpers for example data locations (e.g., TrpCage) and any small metadata that helps examples/tests stay readable.
+4. **Lazy phase imports.** Each phase is imported only when invoked, so
+   optional heavy dependencies (OpenMM, PDBFixer) do not impose a cost on
+   users who only use a subset of phases.
 
-- **`utils.py`**  
-  General utilities. Notably:
-  - `load_trajectory(...)`: robust loader that accepts single/multiple paths (lists, comma-separated strings, or glob patterns) and normalizes topology handling.
-  - Helper routines (e.g., safe path creation, figure saving).
+5. **Continue FastMDAnalysis conventions.** The analysis subpackage uses the
+   same module taxonomy (`rmsd`, `rmsf`, `rg`, `hbonds`, `ss`, `cluster`,
+   `sasa`, `dimred`, `qvalue`, `dihedrals`) established in FastMDAnalysis,
+   now extended with protein-ligand analyses — FastMDXplora being the
+   direct successor to that package.
 
-### `analysis/`: analysis modules
+### Naming alignment
 
-Each analysis is self-contained with a thin, consistent API and plotting helpers.
-
-- **`__init__.py`** – Re-exports the analysis classes/functions for convenient imports.
-- **`base.py`** – Shared machinery: a base analysis class, common exceptions, and small utilities reused across analyses.
-- **`rmsd.py`** – RMSD computation against a reference frame; alignment options and basic QC plots.
-- **`rmsf.py`** – Per-atom RMSF and summaries (tables/plots).
-- **`rg.py`** – Radius of gyration (global and, optionally, by chain/segment).
-- **`hbonds.py`** – Hydrogen-bond detection (e.g., Baker–Hubbard criteria) and counts/time series.
-- **`ss.py`** – Secondary structure assignment wrappers (e.g., DSSP) with state fractions over time.
-- **`cluster.py`** – Clustering wrappers (KMeans, DBSCAN, Hierarchical), dendrograms, and cluster occupancy/centroid reporting.
-- **`dimred.py`** – Dimensionality reduction (PCA, MDS, t-SNE) with 2D scatter plots and projection exports.
-- **`sasa.py`** – Solvent Accessible Surface Area: total, per-residue, and averaged measures.
-
-### `cli/`: command-line interface
-
-A small CLI package powers the `fastmda` command.
-
-- **`__init__.py`** – CLI package init.
-- **`_common.py`** – Shared CLI glue: argument builders, logging/config setup, frame/atom selection parsing, and construction of the `FastMDAnalysis` instance.
-- **`main.py`** – The CLI entry point that wires subcommands and dispatches to implementations.
-- **`analyze.py`** – “Orchestrator” command to run multiple analyses in one invocation, read options from YAML/JSON, and optionally generate slides.
-- **`simple.py`** – Legacy single-analysis commands (e.g., `rmsd`, `rg`, `hbonds`, `cluster`, `ss`, `sasa`, `dimred`) retained for convenience.
-
-> The README shows how to invoke the CLI, e.g., `fastmda analyze -traj traj.dcd -top top.pdb ...`. 
-
----
-
-## Tests
-
-- **`tests/`** houses pytest-based unit tests. Tests target each analysis module and the CLI orchestrator.  
-  Typical local run: `pytest -q -m "not slow" --cov=fastmdanalysis --cov-report=term-missing`. 
----
-
-## Documentation
-
-- **`docs/`** contains Sphinx sources (API docs, user guide, developer guide).  
-- **`.readthedocs.yaml`** controls RTD builds (Python version, extras, build commands). 
----
-
-## Continuous Integration
-
-- **`.github/workflows/`** defines CI pipelines (tests, coverage, docs build, style checks).  
-  Workflows run on PRs and pushes to keep the package reliable. 
-
----
-
-## Packaging and installation
-
-- **`pyproject.toml`** declares the build system, package metadata, and entry points used to expose the `fastmda` CLI after `pip install fastmdanalysis`. See **README** for usage and options. 
----
-
-## Examples and assets
-
-- **`examples/`**: runnable scripts showing both API and CLI workflows on small datasets.  
-- **`assets/`**: branding materials for papers, talks, and tutorials. 
+| Surface | Name |
+|---|---|
+| Project / brand | FastMDXplora |
+| PyPI primary | `fastmdxplora` |
+| PyPI alias | `fastmdx` (depends on `fastmdxplora`) |
+| Python import | `fastmdxplora` (commonly aliased: `import fastmdxplora as fastmdx`) |
+| CLI command | `fastmdx` |
+| GitHub repo | `aai-research-lab/FastMDXplora` |
+| DOI | 10.1002/jcc.70350 (foundational JCC paper) |

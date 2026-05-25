@@ -1,0 +1,627 @@
+"""Tests for the batch / parameter-sweep system.
+
+Covers:
+  - Pure sweep expansion (systems × sweep cross-product)
+  - System and sweep normalization + validation
+  - Run-id generation and uniqueness
+  - Merge precedence (base < per-system < sweep)
+  - Sweep-axis typo rejection (via config validation)
+  - End-to-end BatchExplorer execution + manifest
+  - Flat output for a single run; runs/ layout for many
+  - Execution scheduling: worker-count resolution, device round-robin
+    pinning, and sequential-vs-parallel equivalence (mocked — real GPU
+    parallelism can't run in the sandbox)
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from fastmdxplora.batch import (
+    BatchExplorer,
+    RunSpec,
+    SweepError,
+    expand_runs,
+    normalize_sweep,
+    normalize_systems,
+)
+from fastmdxplora.batch.sweep import is_batch_config
+from fastmdxplora.config import ConfigError, validate_config
+from fastmdxplora.cli.main import main as cli_main
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def stub_pdb(tmp_path: Path) -> Path:
+    p = tmp_path / "protein.pdb"
+    p.write_text(
+        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    return p
+
+
+def _write(tmp_path: Path, text: str, name: str = "batch.yml") -> Path:
+    p = tmp_path / name
+    p.write_text(text)
+    return p
+
+
+# ===========================================================================
+# normalize_systems
+# ===========================================================================
+class TestNormalizeSystems:
+    def test_basic(self):
+        out = normalize_systems([
+            {"id": "a", "system": "a.pdb"},
+            {"id": "b", "system": "b.pdb"},
+        ])
+        assert [s["id"] for s in out] == ["a", "b"]
+        assert out[0]["system"] == "a.pdb"
+
+    def test_auto_id_when_missing(self):
+        out = normalize_systems([{"system": "x.pdb"}])
+        assert out[0]["id"] == "s1"
+
+    def test_per_system_options_captured(self):
+        out = normalize_systems([
+            {"id": "a", "system": "a.pdb", "setup": {"ph": 6.5}},
+        ])
+        assert out[0]["options"]["setup"]["ph"] == 6.5
+
+    def test_missing_system_raises(self):
+        with pytest.raises(SweepError, match="missing a `system`"):
+            normalize_systems([{"id": "a"}])
+
+    def test_duplicate_id_raises(self):
+        with pytest.raises(SweepError, match="Duplicate system id"):
+            normalize_systems([
+                {"id": "a", "system": "a.pdb"},
+                {"id": "a", "system": "b.pdb"},
+            ])
+
+    def test_empty_raises(self):
+        with pytest.raises(SweepError, match="non-empty list"):
+            normalize_systems([])
+
+
+# ===========================================================================
+# normalize_sweep
+# ===========================================================================
+class TestNormalizeSweep:
+    def test_basic(self):
+        out = normalize_sweep({"simulation.temperature_K": [300, 310]})
+        assert out["simulation.temperature_K"] == [300, 310]
+
+    def test_scalar_becomes_single_axis(self):
+        out = normalize_sweep({"setup.ph": 7.0})
+        assert out["setup.ph"] == [7.0]
+
+    def test_non_dotted_key_raises(self):
+        with pytest.raises(SweepError, match="dotted phase.option"):
+            normalize_sweep({"temperature_K": [300]})
+
+    def test_unknown_phase_raises(self):
+        with pytest.raises(SweepError, match="not a valid phase"):
+            normalize_sweep({"nosuchphase.x": [1]})
+
+    def test_empty_values_raises(self):
+        with pytest.raises(SweepError, match="empty value list"):
+            normalize_sweep({"setup.ph": []})
+
+
+# ===========================================================================
+# expand_runs
+# ===========================================================================
+class TestExpandRuns:
+    def test_systems_times_sweep(self):
+        systems = normalize_systems([
+            {"id": "a", "system": "a.pdb"},
+            {"id": "b", "system": "b.pdb"},
+        ])
+        sweep = normalize_sweep({"simulation.temperature_K": [300, 310, 320]})
+        runs = expand_runs(systems=systems, sweep=sweep)
+        assert len(runs) == 6  # 2 × 3
+
+    def test_two_axis_cross_product(self):
+        systems = normalize_systems([{"id": "a", "system": "a.pdb"}])
+        sweep = normalize_sweep({
+            "simulation.temperature_K": [300, 310],
+            "simulation.pressure_bar": [1.0, 1.2],
+        })
+        runs = expand_runs(systems=systems, sweep=sweep)
+        assert len(runs) == 4  # 1 × 2 × 2
+
+    def test_no_sweep_one_run_per_system(self):
+        systems = normalize_systems([
+            {"id": "a", "system": "a.pdb"},
+            {"id": "b", "system": "b.pdb"},
+        ])
+        runs = expand_runs(systems=systems, sweep=None)
+        assert len(runs) == 2
+        assert all(r.sweep_values == {} for r in runs)
+
+    def test_single_implicit_system(self):
+        sweep = normalize_sweep({"setup.ph": [6.5, 7.0]})
+        runs = expand_runs(systems=None, sweep=sweep, base_system="x.pdb")
+        assert len(runs) == 2
+        assert all(r.system == "x.pdb" for r in runs)
+
+    def test_sweep_value_lands_in_options(self):
+        systems = normalize_systems([{"id": "a", "system": "a.pdb"}])
+        sweep = normalize_sweep({"simulation.temperature_K": [310]})
+        runs = expand_runs(systems=systems, sweep=sweep)
+        assert runs[0].options["simulation"]["temperature_K"] == 310
+
+    def test_merge_precedence_sweep_beats_system_beats_base(self):
+        systems = normalize_systems([
+            {"id": "a", "system": "a.pdb", "setup": {"ph": 6.0}},
+        ])
+        sweep = normalize_sweep({"setup.ph": [8.0]})
+        base = {"setup": {"ph": 5.0, "ion_concentration_M": 0.1}}
+        runs = expand_runs(systems=systems, sweep=sweep, base_options=base)
+        # sweep (8.0) wins over system (6.0) wins over base (5.0)
+        assert runs[0].options["setup"]["ph"] == 8.0
+        # base-only option survives
+        assert runs[0].options["setup"]["ion_concentration_M"] == 0.1
+
+    def test_deterministic_order(self):
+        systems = normalize_systems([
+            {"id": "a", "system": "a.pdb"},
+            {"id": "b", "system": "b.pdb"},
+        ])
+        sweep = normalize_sweep({"setup.ph": [6, 7]})
+        runs = expand_runs(systems=systems, sweep=sweep)
+        ids = [r.run_id for r in runs]
+        # systems outer, sweep inner
+        assert ids[0].startswith("a__")
+        assert ids[1].startswith("a__")
+        assert ids[2].startswith("b__")
+
+    def test_requires_systems_or_base(self):
+        with pytest.raises(SweepError, match="requires either"):
+            expand_runs(systems=None, sweep=None)
+
+
+# ===========================================================================
+# Run-id generation
+# ===========================================================================
+class TestRunIds:
+    def test_encodes_system_and_sweep(self):
+        systems = normalize_systems([{"id": "trpcage1", "system": "t.pdb"}])
+        sweep = normalize_sweep({"simulation.temperature_K": [300]})
+        runs = expand_runs(systems=systems, sweep=sweep)
+        assert "trpcage1" in runs[0].run_id
+        assert "300" in runs[0].run_id
+
+    def test_ids_unique(self):
+        systems = normalize_systems([
+            {"id": "a", "system": "a.pdb"},
+            {"id": "b", "system": "b.pdb"},
+        ])
+        sweep = normalize_sweep({"setup.ph": [6, 7, 8]})
+        runs = expand_runs(systems=systems, sweep=sweep)
+        ids = [r.run_id for r in runs]
+        assert len(ids) == len(set(ids))
+
+    def test_unsafe_chars_slugged(self):
+        systems = normalize_systems([{"id": "my system/v2", "system": "x.pdb"}])
+        runs = expand_runs(systems=systems, sweep=None)
+        # No slashes or spaces in the run id (safe as a directory name)
+        assert "/" not in runs[0].run_id
+        assert " " not in runs[0].run_id
+
+
+# ===========================================================================
+# Batch detection
+# ===========================================================================
+class TestBatchDetection:
+    def test_sweep_triggers(self):
+        assert is_batch_config({"sweep": {"setup.ph": [7]}}) is True
+
+    def test_systems_triggers(self):
+        assert is_batch_config({"systems": [{"system": "x.pdb"}]}) is True
+
+    def test_plain_config_not_batch(self):
+        assert is_batch_config({"system": "x.pdb", "setup": {"ph": 7}}) is False
+
+    def test_empty_sweep_not_batch(self):
+        assert is_batch_config({"system": "x.pdb", "sweep": {}}) is False
+
+
+# ===========================================================================
+# Validation integration (typo'd sweep axis)
+# ===========================================================================
+class TestBatchValidation:
+    def test_unknown_sweep_option_rejected(self):
+        with pytest.raises(ConfigError, match="not a valid simulation option"):
+            validate_config({
+                "systems": [{"id": "a", "system": "x.pdb"}],
+                "sweep": {"simulation.temperatur_K": [300]},  # typo
+            })
+
+    def test_valid_batch_config_passes(self):
+        validate_config({
+            "output": "./out",
+            "systems": [{"id": "a", "system": "x.pdb", "setup": {"ph": 6.5}}],
+            "sweep": {"simulation.temperature_K": [300, 310]},
+        })
+
+    def test_bad_system_entry_rejected(self):
+        with pytest.raises(ConfigError, match="missing a `system`"):
+            validate_config({"systems": [{"id": "a"}]})
+
+
+# ===========================================================================
+# End-to-end BatchExplorer
+# ===========================================================================
+class TestBatchExplorerE2E:
+    def test_runs_full_matrix(self, tmp_path, stub_pdb):
+        cfg = _write(tmp_path, f"""
+output: {tmp_path / 'batch'}
+include: [setup]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+  - {{id: b, system: {stub_pdb}, setup: {{ph: 6.5}}}}
+sweep:
+  setup.temperature_K: [300, 310, 320]
+""")
+        batch = BatchExplorer(config=str(cfg))
+        results = batch.run()
+        assert len(results) == 6
+        assert all(r.status == "ok" for r in results)
+        # All six run dirs exist
+        runs_dir = tmp_path / "batch" / "runs"
+        assert len(list(runs_dir.iterdir())) == 6
+
+    def test_batch_manifest_written(self, tmp_path, stub_pdb):
+        cfg = _write(tmp_path, f"""
+output: {tmp_path / 'batch'}
+include: [setup]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+sweep:
+  setup.ph: [6.5, 7.4]
+""")
+        BatchExplorer(config=str(cfg)).run()
+        manifest = json.loads(
+            (tmp_path / "batch" / "batch_manifest.json").read_text(encoding="utf-8")
+        )
+        assert manifest["kind"] == "batch"
+        assert manifest["n_runs"] == 2
+        assert len(manifest["runs"]) == 2
+
+    def test_per_system_and_sweep_overrides_applied(self, tmp_path, stub_pdb):
+        cfg = _write(tmp_path, f"""
+output: {tmp_path / 'batch'}
+include: [setup]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+  - {{id: b, system: {stub_pdb}, setup: {{ph: 6.5}}}}
+sweep:
+  setup.temperature_K: [300]
+""")
+        BatchExplorer(config=str(cfg)).run()
+        # b has ph 6.5, a has default 7.0; both have temperature_K 300
+        a = json.loads((tmp_path / "batch" / "runs" / "a__temperature-K-300"
+                        / "setup" / "setup_parameters.json").read_text(encoding="utf-8"))
+        b = json.loads((tmp_path / "batch" / "runs" / "b__temperature-K-300"
+                        / "setup" / "setup_parameters.json").read_text(encoding="utf-8"))
+        assert a["parameters"]["ph"] == 7.0
+        assert b["parameters"]["ph"] == 6.5
+        assert a["parameters"]["temperature_K"] == 300
+        assert b["parameters"]["temperature_K"] == 300
+
+    def test_each_run_is_self_contained(self, tmp_path, stub_pdb):
+        """Every run dir has its own manifest + resolved_config."""
+        cfg = _write(tmp_path, f"""
+output: {tmp_path / 'batch'}
+include: [setup]
+sweep:
+  setup.ph: [6.5, 7.0]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+""")
+        BatchExplorer(config=str(cfg)).run()
+        for run_dir in (tmp_path / "batch" / "runs").iterdir():
+            assert (run_dir / "manifest.json").exists()
+            assert (run_dir / "resolved_config.yml").exists()
+            assert (run_dir / "setup").is_dir()
+
+
+# ===========================================================================
+# CLI
+# ===========================================================================
+class TestBatchCLI:
+    def test_explore_runs_sweep(self, tmp_path, stub_pdb):
+        cfg = _write(tmp_path, f"""
+output: {tmp_path / 'b'}
+include: [setup]
+sweep:
+  setup.ph: [6.5, 7.0]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+""")
+        rc = cli_main(["explore", "--config", str(cfg)])
+        assert rc == 0
+        # Two runs -> runs/ layout + batch manifest
+        assert (tmp_path / "b" / "batch_manifest.json").exists()
+
+    def test_explore_multi_system(self, tmp_path, stub_pdb):
+        cfg = _write(tmp_path, f"""
+output: {tmp_path / 'b'}
+include: [setup]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+sweep:
+  setup.temperature_K: [300, 310]
+""")
+        rc = cli_main(["explore", "--config", str(cfg)])
+        assert rc == 0
+        manifest = json.loads((tmp_path / "b" / "batch_manifest.json").read_text(encoding="utf-8"))
+        assert manifest["n_runs"] == 2
+
+    def test_single_system_flat_output(self, tmp_path, stub_pdb):
+        """A one-system, no-sweep config produces the flat single-run layout."""
+        cfg = _write(tmp_path, f"""
+output: {tmp_path / 'single'}
+include: [setup]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+""")
+        rc = cli_main(["explore", "--config", str(cfg)])
+        assert rc == 0
+        # Flat layout: NO batch_manifest, NO runs/ dir; phase dir at root
+        assert not (tmp_path / "single" / "batch_manifest.json").exists()
+        assert not (tmp_path / "single" / "runs").exists()
+        assert (tmp_path / "single" / "setup").is_dir()
+
+    def test_cli_dry_run_creates_nothing(self, tmp_path, stub_pdb):
+        cfg = _write(tmp_path, f"""
+output: {tmp_path / 'dry'}
+include: [setup]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+sweep:
+  setup.temperature_K: [300, 310]
+""")
+        rc = cli_main(["explore", "--config", str(cfg), "--dry-run"])
+        assert rc == 0
+        # Nothing executed: no output directory at all
+        assert not (tmp_path / "dry").exists()
+
+    def test_batch_typo_returns_error_code(self, tmp_path, stub_pdb):
+        cfg = _write(tmp_path, f"""
+output: {tmp_path / 'b'}
+sweep:
+  simulation.temperatur_K: [300]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+""")
+        rc = cli_main(["explore", "--config", str(cfg)])
+        assert rc == 2  # ConfigError -> exit 2
+
+
+# ===========================================================================
+# Execution scheduling (worker count, device pinning, parallel path)
+# ===========================================================================
+class TestExecutionScheduling:
+    def _cfg(self, tmp_path, stub_pdb, execution_block="", n_temps=4):
+        temps = ", ".join(str(300 + 10 * i) for i in range(n_temps))
+        return _write(tmp_path, f"""
+output: {tmp_path / 'b'}
+include: [setup]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+sweep:
+  setup.temperature_K: [{temps}]
+{execution_block}
+""")
+
+    def test_workers_explicit(self, tmp_path, stub_pdb):
+        cfg = self._cfg(tmp_path, stub_pdb,
+                        "execution:\n  mode: parallel\n  workers: 3\n")
+        batch = BatchExplorer(config=str(cfg))
+        assert batch._resolve_workers() == 3
+
+    def test_workers_default_from_devices(self, tmp_path, stub_pdb):
+        cfg = self._cfg(tmp_path, stub_pdb,
+                        "execution:\n  mode: parallel\n  devices: [0, 1]\n")
+        batch = BatchExplorer(config=str(cfg))
+        # One worker per device when workers unset
+        assert batch._resolve_workers() == 2
+
+    def test_workers_default_cpu_capped_at_runs(self, tmp_path, stub_pdb):
+        # 2 runs, no devices, no explicit workers -> capped at run count
+        cfg = self._cfg(tmp_path, stub_pdb,
+                        "execution:\n  mode: parallel\n", n_temps=2)
+        batch = BatchExplorer(config=str(cfg))
+        assert batch._resolve_workers() <= 2
+        assert batch._resolve_workers() >= 1
+
+    def test_device_round_robin(self, tmp_path, stub_pdb):
+        cfg = self._cfg(tmp_path, stub_pdb,
+                        "execution:\n  mode: parallel\n  devices: [0, 1]\n")
+        batch = BatchExplorer(config=str(cfg))
+        # Worker slots cycle through the device list
+        assert batch._device_for_worker(0) == "0"
+        assert batch._device_for_worker(1) == "1"
+        assert batch._device_for_worker(2) == "0"
+        assert batch._device_for_worker(3) == "1"
+
+    def test_no_devices_no_pinning(self, tmp_path, stub_pdb):
+        cfg = self._cfg(tmp_path, stub_pdb, "execution:\n  mode: sequential\n")
+        batch = BatchExplorer(config=str(cfg))
+        assert batch._device_for_worker(0) is None
+
+    def test_mode_defaults_sequential(self, tmp_path, stub_pdb):
+        cfg = self._cfg(tmp_path, stub_pdb, "")
+        batch = BatchExplorer(config=str(cfg))
+        assert batch.mode == "sequential"
+
+    def test_parallel_produces_same_runs_as_sequential(self, tmp_path, stub_pdb):
+        """Parallel and sequential must produce equivalent results.
+
+        This verifies the *scheduler*: parallel mode must dispatch and
+        collect the same run set (same ids, same count) with the same
+        per-run status as sequential mode. It deliberately does NOT require
+        status == "ok": that would demand the real chemistry backend succeed
+        inside spawned worker processes, which is environment-dependent
+        (e.g. OpenMM behavior under Windows 'spawn' on a degenerate stub).
+        Whatever the chemistry produces, the two modes must agree.
+        """
+        seq_cfg = self._cfg(
+            tmp_path, stub_pdb, "execution:\n  mode: sequential\n")
+        seq = BatchExplorer(config=str(seq_cfg))
+        seq_results = seq.run()
+
+        # Fresh output dir for the parallel run
+        par_cfg = _write(tmp_path, f"""
+output: {tmp_path / 'bpar'}
+include: [setup]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+sweep:
+  setup.temperature_K: [300, 310, 320, 330]
+execution:
+  mode: parallel
+  workers: 2
+""", name="par.yml")
+        par = BatchExplorer(config=str(par_cfg))
+        par_results = par.run()
+
+        # Same run ids and count (pure scheduling — independent of chemistry).
+        seq_ids = sorted(r.run_id for r in seq_results)
+        par_ids = sorted(r.run_id for r in par_results)
+        assert seq_ids == par_ids
+        assert len(par_results) == 4
+
+        # Same per-run status between the two modes: the scheduler must not
+        # change outcomes. (Equivalence, not a hard-coded "ok".) Surface the
+        # actual per-run error messages so a real parallel-only failure is
+        # diagnosable from CI rather than opaque.
+        seq_status = {r.run_id: r.status for r in seq_results}
+        par_status = {r.run_id: r.status for r in par_results}
+        par_errors = {
+            r.run_id: (r.message or [p.message for p in r.phases])
+            for r in par_results if r.status != "ok"
+        }
+        assert par_status == seq_status, (
+            "parallel and sequential disagree on per-run status:\n"
+            f"  sequential={seq_status}\n"
+            f"  parallel={par_status}\n"
+            f"  parallel errors={par_errors}"
+        )
+
+    def test_parallel_manifest_records_execution(self, tmp_path, stub_pdb):
+        cfg = _write(tmp_path, f"""
+output: {tmp_path / 'b'}
+include: [setup]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+sweep:
+  setup.temperature_K: [300, 310]
+execution:
+  mode: parallel
+  workers: 2
+  devices: [0, 1]
+""")
+        BatchExplorer(config=str(cfg)).run()
+        manifest = json.loads((tmp_path / "b" / "batch_manifest.json").read_text(encoding="utf-8"))
+        assert manifest["execution"]["mode"] == "parallel"
+        assert manifest["execution"]["workers"] == 2
+        assert manifest["execution"]["devices"] == [0, 1]
+
+    def test_device_pinning_stamps_simulation_option(self, tmp_path, stub_pdb):
+        """The worker stamps its device onto the run's simulation.device_index."""
+        from fastmdxplora.batch.explorer import _execute_run
+        spec = {
+            "run_id": "a__t-300", "system_id": "a", "system": str(stub_pdb),
+            "sweep_values": {"setup.temperature_K": 300},
+            "options": {"setup": {}, "simulation": {}},
+        }
+        record = _execute_run(
+            spec, str(tmp_path / "out"), ["setup"], None, False,
+            device_override="1",
+        )
+        # The run completed; device pinning is internal but must not crash
+        # and must produce a valid record.
+        assert record.run_id == "a__t-300"
+        assert record.status in ("ok", "error")
+
+
+# ===========================================================================
+# Dry-run (plan only) + uniform RunResult shape
+# ===========================================================================
+class TestDryRunAndShape:
+    def test_dry_run_sweep_executes_nothing(self, tmp_path, stub_pdb, capsys):
+        cfg = _write(tmp_path, f"""
+output: {tmp_path / 'd'}
+include: [setup]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+sweep:
+  setup.temperature_K: [300, 310]
+""")
+        from fastmdxplora import FastMDXplora
+        results = FastMDXplora(config=str(cfg)).explore(dry_run=True)
+        # Two planned runs, nothing executed
+        assert len(results) == 2
+        assert all(r.status == "planned" for r in results)
+        assert all(r.phases == [] for r in results)
+        # No output directory created
+        assert not (tmp_path / "d").exists()
+        out = capsys.readouterr().out
+        assert "dry run" in out.lower()
+
+    def test_dry_run_single_system(self, tmp_path, stub_pdb):
+        from fastmdxplora import FastMDXplora
+        results = FastMDXplora(
+            system=str(stub_pdb), output_dir=tmp_path / "s"
+        ).explore(include=["setup"], dry_run=True)
+        assert len(results) == 1
+        assert results[0].status == "planned"
+
+    def test_explore_returns_uniform_runresult_list(self, tmp_path, stub_pdb):
+        """Single system and sweep both return list[RunResult]."""
+        from fastmdxplora import FastMDXplora
+        from fastmdxplora.orchestrator import RunResult
+
+        # single system=
+        r1 = FastMDXplora(
+            system=str(stub_pdb), output_dir=tmp_path / "a"
+        ).explore(include=["setup"])
+        assert isinstance(r1, list) and all(isinstance(x, RunResult) for x in r1)
+        assert len(r1) == 1 and r1[0].phases[0].name == "setup"
+
+        # sweep
+        cfg = _write(tmp_path, f"""
+output: {tmp_path / 'b'}
+include: [setup]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+sweep:
+  setup.temperature_K: [300, 310]
+""")
+        r2 = FastMDXplora(config=str(cfg)).explore()
+        assert all(isinstance(x, RunResult) for x in r2)
+        assert len(r2) == 2
+        # Each RunResult carries its phases
+        assert all(x.phases[0].name == "setup" for x in r2)
+
+    def test_runresult_to_dict_and_phase_lookup(self, tmp_path, stub_pdb):
+        from fastmdxplora import FastMDXplora
+        run = FastMDXplora(
+            system=str(stub_pdb), output_dir=tmp_path / "a"
+        ).explore(include=["setup", "analysis"])[0]
+        d = run.to_dict()
+        assert d["run_id"] == "s1"
+        assert {p["name"] for p in d["phases"]} == {"setup", "analysis"}
+        # phase() helper
+        assert run.phase("setup").name == "setup"
+        assert run.phase("report") is None

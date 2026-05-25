@@ -1,0 +1,34 @@
+# Conda environment for FastMDXplora.
+#
+# Creates an environment named `fastmdxplora` with the full dependency
+# stack, including the molecular-dynamics chemistry tools (OpenMM,
+# PDBFixer) that drive the setup and simulation phases. These come from
+# conda-forge, where they are reliably packaged across platforms.
+#
+# Create it with mamba (faster solver) and fall back to conda:
+#
+#     mamba env create -f environment.yml || conda env create -f environment.yml
+#     conda activate fastmdxplora
+#     pip install .            # or `pip install -e ".[test]"` for development
+#
+# The OpenMM/PDBFixer packages are what make conda the recommended route;
+# the rest of the stack is pip-installable, so analysis + report also work
+# from a plain `pip install fastmdxplora` without this environment.
+name: fastmdxplora
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.9
+  - pip
+  # Core (analysis + report)
+  - numpy>=1.22
+  - pyyaml>=6.0
+  - mdtraj>=1.9.7
+  - matplotlib>=3.5
+  - scikit-learn>=1.0
+  - pandas>=1.4
+  - python-pptx>=0.6.21
+  # Molecular-dynamics chemistry stack (setup + simulation phases)
+  - openmm>=8.0
+  - pdbfixer
+  - openmmforcefields

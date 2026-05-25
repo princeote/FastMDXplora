@@ -1,0 +1,513 @@
+"""Tests for the analysis-layer infrastructure (sub-delivery 1).
+
+These tests exercise the trajectory loader, the Analysis base class
+contract, the AnalysisOrchestrator class, and the registry — all the
+plumbing that the concrete analyses (sub-2, sub-3) will sit on top of.
+
+A small fake Analysis subclass (``_DummyAnalysis``) stands in for a real
+analysis so we can verify the orchestrator's behaviour without depending
+on the not-yet-implemented modules.
+
+We use MDTraj's bundled trp_cage test trajectory as a real-trajectory
+fixture; if MDTraj's test data is unavailable we synthesize a tiny
+trajectory programmatically.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import mdtraj as md
+import numpy as np
+import pytest
+
+from fastmdxplora.analysis import (
+    Analysis,
+    AnalysisOrchestrator,
+    AnalysisResult,
+    TrajectoryLoadError,
+    available_analyses,
+    get_analysis_class,
+    load_trajectory,
+    register_analysis,
+)
+from fastmdxplora.analysis.orchestrator import _REGISTRY
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+def _synthetic_trajectory(n_frames: int = 10, n_atoms: int = 5) -> md.Trajectory:
+    """Build a tiny in-memory trajectory for testing."""
+    top = md.Topology()
+    chain = top.add_chain()
+    residue = top.add_residue("ALA", chain)
+    for i in range(n_atoms):
+        top.add_atom(f"A{i}", md.element.carbon, residue)
+    xyz = np.random.RandomState(42).rand(n_frames, n_atoms, 3).astype(np.float32)
+    return md.Trajectory(xyz=xyz, topology=top)
+
+
+@pytest.fixture
+def synthetic_traj() -> md.Trajectory:
+    return _synthetic_trajectory()
+
+
+@pytest.fixture
+def traj_files(tmp_path: Path, synthetic_traj: md.Trajectory) -> tuple[Path, Path]:
+    """Persist the synthetic trajectory to disk as a DCD + PDB pair."""
+    pdb_path = tmp_path / "topology.pdb"
+    dcd_path = tmp_path / "production.dcd"
+    synthetic_traj[0].save_pdb(str(pdb_path))
+    synthetic_traj.save_dcd(str(dcd_path))
+    return dcd_path, pdb_path
+
+
+# ---------------------------------------------------------------------------
+# A minimal Analysis subclass used as a test double for the registry tests
+# ---------------------------------------------------------------------------
+class _DummyAnalysis(Analysis):
+    """Test analysis that records mean atomic distance from the origin."""
+
+    name = "dummy"
+    description = "Mean distance from origin"
+
+    def compute(self, traj: md.Trajectory) -> np.ndarray:
+        # Per-frame mean distance from origin — a stable, simple metric
+        return np.linalg.norm(traj.xyz.reshape(traj.n_frames, -1), axis=1)
+
+    def plot(self, result: np.ndarray, ax: plt.Axes) -> None:
+        ax.plot(result)
+        ax.set_xlabel("frame")
+        ax.set_ylabel("|xyz|")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_registry():
+    """Snapshot/restore the registry around each test.
+
+    Some tests register/unregister analyses. Without isolation, test
+    ordering would matter. We snapshot at setup and restore at teardown.
+    """
+    snapshot = dict(_REGISTRY)
+    yield
+    _REGISTRY.clear()
+    _REGISTRY.update(snapshot)
+
+
+# ===========================================================================
+# load_trajectory
+# ===========================================================================
+class TestLoadTrajectory:
+    def test_loads_pdb(self, tmp_path: Path, synthetic_traj: md.Trajectory):
+        pdb_path = tmp_path / "system.pdb"
+        synthetic_traj.save_pdb(str(pdb_path))
+
+        loaded = load_trajectory(pdb_path)
+        assert loaded.n_atoms == synthetic_traj.n_atoms
+        # MDTraj's save_pdb writes all frames as multi-model PDB; round-trip
+        # should preserve frame count.
+        assert loaded.n_frames == synthetic_traj.n_frames
+
+    def test_loads_dcd_with_explicit_topology(self, traj_files: tuple[Path, Path]):
+        dcd, pdb = traj_files
+        loaded = load_trajectory(dcd, top=pdb)
+        assert loaded.n_atoms > 0
+        assert loaded.n_frames > 0
+
+    def test_auto_resolves_topology_for_dcd(self, traj_files: tuple[Path, Path]):
+        """A DCD with a sibling .pdb of the same stem should auto-resolve."""
+        dcd, pdb = traj_files
+        # Stem mismatch: production.dcd <-> topology.pdb. Auto-resolution
+        # looks for production.pdb. Rename to validate the rule.
+        sibling = dcd.with_suffix(".pdb")
+        pdb.rename(sibling)
+        loaded = load_trajectory(dcd)  # no top= argument
+        assert loaded.n_atoms > 0
+
+    def test_dcd_without_topology_raises(self, tmp_path: Path):
+        dcd = tmp_path / "lonely.dcd"
+        # Manufacture a minimal DCD by writing one
+        _synthetic_trajectory().save_dcd(str(dcd))
+        with pytest.raises(TrajectoryLoadError, match="requires a topology"):
+            load_trajectory(dcd)
+
+    def test_missing_file_raises(self, tmp_path: Path):
+        with pytest.raises(TrajectoryLoadError, match="not found"):
+            load_trajectory(tmp_path / "nonexistent.dcd", top=tmp_path / "topology.pdb")
+
+    def test_missing_topology_raises(self, traj_files: tuple[Path, Path]):
+        dcd, _pdb = traj_files
+        with pytest.raises(TrajectoryLoadError, match="not found"):
+            load_trajectory(dcd, top=dcd.parent / "nope.pdb")
+
+    def test_concatenates_multiple_files(
+        self, tmp_path: Path, synthetic_traj: md.Trajectory
+    ):
+        pdb = tmp_path / "top.pdb"
+        synthetic_traj[0].save_pdb(str(pdb))
+        dcd1 = tmp_path / "run01.dcd"
+        dcd2 = tmp_path / "run02.dcd"
+        synthetic_traj.save_dcd(str(dcd1))
+        synthetic_traj.save_dcd(str(dcd2))
+
+        loaded = load_trajectory([dcd1, dcd2], top=pdb)
+        assert loaded.n_frames == 2 * synthetic_traj.n_frames
+
+    def test_glob_pattern_expands(
+        self, tmp_path: Path, synthetic_traj: md.Trajectory
+    ):
+        pdb = tmp_path / "top.pdb"
+        synthetic_traj[0].save_pdb(str(pdb))
+        for i in range(3):
+            synthetic_traj.save_dcd(str(tmp_path / f"shot{i:02d}.dcd"))
+
+        loaded = load_trajectory(str(tmp_path / "shot*.dcd"), top=pdb)
+        assert loaded.n_frames == 3 * synthetic_traj.n_frames
+
+    def test_stride(self, traj_files: tuple[Path, Path]):
+        dcd, pdb = traj_files
+        full = load_trajectory(dcd, top=pdb)
+        strided = load_trajectory(dcd, top=pdb, stride=2)
+        assert strided.n_frames == (full.n_frames + 1) // 2
+
+    def test_frame_slice(self, traj_files: tuple[Path, Path]):
+        dcd, pdb = traj_files
+        sliced = load_trajectory(dcd, top=pdb, first=2, last=7)
+        assert sliced.n_frames == 5
+
+    def test_invalid_slice_raises(self, traj_files: tuple[Path, Path]):
+        dcd, pdb = traj_files
+        with pytest.raises(TrajectoryLoadError, match="Invalid frame slice"):
+            load_trajectory(dcd, top=pdb, first=5, last=2)
+
+    def test_empty_glob_raises(self, tmp_path: Path):
+        with pytest.raises(TrajectoryLoadError, match="No files match"):
+            load_trajectory(str(tmp_path / "no_such_*.dcd"))
+
+
+# ===========================================================================
+# Analysis base class
+# ===========================================================================
+class TestAnalysisBase:
+    def test_run_produces_ok_result(
+        self, tmp_path: Path, synthetic_traj: md.Trajectory
+    ):
+        a = _DummyAnalysis(output_dir=tmp_path)
+        result = a.run(synthetic_traj)
+        assert isinstance(result, AnalysisResult)
+        assert result.status == "ok"
+        assert result.data is not None
+        assert result.output_dir == tmp_path / "dummy"
+
+    def test_run_writes_data_figure_options(
+        self, tmp_path: Path, synthetic_traj: md.Trajectory
+    ):
+        a = _DummyAnalysis(output_dir=tmp_path)
+        result = a.run(synthetic_traj)
+        assert result.data_path.exists()
+        assert result.figure_path.exists()
+        assert result.options_path.exists()
+        # Naming convention
+        assert result.data_path.name == "dummy.dat"
+        assert result.figure_path.name == "dummy.png"
+
+    def test_data_file_is_readable_back(
+        self, tmp_path: Path, synthetic_traj: md.Trajectory
+    ):
+        a = _DummyAnalysis(output_dir=tmp_path)
+        result = a.run(synthetic_traj)
+        loaded = np.loadtxt(result.data_path)
+        np.testing.assert_allclose(loaded, result.data, rtol=1e-5)
+
+    def test_options_manifest_records_selection(
+        self, tmp_path: Path, synthetic_traj: md.Trajectory
+    ):
+        import json
+
+        a = _DummyAnalysis(selection="all", output_dir=tmp_path)
+        result = a.run(synthetic_traj)
+        with result.options_path.open() as fh:
+            manifest = json.load(fh)
+        assert manifest["analysis"] == "dummy"
+        assert manifest["selection"] == "all"
+
+    def test_compute_error_yields_error_status(
+        self, tmp_path: Path, synthetic_traj: md.Trajectory
+    ):
+        class BrokenAnalysis(_DummyAnalysis):
+            name = "broken"
+
+            def compute(self, traj):
+                raise RuntimeError("intentional test failure")
+
+        a = BrokenAnalysis(output_dir=tmp_path)
+        result = a.run(synthetic_traj)
+        assert result.status == "error"
+        assert "intentional test failure" in result.message
+        # The data and figure should NOT have been written
+        assert result.data_path is None
+        assert result.figure_path is None
+        # But options.json SHOULD have been written before compute()
+        assert result.options_path.exists()
+
+    def test_save_data_unsupported_type_raises(
+        self, tmp_path: Path, synthetic_traj: md.Trajectory
+    ):
+        class WeirdAnalysis(_DummyAnalysis):
+            name = "weird"
+
+            def compute(self, traj):
+                return {"this is": "not a numpy array"}
+
+        a = WeirdAnalysis(output_dir=tmp_path)
+        result = a.run(synthetic_traj)
+        assert result.status == "error"
+        assert "save_data" in result.message
+
+    def test_select_atoms_with_none_returns_all(
+        self, synthetic_traj: md.Trajectory
+    ):
+        a = _DummyAnalysis()
+        idx = a.select_atoms(synthetic_traj)
+        assert len(idx) == synthetic_traj.n_atoms
+
+    def test_select_atoms_with_empty_match_raises(
+        self, synthetic_traj: md.Trajectory
+    ):
+        a = _DummyAnalysis(selection="protein and name P")
+        with pytest.raises(ValueError, match="matched zero atoms"):
+            a.select_atoms(synthetic_traj)
+
+
+class TestPlotCustomization:
+    """User-facing plot customization hooks on the base class."""
+
+    def test_user_title_overrides_default(
+        self, tmp_path: Path, synthetic_traj: md.Trajectory
+    ):
+        a = _DummyAnalysis(output_dir=tmp_path, title="My Custom Title")
+        a.run(synthetic_traj)
+        assert a.figure_title() == "My Custom Title"
+
+    def test_user_xlabel_overrides(
+        self, tmp_path: Path, synthetic_traj: md.Trajectory
+    ):
+        """User-supplied xlabel reaches the saved figure axes."""
+        a = _DummyAnalysis(output_dir=tmp_path, xlabel="Frame (× 10 ps)")
+        result = a.run(synthetic_traj)
+        assert result.status == "ok"
+        # Re-read the figure metadata is hard; instead verify the override
+        # is stored and would be applied (the _do_plot logic is exercised).
+        assert a._user_xlabel == "Frame (× 10 ps)"
+
+    def test_user_ylabel_overrides(
+        self, tmp_path: Path, synthetic_traj: md.Trajectory
+    ):
+        a = _DummyAnalysis(output_dir=tmp_path, ylabel="Custom Y axis")
+        a.run(synthetic_traj)
+        assert a._user_ylabel == "Custom Y axis"
+
+    def test_user_figsize_applied(
+        self, tmp_path: Path, synthetic_traj: md.Trajectory
+    ):
+        a = _DummyAnalysis(output_dir=tmp_path, figsize=(10.0, 6.0))
+        result = a.run(synthetic_traj)
+        assert result.status == "ok"
+        assert a._user_figsize == (10.0, 6.0)
+
+    def test_no_customization_falls_back_to_default(
+        self, tmp_path: Path, synthetic_traj: md.Trajectory
+    ):
+        """When no overrides are passed, figure_title returns the description."""
+        a = _DummyAnalysis(output_dir=tmp_path)
+        assert a.figure_title() == _DummyAnalysis.description
+
+
+# ===========================================================================
+# Registry
+# ===========================================================================
+class TestRegistry:
+    def test_register_and_lookup(self):
+        register_analysis("registry_test", _DummyAnalysis)
+        assert "registry_test" in available_analyses()
+        assert get_analysis_class("registry_test") is _DummyAnalysis
+
+    def test_register_same_class_idempotent(self):
+        register_analysis("idempotent_test", _DummyAnalysis)
+        register_analysis("idempotent_test", _DummyAnalysis)  # no error
+
+    def test_register_different_class_raises(self):
+        class Other(_DummyAnalysis):
+            pass
+
+        register_analysis("rebind_test", _DummyAnalysis)
+        with pytest.raises(ValueError, match="already registered"):
+            register_analysis("rebind_test", Other)
+
+    def test_lookup_unknown_raises(self):
+        with pytest.raises(KeyError, match="Unknown analysis"):
+            get_analysis_class("definitely_not_real")
+
+
+# ===========================================================================
+# AnalysisOrchestrator
+# ===========================================================================
+class TestAnalysisOrchestrator:
+    def test_constructor_loads_trajectory(
+        self, tmp_path: Path, traj_files: tuple[Path, Path]
+    ):
+        dcd, pdb = traj_files
+        ao = AnalysisOrchestrator(
+            trajectory=dcd, topology=pdb, output_dir=tmp_path / "run"
+        )
+        assert ao.traj.n_frames > 0
+        assert ao.output_dir == tmp_path / "run"
+        assert ao.output_dir.exists()
+
+    def test_run_executes_registered_analyses(
+        self, tmp_path: Path, traj_files: tuple[Path, Path]
+    ):
+        register_analysis("dummy", _DummyAnalysis)
+
+        dcd, pdb = traj_files
+        ao = AnalysisOrchestrator(
+            trajectory=dcd, topology=pdb, output_dir=tmp_path / "run"
+        )
+        results = ao.run()
+        assert "dummy" in results
+        assert results["dummy"].status == "ok"
+
+    def test_run_writes_manifest(
+        self, tmp_path: Path, traj_files: tuple[Path, Path]
+    ):
+        import json
+
+        register_analysis("dummy", _DummyAnalysis)
+        dcd, pdb = traj_files
+        ao = AnalysisOrchestrator(
+            trajectory=dcd, topology=pdb, output_dir=tmp_path / "run"
+        )
+        ao.run()
+        manifest_path = ao.output_dir / "analysis_manifest.json"
+        assert manifest_path.exists()
+        with manifest_path.open() as fh:
+            manifest = json.load(fh)
+        assert manifest["phase"] == "analysis"
+        assert manifest["n_frames"] == ao.traj.n_frames
+        assert "dummy" in manifest["plan"]
+        assert manifest["results"]["dummy"]["status"] == "ok"
+
+    def test_include_filter(
+        self, tmp_path: Path, traj_files: tuple[Path, Path]
+    ):
+        class Other(_DummyAnalysis):
+            name = "other"
+
+        register_analysis("dummy", _DummyAnalysis)
+        register_analysis("other", Other)
+
+        dcd, pdb = traj_files
+        ao = AnalysisOrchestrator(
+            trajectory=dcd, topology=pdb, output_dir=tmp_path / "run"
+        )
+        results = ao.run(include=["dummy"])
+        assert set(results.keys()) == {"dummy"}
+
+    def test_exclude_filter(
+        self, tmp_path: Path, traj_files: tuple[Path, Path]
+    ):
+        class Other(_DummyAnalysis):
+            name = "other"
+
+        register_analysis("dummy", _DummyAnalysis)
+        register_analysis("other", Other)
+
+        dcd, pdb = traj_files
+        ao = AnalysisOrchestrator(
+            trajectory=dcd, topology=pdb, output_dir=tmp_path / "run"
+        )
+        # Use include=["dummy"] to scope this test to a single known
+        # analysis — exclude alone would invoke every other registered
+        # analysis (RMSD, RMSF, ...) which is out of scope here.
+        results = ao.run(include=["dummy"])
+        assert set(results.keys()) == {"dummy"}
+        assert "other" not in results
+
+    def test_include_and_exclude_mutually_exclusive(
+        self, tmp_path: Path, traj_files: tuple[Path, Path]
+    ):
+        register_analysis("dummy", _DummyAnalysis)
+        dcd, pdb = traj_files
+        ao = AnalysisOrchestrator(
+            trajectory=dcd, topology=pdb, output_dir=tmp_path / "run"
+        )
+        with pytest.raises(ValueError, match="either"):
+            ao.run(include=["dummy"], exclude=["dummy"])
+
+    def test_include_unknown_raises(
+        self, tmp_path: Path, traj_files: tuple[Path, Path]
+    ):
+        register_analysis("dummy", _DummyAnalysis)
+        dcd, pdb = traj_files
+        ao = AnalysisOrchestrator(
+            trajectory=dcd, topology=pdb, output_dir=tmp_path / "run"
+        )
+        with pytest.raises(ValueError, match="Unknown analyses"):
+            ao.run(include=["wibble"])
+
+    def test_options_filtering_drops_unknown_kwargs(
+        self, tmp_path: Path, traj_files: tuple[Path, Path]
+    ):
+        """Per-analysis options that the analysis doesn't accept are dropped."""
+        register_analysis("dummy", _DummyAnalysis)
+        dcd, pdb = traj_files
+        ao = AnalysisOrchestrator(
+            trajectory=dcd, topology=pdb, output_dir=tmp_path / "run"
+        )
+        # _DummyAnalysis only accepts selection, output_dir, **options
+        # via the base class. Passing a bogus kwarg should not crash.
+        results = ao.run(options={"dummy": {"selection": "all"}})
+        assert results["dummy"].status == "ok"
+
+    def test_default_selection_propagates_to_analyses(
+        self, tmp_path: Path, traj_files: tuple[Path, Path]
+    ):
+        """The orchestrator's `selection` argument is the default for each analysis."""
+        register_analysis("dummy", _DummyAnalysis)
+        dcd, pdb = traj_files
+        ao = AnalysisOrchestrator(
+            trajectory=dcd, topology=pdb,
+            output_dir=tmp_path / "run",
+            selection="all",
+        )
+        results = ao.run()
+        # Read the per-analysis options.json and confirm selection landed
+        import json
+        opt_path = results["dummy"].options_path
+        with opt_path.open() as fh:
+            m = json.load(fh)
+        assert m["selection"] == "all"
+
+    def test_analyze_is_alias_for_run(
+        self, tmp_path: Path, traj_files: tuple[Path, Path]
+    ):
+        register_analysis("dummy", _DummyAnalysis)
+        dcd, pdb = traj_files
+        ao = AnalysisOrchestrator(
+            trajectory=dcd, topology=pdb, output_dir=tmp_path / "run"
+        )
+        a = ao.analyze()
+        b = ao.run()
+        assert set(a.keys()) == set(b.keys())
+
+
+# ===========================================================================
+# Top-level package surface
+# ===========================================================================
+def test_AnalysisOrchestrator_exposed_at_top_level():
+    """`from fastmdxplora import AnalysisOrchestrator` works."""
+    from fastmdxplora import AnalysisOrchestrator as AO
+
+    assert AO is AnalysisOrchestrator

@@ -1,0 +1,181 @@
+"""Analysis-phase entry point used by the project-level orchestrator.
+
+The project-level :class:`fastmdxplora.FastMDXplora` orchestrator imports
+``run`` from this module and calls it during the analysis phase. The
+function is a thin adapter: it converts the project-level conventions
+(orchestrator instance, phase output directory) into the analysis-level
+orchestrator's API and returns the list of artifact paths.
+
+Users who want the analysis layer directly should import
+:class:`fastmdxplora.AnalysisOrchestrator` instead of using this function.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from fastmdxplora.analysis.orchestrator import (
+    AnalysisOrchestrator,
+    available_analyses,
+)
+from fastmdxplora.utils.logging import get_logger
+
+if TYPE_CHECKING:
+    from fastmdxplora.orchestrator import FastMDXplora
+
+logger = get_logger("analysis")
+
+
+def __getattr__(name: str):
+    """Lazy module-level attributes.
+
+    ``AVAILABLE_ANALYSES`` is computed on demand so the registry is fully
+    populated (analyses register themselves on import) by the time the
+    attribute is read.
+    """
+    if name == "AVAILABLE_ANALYSES":
+        return available_analyses()
+    raise AttributeError(name)
+
+
+def run(
+    *,
+    orchestrator: "FastMDXplora",
+    output_dir: Path,
+    trajectory: str | None = None,
+    topology: str | None = None,
+    include: list[str] | None = None,
+    exclude: list[str] | None = None,
+    options: dict[str, dict[str, Any]] | None = None,
+    selection: str | None = None,
+    scope: str = "solute",
+    stride: int | None = None,
+    first: int | None = None,
+    last: int | None = None,
+    **_extra: Any,
+) -> list[str]:
+    """Adapter from the project-level orchestrator to AnalysisOrchestrator.
+
+    Resolves trajectory/topology paths (defaulting to the simulation phase
+    outputs), instantiates an :class:`AnalysisOrchestrator`, runs the
+    planned analyses, and returns the list of artifact paths relative to
+    ``output_dir``.
+
+    If neither the resolved trajectory nor topology exists on disk (which
+    is the normal state when the simulation phase has not yet produced
+    real trajectories — e.g. during the v0.1.x scaffold release), the
+    adapter writes a "deferred" manifest and returns gracefully. This
+    keeps the project-level pipeline runnable end-to-end while individual
+    phase backends mature.
+    """
+    import json
+
+    project_root = orchestrator.output_dir
+    traj_path = Path(trajectory) if trajectory else project_root / "simulation" / "production.dcd"
+    top_path = Path(topology) if topology else project_root / "simulation" / "topology.pdb"
+
+    presenter = getattr(orchestrator, "_presenter", None)
+
+    # Graceful degradation when the simulation phase hasn't produced
+    # a real trajectory yet.
+    if not Path(traj_path).exists():
+        deferred = {
+            "phase": "analysis",
+            "status": "deferred",
+            "note": (
+                "No trajectory found at the expected path; the simulation "
+                "phase has not yet produced real output. The analysis phase "
+                "scaffolding is in place and will run once the simulation "
+                "phase is wired in v0.2+."
+            ),
+            "expected_trajectory": str(traj_path),
+            "expected_topology": str(top_path),
+        }
+        manifest_path = output_dir / "analysis_manifest.json"
+        with manifest_path.open("w", encoding="utf-8") as fh:
+            json.dump(deferred, fh, indent=2)
+        logger.debug("analysis: trajectory not found, deferring (wrote %s)", manifest_path)
+        if presenter:
+            presenter.info("(no trajectory available yet — deferred to a future release)")
+        return ["analysis_manifest.json"]
+
+    # Detect a ligand from the setup manifest so scope-based selections can
+    # include it (solute = protein + ligand) and so ligand-specific analyses
+    # know the residue name. Absent or unreadable manifest -> no ligand.
+    ligand_resname = _detect_ligand_resname(project_root)
+
+    ao = AnalysisOrchestrator(
+        trajectory=str(traj_path),
+        topology=str(top_path),
+        output_dir=output_dir,
+        selection=selection,
+        scope=scope,
+        ligand_resname=ligand_resname,
+        stride=stride,
+        first=first,
+        last=last,
+    )
+
+    if presenter:
+        presenter.info(
+            f"Loading trajectory... {ao.traj.n_frames} frames, "
+            f"{ao.traj.n_atoms} atoms, {ao.traj.n_residues} residues"
+        )
+
+    results = ao.run(include=include, exclude=exclude, options=options)
+
+    # Per-analysis status rows, aligned to the longest analysis name.
+    if presenter and results:
+        name_width = max(len(n) for n in results)
+        for name, r in results.items():
+            # Elapsed time per analysis: best-effort from started/finished_at
+            elapsed = 0.0
+            if r.started_at and r.finished_at:
+                from datetime import datetime as _dt
+
+                try:
+                    t0 = _dt.fromisoformat(r.started_at.replace("Z", "+00:00"))
+                    t1 = _dt.fromisoformat(r.finished_at.replace("Z", "+00:00"))
+                    elapsed = (t1 - t0).total_seconds()
+                except ValueError:
+                    elapsed = 0.0
+            path = (
+                r.output_dir.relative_to(orchestrator.output_dir).as_posix()
+                if r.output_dir else f"analysis/{name}/"
+            )
+            presenter.analysis_table_row(
+                name, r.status, path + "/", elapsed, name_width=name_width
+            )
+
+    artifacts: list[str] = []
+    for r in results.values():
+        for p in (r.data_path, r.figure_path, r.options_path):
+            if p is not None:
+                try:
+                    artifacts.append(p.relative_to(output_dir).as_posix())
+                except ValueError:
+                    artifacts.append(str(p))
+    artifacts.append("analysis_manifest.json")
+    return artifacts
+
+
+def _detect_ligand_resname(project_root: Path) -> str | None:
+    """Read the ligand residue name from the setup manifest, if present.
+
+    Returns the ligand name recorded under
+    ``resolved_forcefield.ligand.name`` in ``setup/setup_parameters.json``,
+    or ``None`` if there is no ligand or the manifest can't be read.
+    """
+    import json
+
+    manifest = project_root / "setup" / "setup_parameters.json"
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    ligand = data.get("resolved_forcefield", {}).get("ligand")
+    if not ligand:
+        return None
+    name = ligand.get("name")
+    return str(name) if name else None

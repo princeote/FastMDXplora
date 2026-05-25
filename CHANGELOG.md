@@ -9,22 +9,19 @@ Versioning: [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html)
 
 ## [2.0.0] — 2026-05-25
 
-**Project renamed: FastMDAnalysis → FastMDXplora.** This is the next
-generation of FastMDAnalysis (Aina & Kwan, *J. Comput. Chem.* 2026), carrying
-its automated, reproducibility-by-design analysis forward and extending it to
-the full molecular dynamics study — setup, simulation (with enhanced
-sampling), protein and protein-ligand analysis, and reporting. The interim
-`fastmdxplorer` releases (0.1–0.3) are consolidated here under the final name.
+**FastMDXplora** — Fully Automated SysTem for Molecular Dynamics eXploration.
+A single command takes a structure (and optional bound ligand) from input to
+publication-quality deliverable across four phases: setup, simulation
+(including enhanced sampling), analysis (protein and protein-ligand), and
+reporting.
 
-### Changed
-- **Package renamed to `fastmdxplora`** (import `fastmdxplora`). The CLI
-  command remains `fastmdx`. See [MIGRATION.md](MIGRATION.md).
-- The former PyPI names remain available as redirect packages that install
-  `fastmdxplora` and re-export its namespace, so existing installs are not
-  broken: `fastmdanalysis` and `fastmdxplorer` (both deprecated, emit a
-  notice), and `fastmdx` (a supported short alias, not deprecated).
+### Packaging
+- Canonical package: **`fastmdxplora`** (`import fastmdxplora`). The CLI
+  command is **`fastmdx`**.
+- `fastmdx` remains available on PyPI as a short alias that installs and
+  re-exports `fastmdxplora`.
 
-### Included from the 0.1–0.3 interim releases
+### Features
 - End-to-end MD orchestration across four phases (setup, simulation, analysis, report).
 - Named force-field selector; OpenFF ligand/cofactor parameterization with a setup-time pose clash check.
 - Protein-ligand analyses: ligand pose RMSD, protein-ligand contacts + binding-site fingerprint, protein-ligand H-bonds, ligand RMSF — auto-detected for complexes.

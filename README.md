@@ -350,7 +350,7 @@ Each phase writes to a dedicated subdirectory under the project output root, wit
 
 ## Documentation
 
-Documentation is hosted at [fastmdxplora.readthedocs.io](https://fastmdxplora.readthedocs.io) (under development).
+Documentation is available at [fastmdxplora.readthedocs.io](https://fastmdxplora.readthedocs.io) and is actively expanding.
 
 ## Citation
 

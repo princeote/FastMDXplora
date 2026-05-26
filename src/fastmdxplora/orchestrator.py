@@ -12,7 +12,7 @@ the orchestrator:
 
 Unlike a generic workflow engine (Snakemake, Nextflow, Galaxy), the workflow
 is built-in and the user expresses intent through include/exclude and option
-overrides — not by describing a DAG (directed acyclic graph: the
+overrides, not by describing a DAG (directed acyclic graph: the
 task-and-dependency model those engines use).
 """
 
@@ -106,14 +106,16 @@ class FastMDXplora:
     ----------
     system : str | os.PathLike
         Input for a single study. Accepted forms (auto-detected):
-          - Path to a PDB / CIF file (e.g. ``"protein.pdb"``)
-          - 4-character PDB ID (e.g. ``"1L2Y"``), fetched from RCSB
-          - One-letter amino-acid sequence, if structure prediction is
-            available (future)
+
+        - Path to a PDB / CIF file (e.g. ``"protein.pdb"``)
+        - 4-character PDB ID (e.g. ``"1L2Y"``), fetched from RCSB
+        - One-letter amino-acid sequence, if structure prediction is
+          available (future)
+
         Mutually exclusive with ``config``.
     config : str | os.PathLike | None
         Path to a YAML config file. Drives one system or many (with an
-        optional parameter sweep and parallel execution) — the interface
+        optional parameter sweep and parallel execution); the interface
         is the same either way. Mutually exclusive with ``system``.
     output_dir : str | os.PathLike | None
         Where to write project outputs. Defaults to
@@ -131,13 +133,13 @@ class FastMDXplora:
     >>> fmdx = FastMDXplora(system="protein.pdb")
     >>> fmdx.explore()                          # doctest: +SKIP
 
-    >>> fmdx = FastMDXplora(system="1L2Y")     # PDB ID — fetched from RCSB
+    >>> fmdx = FastMDXplora(system="1L2Y")     # PDB ID, fetched from RCSB
     >>> fmdx.explore(                            # doctest: +SKIP
     ...     include=["setup", "simulation"],
     ...     options={"simulation": {"duration_ns": 50}},
     ... )
 
-    >>> # A config file — one system or many, same interface:
+    >>> # A config file: one system or many, same interface:
     >>> fmdx = FastMDXplora(config="study.yml")
     >>> fmdx.explore()                          # doctest: +SKIP
     """

@@ -14,7 +14,7 @@ copyright = "2026, AAI Research Lab"
 try:
     from fastmdxplora import __version__ as release
 except ImportError:
-    release = "0.1.0"
+    release = "2.0.0"
 version = ".".join(release.split(".")[:2])
 
 extensions = [
@@ -25,13 +25,42 @@ extensions = [
     "myst_parser",
 ]
 
+# MyST: allow ```{eval-rst} blocks and common extensions.
+myst_enable_extensions = [
+    "colon_fence",
+    "deflist",
+]
+
+autodoc_default_options = {
+    "members": True,
+    "undoc-members": True,
+    "show-inheritance": True,
+}
+autodoc_typehints = "description"
+autodoc_mock_imports = [
+    "openmm",
+    "openmmforcefields",
+    "openff",
+    "pdbfixer",
+    "openmmplumed",
+]
+
+napoleon_google_docstring = True
+napoleon_numpy_docstring = True
+
+intersphinx_mapping = {
+    "python": ("https://docs.python.org/3", None),
+    "numpy": ("https://numpy.org/doc/stable/", None),
+    "mdtraj": ("https://www.mdtraj.org/1.9.8.dev0/", None),
+}
+
 source_suffix = {
     ".rst": "restructuredtext",
     ".md": "markdown",
 }
 
 master_doc = "index"
-exclude_patterns = ["_build"]
+exclude_patterns = ["_build", "design"]
 
 html_theme = "sphinx_rtd_theme"
 html_static_path = ["_static"]

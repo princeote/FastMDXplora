@@ -58,6 +58,7 @@ logger = get_logger("simulation")
 
 # Default parameters — see runner.py for the precise step counts.
 DEFAULTS: dict[str, Any] = {
+    "preset": None,               # e.g. "gentle" for conservative smoke tests
     # Stages
     "minimize": True,
     "minimize_tolerance_kjmol_per_nm": 10.0,
@@ -95,6 +96,33 @@ DEFAULTS: dict[str, Any] = {
     "plumed": None,
 }
 
+PRESETS: dict[str, dict[str, Any]] = {
+    "gentle": {
+        "timestep_fs": 0.5,
+        "temperature_K": 100.0,
+        "friction_per_ps": 5.0,
+        "nvt_steps": 1000,
+        "npt_steps": 0,
+        "production_steps": 1000,
+        "duration_ns": 0.001,
+        "precision": "double",
+    },
+}
+
+
+def _resolve_params(options: dict[str, Any]) -> dict[str, Any]:
+    """Merge defaults, an optional preset, and explicit user options."""
+    preset = options.get("preset")
+    if preset is None:
+        return {**DEFAULTS, **options}
+    preset_key = str(preset).lower()
+    if preset_key not in PRESETS:
+        valid = ", ".join(sorted(PRESETS))
+        raise ValueError(f"Unknown simulation preset {preset!r}. Valid presets: {valid}.")
+    explicit = dict(options)
+    explicit["preset"] = preset_key
+    return {**DEFAULTS, **PRESETS[preset_key], **explicit}
+
 
 def _setup_outputs_present(setup_dir: Path) -> tuple[Path | None, Path | None, Path | None]:
     """Return paths to setup outputs that exist on disk, else (None, ...)."""
@@ -127,7 +155,7 @@ def run(
     list of str
         Paths (relative to ``output_dir``) of artifacts produced.
     """
-    params: dict[str, Any] = {**DEFAULTS, **options}
+    params: dict[str, Any] = _resolve_params(options)
     presenter = getattr(orchestrator, "_presenter", None)
     artifacts: list[str] = []
     notes: list[str] = []
@@ -215,6 +243,11 @@ def run(
                 artifacts.append(path.relative_to(output_dir).as_posix())
             except ValueError:
                 artifacts.append(str(path))
+        if result.minimized_state is not None:
+            try:
+                artifacts.append(result.minimized_state.relative_to(output_dir).as_posix())
+            except ValueError:
+                artifacts.append(str(result.minimized_state))
 
         if presenter:
             presenter.step(
@@ -272,6 +305,7 @@ def _write_manifest(
         "trajectory": "production.dcd",
         "topology": "topology.pdb",
         "state": "state_final.xml",
+        "minimized_state": "state_minimized.xml",
         "energy_log": "energy.csv",
         "stdout_log": "simulation.log",
         "checkpoint": "checkpoint.chk",

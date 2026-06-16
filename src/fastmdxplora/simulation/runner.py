@@ -20,6 +20,7 @@ module does not.
 from __future__ import annotations
 
 import csv
+import math
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,6 +85,7 @@ class SimulationResult:
     platform_used: str
     n_production_frames: int
     duration_ns_actual: float
+    minimized_state: Path | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +402,88 @@ def _run_minimize(
     )
 
 
+def _flatten_numbers(value: Any):
+    """Yield numeric leaves from nested OpenMM/numpy/list containers."""
+    if isinstance(value, (int, float)):
+        yield float(value)
+        return
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (str, bytes)):
+        return
+    try:
+        iterator = iter(value)
+    except TypeError:
+        return
+    for item in iterator:
+        yield from _flatten_numbers(item)
+
+
+def _value_in_unit(quantity: Any, unit_value: Any) -> Any:
+    if hasattr(quantity, "value_in_unit"):
+        return quantity.value_in_unit(unit_value)
+    return quantity
+
+
+def _validation_error(stage: str, detail: str) -> RuntimeError:
+    return RuntimeError(
+        f"Invalid simulation state after {stage}: {detail}. "
+        "Try safer settings: lower --simulate-timestep-fs, lower "
+        "--simulate-temperature-K, increase --simulate-friction-per-ps, use "
+        "--simulate-precision double, or disable NPT for the first smoke test "
+        "with --simulate-npt-steps 0."
+    )
+
+
+def _validate_state_finite(omm: dict, simulation: Any, *, stage: str) -> None:
+    """Validate finite positions and potential energy at a stage boundary."""
+    unit = omm["unit"]
+    try:
+        state = simulation.context.getState(
+            getPositions=True,
+            getEnergy=True,
+            enforcePeriodicBox=True,
+        )
+    except TypeError:
+        try:
+            state = simulation.context.getState()
+        except Exception as exc:  # noqa: BLE001
+            raise _validation_error(stage, f"could not evaluate state ({exc})") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise _validation_error(stage, f"could not evaluate state ({exc})") from exc
+
+    try:
+        positions = state.getPositions(asNumpy=True)
+    except TypeError:
+        positions = state.getPositions()
+    except AttributeError as exc:
+        raise _validation_error(stage, "positions unavailable") from exc
+
+    try:
+        position_values = _value_in_unit(positions, unit.nanometer)
+    except Exception as exc:  # noqa: BLE001
+        raise _validation_error(stage, f"could not read positions ({exc})") from exc
+    position_numbers = list(_flatten_numbers(position_values))
+    if not position_numbers:
+        raise _validation_error(stage, "no positions found")
+    if not all(math.isfinite(x) for x in position_numbers):
+        raise _validation_error(stage, "positions contain NaN or Inf")
+
+    try:
+        energy = state.getPotentialEnergy()
+    except AttributeError as exc:
+        raise _validation_error(stage, "potential energy unavailable") from exc
+    try:
+        energy_value = _value_in_unit(energy, unit.kilojoules_per_mole)
+    except Exception as exc:  # noqa: BLE001
+        raise _validation_error(stage, f"could not read potential energy ({exc})") from exc
+    energy_numbers = list(_flatten_numbers(energy_value))
+    if not energy_numbers:
+        raise _validation_error(stage, "potential energy missing")
+    if not all(math.isfinite(x) for x in energy_numbers):
+        raise _validation_error(stage, "potential energy is NaN or Inf")
+
+
 def _run_md_stage(
     simulation: Any,
     *,
@@ -412,7 +496,10 @@ def _run_md_stage(
         return
     if on_progress:
         on_progress(f"{label}: {n_steps:,} steps")
-    simulation.step(int(n_steps))
+    try:
+        simulation.step(int(n_steps))
+    except Exception as exc:  # noqa: BLE001
+        raise _validation_error(label, f"OpenMM integration failed ({exc})") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -629,9 +716,11 @@ def run_simulation(
         topology, system, integrator, platform_obj, platform_props
     )
     simulation.context.setState(state)
+    _validate_state_finite(omm, simulation, stage="loading state.xml")
 
     # Output paths
     traj_path = output_dir / "production.dcd"
+    minimized_state_path = output_dir / "state_minimized.xml"
     final_state_path = output_dir / "state_final.xml"
     energy_csv = output_dir / "energy.csv"
     log_path = output_dir / "simulation.log"
@@ -659,6 +748,24 @@ def run_simulation(
                 max_iterations=minimize_max_iterations,
                 on_progress=_log_step,
             )
+            _validate_state_finite(omm, simulation, stage="minimization")
+            if random_seed is None:
+                simulation.context.setVelocitiesToTemperature(
+                    temperature_K * unit.kelvin
+                )
+            else:
+                simulation.context.setVelocitiesToTemperature(
+                    temperature_K * unit.kelvin,
+                    int(random_seed),
+                )
+            _log_step(f"Reset velocities to {temperature_K:.1f} K after minimization")
+            minimized_state = simulation.context.getState(
+                getPositions=True,
+                getVelocities=True,
+                enforcePeriodicBox=True,
+            )
+            with minimized_state_path.open("w", encoding="utf-8") as fh:
+                fh.write(omm["openmm"].XmlSerializer.serialize(minimized_state))
 
         # ---- Stage 2: NVT equilibration -------------------------------
         # Use the integrator's existing thermostat (Langevin). No barostat.
@@ -673,13 +780,13 @@ def run_simulation(
             label="NVT equilibration",
             on_progress=_log_step,
         )
+        _validate_state_finite(omm, simulation, stage="NVT equilibration")
 
         # ---- Stage 3: NPT equilibration -------------------------------
-        # Add the barostat and reinitialize the context so the system
-        # picks up the new force; remove it again after NPT to enter
-        # production in NVT (or leave it on -- see below).
+        # Add the barostat and reinitialize the context so the system picks up
+        # the new force. Production then continues in NPT.
         if plan["npt_steps"] > 0:
-            barostat_idx = _add_barostat(
+            _add_barostat(
                 omm, system,
                 temperature_K=temperature_K,
                 pressure_bar=resolved_pressure_bar,
@@ -692,8 +799,7 @@ def run_simulation(
                 label="NPT equilibration",
                 on_progress=_log_step,
             )
-        else:
-            barostat_idx = None
+            _validate_state_finite(omm, simulation, stage="NPT equilibration")
 
         # ---- Stage 4: Production --------------------------------------
         # Production runs in NPT (the standard default ensemble).
@@ -755,6 +861,7 @@ def run_simulation(
         platform_used=platform_name,
         n_production_frames=int(n_frames),
         duration_ns_actual=float(duration_ns_actual),
+        minimized_state=minimized_state_path if minimize else None,
     )
 
 

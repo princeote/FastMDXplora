@@ -407,6 +407,49 @@ class TestRunnerWiring:
         # attached but nothing is written yet — file may or may not
         # exist depending on OpenMM internals. Don't assert on it here.
 
+    def test_minimization_resets_velocities_to_simulation_temperature(self, tmp_path: Path):
+        """After minimization, inherited setup velocities are replaced."""
+        system_xml = tmp_path / "system.xml"
+        state_xml = tmp_path / "state.xml"
+        topo = tmp_path / "topology.pdb"
+        for p in (system_xml, state_xml, topo):
+            p.write_text("<x />" if p.suffix == ".xml" else "ATOM\nEND\n")
+
+        fake_omm = _build_fake_omm()
+        fake_context = fake_omm["Simulation"].return_value.context
+
+        with patch.object(_runner, "_import_openmm", return_value=fake_omm):
+            result = _runner.run_simulation(
+                system_xml=system_xml,
+                state_xml=state_xml,
+                topology_pdb=topo,
+                output_dir=tmp_path / "out",
+                temperature_K=100.0,
+                random_seed=123,
+                nvt_steps=0,
+                npt_steps=0,
+                production_steps=0,
+                minimize=True,
+            )
+
+        fake_context.setVelocitiesToTemperature.assert_called_once_with(100.0, 123)
+        assert result.minimized_state == tmp_path / "out" / "state_minimized.xml"
+        assert result.minimized_state.exists()
+
+    def test_validation_rejects_nan_positions(self):
+        """State validation fails clearly before opaque OpenMM NaN crashes."""
+        fake_omm = _build_fake_omm()
+        bad_state = MagicMock()
+        bad_state.getPositions.return_value = [[0.0, float("nan"), 0.0]]
+        bad_state.getPotentialEnergy.return_value = 0.0
+        fake_simulation = MagicMock()
+        fake_simulation.context.getState.return_value = bad_state
+
+        with pytest.raises(RuntimeError, match="positions contain NaN or Inf"):
+            _runner._validate_state_finite(fake_omm, fake_simulation, stage="NVT")
+        with pytest.raises(RuntimeError, match="simulate-timestep-fs"):
+            _runner._validate_state_finite(fake_omm, fake_simulation, stage="NVT")
+
     def test_runner_missing_input_raises(self, tmp_path: Path):
         """Missing system.xml raises FileNotFoundError before any OpenMM work."""
         with patch.object(_runner, "_import_openmm", return_value=_build_fake_omm()):
@@ -442,6 +485,15 @@ class TestDefaults:
     def test_runner_barostat_defaults(self):
         assert _runner.DEFAULT_PRESSURE_BAR == 1.0
         assert _runner.DEFAULT_BAROSTAT_FREQUENCY == 25
+
+    def test_gentle_preset_expands_to_safe_smoke_settings(self):
+        params = _pipeline._resolve_params({"preset": "gentle", "platform": "CPU"})
+        assert params["timestep_fs"] == 0.5
+        assert params["temperature_K"] == 100.0
+        assert params["friction_per_ps"] == 5.0
+        assert params["npt_steps"] == 0
+        assert params["production_steps"] == 1000
+        assert params["platform"] == "CPU"
 
 
 # ===========================================================================
@@ -552,9 +604,12 @@ def _build_fake_omm() -> dict:
     fake_pdbfile_cls.writeFile = MagicMock()
 
     fake_state = MagicMock()
+    fake_state.getPositions.return_value = [[0.0, 0.0, 0.0]]
+    fake_state.getPotentialEnergy.return_value = 0.0
     fake_context = MagicMock()
     fake_context.getState = MagicMock(return_value=fake_state)
     fake_context.setState = MagicMock()
+    fake_context.setVelocitiesToTemperature = MagicMock()
 
     fake_simulation_cls = MagicMock()
     fake_simulation_inst = MagicMock()

@@ -107,6 +107,23 @@ Supported integrators: `langevin_middle` (default), `langevin`,
 be given as `--simulate-pressure-bar` or `--simulate-pressure-atm`; atm is
 converted to OpenMM's native bar (1 atm = 1.01325 bar).
 
+### Gentle simulation smoke test
+
+Freshly repaired or very small PDB systems can be numerically fragile at full
+room-temperature MD settings. For a conservative first simulation, use the
+gentle preset:
+
+```bash
+fastmdx explore --system protein.pdb --output run_gentle --include setup simulation --simulate-preset gentle --simulate-platform CPU
+```
+
+The preset uses a 0.5 fs timestep, 100 K, 5/ps Langevin friction, no NPT, and
+short NVT/production stages. The equivalent explicit command is:
+
+```bash
+fastmdx explore --system protein.pdb --output run_gentle --include setup simulation --simulate-duration-ns 0.001 --simulate-nvt-steps 1000 --simulate-npt-steps 0 --simulate-production-steps 1000 --simulate-timestep-fs 0.5 --simulate-temperature-K 100 --simulate-friction-per-ps 5.0 --simulate-platform CPU --simulate-precision double
+```
+
 ### Skipping PDBFixer
 
 If you already have a prepared structure, skip the fixer:

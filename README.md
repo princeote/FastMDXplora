@@ -313,23 +313,6 @@ FastMDXplora(config="campaign.yml").explore()
 
 Each run is identical in structure to a single study (its own `manifest.json`, `resolved_config.yml`, and phase directories), so existing analysis tooling works per-run unchanged. Option precedence within a run is base config < per-system overrides < swept value. Typo'd sweep axes are rejected with the valid-option list, and a failed run is recorded while the others continue.
 
-### Gentle simulation smoke test
-
-Freshly repaired or very small PDB systems can be numerically fragile at full
-room-temperature MD settings. For a conservative first simulation, use the
-gentle preset:
-
-```bash
-fastmdx explore --system protein.pdb --output run_gentle --include setup simulation --simulate-preset gentle --simulate-platform CPU
-```
-
-The preset uses a 0.5 fs timestep, 100 K, 5/ps Langevin friction, no NPT, and
-short NVT/production stages. The equivalent explicit command is:
-
-```bash
-fastmdx explore --system protein.pdb --output run_gentle --include setup simulation --simulate-duration-ns 0.001 --simulate-nvt-steps 1000 --simulate-npt-steps 0 --simulate-production-steps 1000 --simulate-timestep-fs 0.5 --simulate-temperature-K 100 --simulate-friction-per-ps 5.0 --simulate-platform CPU --simulate-precision double
-```
-
 ### Cross-run comparison report
 
 After a multi-run study, FastMDXplora automatically builds a `comparison/` report at the batch root that turns a directory of runs into a single analysis:

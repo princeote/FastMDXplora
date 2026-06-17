@@ -36,6 +36,8 @@ from fastmdxplora.config.schema import (
     PhaseSchema,
 )
 
+VALID_PHASES = set(PHASE_KEYS)
+
 
 class ConfigError(ValueError):
     """Raised for any problem loading or validating a config file."""
@@ -165,6 +167,19 @@ def _validate_block(
             )
 
 
+def _validate_phase_list(value: Any, *, field_name: str) -> None:
+    """Validate top-level include/exclude phase names after type checking."""
+    if value is None:
+        return
+    unknown = [phase for phase in value if not isinstance(phase, str) or phase not in VALID_PHASES]
+    if unknown:
+        valid = ", ".join(PHASE_KEYS)
+        raise ConfigError(
+            f"Top-level '{field_name}' contains unknown phase(s): "
+            f"{', '.join(repr(p) for p in unknown)}. Valid phases: {valid}."
+        )
+
+
 def validate_config(data: dict[str, Any], *, require_systems: bool = False) -> None:
     """Strictly validate a parsed config dict against the schema.
 
@@ -209,6 +224,8 @@ def validate_config(data: dict[str, Any], *, require_systems: bool = False) -> N
             "Config sets both 'include' and 'exclude' at the top level; "
             "they are mutually exclusive."
         )
+    _validate_phase_list(data.get("include"), field_name="include")
+    _validate_phase_list(data.get("exclude"), field_name="exclude")
 
     # `systems` is the canonical (and required) way to specify input.
     if require_systems and not data.get("systems"):

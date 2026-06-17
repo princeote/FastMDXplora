@@ -9,6 +9,7 @@ These tests verify that after a real analysis run, the report phase:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import mdtraj as md
@@ -269,3 +270,16 @@ def test_report_handles_missing_analyses_gracefully(tmp_path: Path):
 
     prs = Presentation(str(tmp_path / "report" / "slides.pptx"))
     assert len(prs.slides) >= 1
+
+
+def test_deferred_analysis_message_is_current_and_actionable(tmp_path: Path):
+    fmdx = FastMDXplora(system="1L2Y", output_dir=tmp_path)
+    result = fmdx.analyze()
+
+    assert result.status == "ok"
+    manifest = json.loads(
+        (tmp_path / "analysis" / "analysis_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "deferred"
+    assert "v0.2" not in manifest["note"]
+    assert "Run the simulation phase first" in manifest["note"]

@@ -458,7 +458,30 @@ def _build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # Subcommand handlers
 # ---------------------------------------------------------------------------
-def _make_orchestrator(args: argparse.Namespace) -> FastMDXplora:
+def _infer_system_from_output(output_dir: str | None) -> str | None:
+    """Best-effort system inference for report/analyze reruns on existing output."""
+    if not output_dir:
+        return None
+
+    import json
+
+    root = Path(output_dir)
+    manifest = root / "manifest.json"
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    system = data.get("system")
+    if system:
+        return str(system)
+
+    topology = root / "simulation" / "topology.pdb"
+    if topology.exists():
+        return str(topology)
+    return None
+
+
+def _make_orchestrator(args: argparse.Namespace, *, phase: str | None = None) -> FastMDXplora:
     """Build a single-system orchestrator for the per-phase subcommands.
 
     The per-phase commands (setup/simulate/analyze/report) operate on one
@@ -466,7 +489,11 @@ def _make_orchestrator(args: argparse.Namespace) -> FastMDXplora:
     through BatchExplorer instead.
     """
     config = getattr(args, "config", None)
-    if not args.system and not config:
+    inferred_system = (
+        _infer_system_from_output(args.output_dir)
+        if phase in {"analyze", "report"} else None
+    )
+    if not args.system and not config and not inferred_system:
         raise SystemExit(
             "fastmdx: this command requires a system input "
             "(-s / -system / --system) or a --config file."
@@ -480,7 +507,7 @@ def _make_orchestrator(args: argparse.Namespace) -> FastMDXplora:
         systems = normalize_systems(raw.get("systems") or [])
         system = systems[0]["system"]
     else:
-        system = args.system
+        system = args.system or inferred_system
     return FastMDXplora(
         system=system,
         output_dir=args.output_dir,
@@ -584,7 +611,7 @@ def _cmd_explore(args: argparse.Namespace) -> int:
 
 
 def _cmd_phase(phase: str, args: argparse.Namespace) -> int:
-    fmdx = _make_orchestrator(args)
+    fmdx = _make_orchestrator(args, phase=phase)
     opts_list, _ = _PHASE_SPEC[phase]
     kwargs = _harvest_phase_options(args, opts_list)
 

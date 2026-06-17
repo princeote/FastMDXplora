@@ -29,6 +29,8 @@ coverage.xml
 venv/
 env/
 .env
+.micromamba-bin/
+.micromamba-root/
 
 # uv
 .uv-cache/
@@ -48,3 +50,6 @@ site/
 
 # FastMDXplora run outputs (do not commit user data)
 fastmdxplora_output_*/
+local_pdbs/
+local_runs/
+private_reports/

@@ -246,6 +246,8 @@ def attach_file_logger(
 
     env_level = os.getenv("FASTMDX_LOGLEVEL")
     handler.setLevel(_to_level(env_level) if env_level else _to_level(level))
+    if base.level == logging.NOTSET or base.level > handler.level:
+        base.setLevel(handler.level)
     base.addHandler(handler)
     _file_handler = handler
     return base

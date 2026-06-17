@@ -75,6 +75,14 @@ def _make_record(level: int = logging.INFO, msg: str = "hello") -> logging.LogRe
     )
 
 
+def _owned_handlers(log: logging.Logger) -> list[logging.Handler]:
+    """Handlers installed by FastMDXplora, excluding pytest log-capture hooks."""
+    return [
+        h for h in log.handlers
+        if not h.__class__.__module__.startswith("_pytest.")
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Formatter behavior
 # ---------------------------------------------------------------------------
@@ -122,14 +130,14 @@ class TestPlainISOFormatter:
 class TestSetupConsole:
     def test_first_call_adds_handler(self, fresh_logger):
         log = setup_console()
-        assert len(log.handlers) == 1
+        assert len(_owned_handlers(log)) == 1
         assert log.propagate is False
 
     def test_idempotent_no_duplicate_handler(self, fresh_logger):
         setup_console()
         setup_console()
         setup_console()
-        assert len(fresh_logger.handlers) == 1
+        assert len(_owned_handlers(fresh_logger)) == 1
 
     def test_level_argument_applied(self, fresh_logger):
         setup_console(level=logging.WARNING)
@@ -143,12 +151,12 @@ class TestSetupConsole:
     def test_env_style_overrides_argument(self, fresh_logger, monkeypatch):
         monkeypatch.setenv("FASTMDX_LOG_STYLE", "plain")
         log = setup_console(style="pretty")
-        handler = log.handlers[0]
+        handler = _owned_handlers(log)[0]
         assert isinstance(handler.formatter, _PlainISOFormatter)
 
     def test_pretty_is_default(self, fresh_logger):
         log = setup_console()
-        handler = log.handlers[0]
+        handler = _owned_handlers(log)[0]
         assert isinstance(handler.formatter, _PrettyFormatter)
 
 
@@ -209,7 +217,7 @@ class TestGetLogger:
         # The child has no handlers of its own — it relies on the root.
         assert child.handlers == []
         # The root has exactly one handler from setup_console.
-        assert len(fresh_logger.handlers) == 1
+        assert len(_owned_handlers(fresh_logger)) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ These tests verify that after a real analysis run, the report phase:
 from __future__ import annotations
 
 import json
+import zipfile
 from pathlib import Path
 
 import mdtraj as md
@@ -17,6 +18,7 @@ import numpy as np
 import pytest
 
 from fastmdxplora import FastMDXplora
+from fastmdxplora.cli.main import main as cli_main
 
 
 # ---------------------------------------------------------------------------
@@ -283,3 +285,110 @@ def test_deferred_analysis_message_is_current_and_actionable(tmp_path: Path):
     assert manifest["status"] == "deferred"
     assert "v0.2" not in manifest["note"]
     assert "Run the simulation phase first" in manifest["note"]
+
+
+# ===========================================================================
+# Robustness for report-only mode and generated artifacts
+# ===========================================================================
+def test_report_only_cli_escapes_weird_markdown_text(tmp_path: Path):
+    """Report-only mode should not let titles/messages reshape Markdown."""
+    root = tmp_path / "existing run with spaces"
+    analysis = root / "analysis"
+    analysis.mkdir(parents=True)
+    weird_system = "sys|`tick` [brackets]\n# injected\tpath"
+    weird_title = "Study | `ticks` [link](x)\n# injected"
+    weird_author = "Author | # name\nnext"
+    weird_message = "bad | `tick`\n# injected failure"
+
+    (root / "manifest.json").write_text(
+        json.dumps({"system": weird_system}),
+        encoding="utf-8",
+    )
+    (analysis / "analysis_manifest.json").write_text(
+        json.dumps(
+            {
+                "plan": ["rmsd"],
+                "results": {"rmsd": {"status": "error", "message": weird_message}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rc = cli_main(
+        [
+            "report",
+            "--output",
+            str(root),
+            "--title",
+            weird_title,
+            "--author",
+            weird_author,
+            "--no-slides",
+            "--no-bundle",
+        ]
+    )
+
+    assert rc == 0
+    text = (root / "report" / "report.md").read_text(encoding="utf-8")
+    first_line = text.splitlines()[0]
+    assert first_line.startswith("# Study")
+    assert "\\|" in first_line
+    assert "\\`ticks\\`" in first_line
+    assert "\n# injected" not in text
+    assert "bad \\| \\`tick\\` \\# injected failure" in text
+
+
+def test_report_phase_manifest_artifacts_exist(tmp_path: Path):
+    fmdx = FastMDXplora(system="sys|odd", output_dir=tmp_path / "run")
+    results = fmdx.explore(
+        include=["report"],
+        options={"report": {"title": "Odd | title", "slides": False, "bundle": False}},
+    )
+
+    report_phase = results[0].phase("report")
+    assert report_phase is not None
+    manifest = json.loads((fmdx.output_dir / "manifest.json").read_text(encoding="utf-8"))
+    report_record = next(p for p in manifest["phases"] if p["name"] == "report")
+    assert report_record["artifacts"] == ["report.md"]
+    for artifact in report_record["artifacts"]:
+        assert (Path(report_record["output_dir"]) / artifact).is_file()
+
+
+def test_report_bundle_excludes_cache_and_temp_files(tmp_path: Path):
+    root = tmp_path / "run"
+    (root / "analysis").mkdir(parents=True)
+    (root / "__pycache__").mkdir()
+    (root / ".cache").mkdir()
+    (root / "__pycache__" / "module.cpython-310.pyc").write_bytes(b"cached")
+    (root / ".cache" / "plot.tmp").write_text("cache", encoding="utf-8")
+    (root / "scratch.tmp").write_text("temp", encoding="utf-8")
+    (root / "keep.dat").write_text("artifact", encoding="utf-8")
+
+    fmdx = FastMDXplora(system="1L2Y", output_dir=root)
+    result = fmdx.report(document=False, slides=False, bundle=True)
+
+    assert result.status == "ok"
+    bundle = root / "report" / "project_bundle.zip"
+    with zipfile.ZipFile(bundle) as zf:
+        names = set(zf.namelist())
+    assert "keep.dat" in names
+    assert "scratch.tmp" not in names
+    assert "__pycache__/module.cpython-310.pyc" not in names
+    assert ".cache/plot.tmp" not in names
+    assert "report/project_bundle.zip" not in names
+
+
+def test_powerpoint_handles_weird_title_and_system(tmp_path: Path):
+    from pptx import Presentation
+
+    title = "T" * 800 + " | `tick`\n# heading"
+    system = "system with spaces | [id]\nnext"
+    fmdx = FastMDXplora(system=system, output_dir=tmp_path / "run")
+    result = fmdx.report(title=title, bundle=False)
+
+    assert result.status == "ok"
+    pptx = fmdx.output_dir / "report" / "slides.pptx"
+    assert pptx.is_file()
+    prs = Presentation(str(pptx))
+    assert len(prs.slides) >= 1
+    assert "\n# heading" not in prs.slides[0].shapes.title.text

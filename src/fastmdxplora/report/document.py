@@ -23,11 +23,36 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 if TYPE_CHECKING:
     from fastmdxplora.orchestrator import FastMDXplora
 
 logger = get_logger("report.document")
+
+
+def _one_line(value: object, *, limit: int = 1000) -> str:
+    text = str(value)
+    text = " ".join(text.replace("\t", " ").splitlines())
+    text = " ".join(text.split())
+    if len(text) > limit:
+        return text[: limit - 1].rstrip() + "..."
+    return text
+
+
+def _md_text(value: object, *, limit: int = 1000) -> str:
+    text = _one_line(value, limit=limit)
+    for char in "\\`*_{}[]()#+-.!|<>":
+        text = text.replace(char, f"\\{char}")
+    return text
+
+
+def _code_text(value: object, *, limit: int = 1000) -> str:
+    return _one_line(value, limit=limit).replace("`", "'")
+
+
+def _link_target(path: str) -> str:
+    return quote(path, safe="/._-")
 
 
 def _load_json_safely(path: Path) -> dict | None:
@@ -57,7 +82,7 @@ def _methods_section(project_root: Path) -> str:
         )
         lines.append("")
         for k, v in setup_params.items():
-            lines.append(f"- **{k}**: `{v}`")
+            lines.append(f"- **{_md_text(k)}**: `{_code_text(v)}`")
     else:
         lines.append("")
         lines.append("Setup parameters were not recorded for this run.")
@@ -71,7 +96,7 @@ def _methods_section(project_root: Path) -> str:
         )
         lines.append("")
         for k, v in sim_params.items():
-            lines.append(f"- **{k}**: `{v}`")
+            lines.append(f"- **{_md_text(k)}**: `{_code_text(v)}`")
     else:
         lines.append("")
         lines.append("Simulation parameters were not recorded for this run.")
@@ -98,12 +123,13 @@ def _results_section(project_root: Path) -> str:
             f"Analysis was performed on a trajectory of {n_frames} frames "
             f"and {n_residues} residues."
         )
-    lines.append(f"Analyses performed: {', '.join(plan)}.")
+    lines.append(f"Analyses performed: {', '.join(_md_text(a) for a in plan)}.")
     lines.append("")
 
     for analysis in plan:
         # Pretty heading: uppercase short names, title-case longer ones
         heading = analysis.upper() if len(analysis) <= 4 else analysis.title()
+        heading = _md_text(heading)
         lines.append(f"### {heading}")
         lines.append("")
 
@@ -116,7 +142,7 @@ def _results_section(project_root: Path) -> str:
                 f"`{status}`)._"
             )
             if result_meta.get("message"):
-                lines.append(f"Reason: {result_meta['message']}")
+                lines.append(f"Reason: {_md_text(result_meta['message'])}")
             lines.append("")
             continue
 
@@ -131,9 +157,9 @@ def _results_section(project_root: Path) -> str:
         if opts or selection:
             lines.append("**Parameters:**")
             if selection:
-                lines.append(f"- `selection`: `{selection}`")
+                lines.append(f"- `selection`: `{_code_text(selection)}`")
             for k, v in opts.items():
-                lines.append(f"- `{k}`: `{v}`")
+                lines.append(f"- `{_code_text(k)}`: `{_code_text(v)}`")
         else:
             lines.append("_Ran with default options._")
         lines.append("")
@@ -148,8 +174,8 @@ def _results_section(project_root: Path) -> str:
                 # Markdown/HTML image links require forward slashes on every
                 # OS; str(WindowsPath) would emit backslashes and break them.
                 rel = fig.relative_to(project_root).as_posix()
-                caption = f"{analysis} — {fig.stem}"
-                lines.append(f"![{caption}]({rel})")
+                caption = _md_text(f"{analysis} — {fig.stem}")
+                lines.append(f"![{caption}]({_link_target(rel)})")
                 lines.append("")
         else:
             lines.append("_No figure was produced for this analysis._")
@@ -195,8 +221,8 @@ def _reproducibility_section(orchestrator: "FastMDXplora") -> str:
     lines.append(f"- **FastMDXplora version**: `{__version__}`")
     lines.append(f"- **Python**: `{sys.version.split()[0]}`")
     lines.append(f"- **Platform**: `{platform.platform()}`")
-    lines.append(f"- **System input**: `{orchestrator.system}`")
-    lines.append(f"- **Output directory**: `{orchestrator.output_dir}`")
+    lines.append(f"- **System input**: `{_code_text(orchestrator.system)}`")
+    lines.append(f"- **Output directory**: `{_code_text(orchestrator.output_dir)}`")
     lines.append("")
     lines.append(
         "Per-phase parameter manifests are preserved at "
@@ -227,9 +253,9 @@ def build_document(
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     sections: list[str] = []
-    header = [f"# {title}", ""]
+    header = [f"# {_md_text(title, limit=200)}", ""]
     if author:
-        header.append(f"_Author: {author}_  ")
+        header.append(f"_Author: {_md_text(author, limit=200)}_  ")
     header.append(f"_Generated: {now} (UTC)_  ")
     header.append(f"_Tool: FastMDXplora_")
     sections.append("\n".join(header))

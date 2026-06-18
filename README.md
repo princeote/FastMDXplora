@@ -64,7 +64,7 @@ pip install fastmdxplora              # primary package
 pip install fastmdx                    # alias (resolves to fastmdxplora)
 ```
 
-This gives a fully working analysis + report pipeline, slide deck included (`python-pptx` is a core dependency). The setup and simulation phases emit a clear warning and skip gracefully until the chemistry stack is present. Add it via conda-forge (recommended, reliable across platforms):
+This gives a fully working analysis + report pipeline, slide deck included (`python-pptx` is a core dependency). The setup and simulation phases require the chemistry stack; if it is missing, invoked setup/simulation runs fail with a clear missing-dependency message. Add it via conda-forge (recommended, reliable across platforms):
 
 ```bash
 conda install -c conda-forge pdbfixer openmm
@@ -143,6 +143,10 @@ fastmdx explore --system 1L2Y
 ```bash
 fastmdx explore -s protein.pdb --setup-ph 7.4 --simulate-duration-ns 100 --simulate-platform CUDA
 ```
+For a short local smoke test before a longer production run, use the gentle preset:
+```bash
+fastmdx explore -s protein.pdb --include setup simulation --simulate-preset gentle --simulate-platform CPU
+```
 **Run only specific phases**:
 ```bash
 fastmdx explore -s protein.pdb --include setup simulation
@@ -150,8 +154,9 @@ fastmdx explore -s protein.pdb --include setup simulation
 **Run a single phase** (bare flags, no phase prefix):
 ```bash
 fastmdx setup -s protein.pdb --ph 6.5
-fastmdx simulate --output run_001 --duration-ns 50 --platform CUDA
+fastmdx simulate -s protein.pdb --output run_001 --duration-ns 50 --platform CUDA
 fastmdx analyze --output run_001 --analyses rmsd rmsf rg
+fastmdx report --output run_001 --no-slides
 ```
 **Drive a whole study from a config file** (`-c` and `-config` also work):
 ```bash

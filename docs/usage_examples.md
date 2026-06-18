@@ -81,13 +81,15 @@ Each phase is also its own subcommand. Here the per-phase flags are bare
 
 ```bash
 fastmdx setup    --system protein.pdb --ph 6.5 --box-shape octahedron
-fastmdx simulate --output ./trpcage_study --duration-ns 50.0 --platform CUDA
+fastmdx simulate --system protein.pdb --output ./trpcage_study --duration-ns 50.0 --platform CUDA
 fastmdx analyze  --output ./trpcage_study --analyses rmsd rg --selection "name CA"
 fastmdx report   --output ./trpcage_study --no-slides
 ```
 
 Pointing later phases at the same `--output` lets them pick up the
-artifacts the earlier phases wrote.
+artifacts the earlier phases wrote. `analyze` and `report` can infer the
+system from an existing run manifest; `setup` and `simulate` still need
+`--system` or `--config`.
 
 ### MD engine controls
 
@@ -305,7 +307,9 @@ fmdx = FastMDXplora(system="protein.pdb")
 results = fmdx.explore()
 
 for r in results:
-    print(r.name, r.status)        # e.g. "setup ok", "simulation ok"
+    print(r.run_id, r.status)
+    for phase in r.phases:
+        print("  ", phase.name, phase.status)
 ```
 
 The recommended import alias mirrors the CLI name:
@@ -346,7 +350,7 @@ for phase in run.phases:
 
 `explore()` **always returns a list of `RunResult`** — a single study is a
 list of one, a sweep is a list of many. Each `RunResult` carries
-`run_id`, `system`, `status` (`"ok"`/`"error"`), `output_dir`,
+`run_id`, `system`, `status` (`"ok"`/`"error"`/`"skipped"`), `output_dir`,
 `sweep_values`, and `phases` (the list of `PhaseResult` for that run).
 The iteration idiom is the same no matter how many runs there are:
 

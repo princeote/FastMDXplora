@@ -68,6 +68,13 @@ python scripts/run_pdb_smoke_campaign.py \
 If DNS is broken, download PDB files elsewhere and use local paths:
 
 ```bash
+mkdir -p local_pdbs
+curl -L -o local_pdbs/1L2Y.pdb https://files.rcsb.org/download/1L2Y.pdb
+curl -L -o local_pdbs/1CRN.pdb https://files.rcsb.org/download/1CRN.pdb
+printf '%s\n' local_pdbs/1L2Y.pdb local_pdbs/1CRN.pdb > local_pdb_files.txt
+```
+
+```bash
 python scripts/run_pdb_smoke_campaign.py \
   --input-list local_pdb_files.txt \
   --output-root runs/pdb_smoke_local \
@@ -75,8 +82,9 @@ python scripts/run_pdb_smoke_campaign.py \
   --continue-on-error
 ```
 
-The campaign writes `campaign_summary.csv` and `campaign_summary.json` under
-the output root. Each protein gets its own output directory.
+The campaign writes `campaign_summary.csv` / `campaign_summary.json` under
+the output root, plus compatibility copies named `summary.csv` /
+`summary.json`. Each protein gets its own output directory.
 
 ## HPC Commands
 

@@ -1,14 +1,12 @@
 # Examples
 
-This directory will host runnable examples demonstrating FastMDXplora
+This directory hosts small example inputs and starter lists for FastMDXplora
 workflows.
 
-Planned examples:
+Current examples:
 
-- `01_trp_cage_quickstart.ipynb` — full pipeline on the TrpCage miniprotein
-- `02_setup_only.ipynb` — system preparation from a raw PDB
-- `03_analyze_existing_trajectory.ipynb` — analysis-only on a trajectory you already have
-- `04_custom_report.ipynb` — customizing the report phase
+- `pdb_list.txt` — a curated 15-entry starter set for the staged PDB smoke
+  campaign workflow documented in `docs/pdb_smoke_campaign.md`.
 
-The examples will be added as the corresponding phase backends are wired
-in v0.2+.
+Notebook examples can be added later, but this directory should only list
+files that are actually present in the repository.

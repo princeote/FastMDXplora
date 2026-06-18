@@ -76,11 +76,31 @@ def _make_record(level: int = logging.INFO, msg: str = "hello") -> logging.LogRe
 
 
 def _owned_handlers(log: logging.Logger) -> list[logging.Handler]:
-    """Handlers installed by FastMDXplora, excluding pytest log-capture hooks."""
+    """Handlers installed by FastMDXplora."""
     return [
         h for h in log.handlers
-        if not h.__class__.__module__.startswith("_pytest.")
+        if getattr(h, "_fastmdx_owned", False)
     ]
+
+
+def _owned_handlers_of_kind(
+    log: logging.Logger,
+    kind: str,
+) -> list[logging.Handler]:
+    return [
+        h for h in _owned_handlers(log)
+        if getattr(h, "_fastmdx_handler_kind", None) == kind
+    ]
+
+
+def _owned_console_handler(log: logging.Logger) -> logging.Handler:
+    handlers = _owned_handlers_of_kind(log, "console")
+    assert len(handlers) == 1
+    return handlers[0]
+
+
+def _owned_file_handlers(log: logging.Logger) -> list[logging.Handler]:
+    return _owned_handlers_of_kind(log, "file")
 
 
 # ---------------------------------------------------------------------------
@@ -130,14 +150,14 @@ class TestPlainISOFormatter:
 class TestSetupConsole:
     def test_first_call_adds_handler(self, fresh_logger):
         log = setup_console()
-        assert len(_owned_handlers(log)) == 1
+        assert len(_owned_handlers_of_kind(log, "console")) == 1
         assert log.propagate is False
 
     def test_idempotent_no_duplicate_handler(self, fresh_logger):
         setup_console()
         setup_console()
         setup_console()
-        assert len(_owned_handlers(fresh_logger)) == 1
+        assert len(_owned_handlers_of_kind(fresh_logger, "console")) == 1
 
     def test_level_argument_applied(self, fresh_logger):
         setup_console(level=logging.WARNING)
@@ -151,13 +171,31 @@ class TestSetupConsole:
     def test_env_style_overrides_argument(self, fresh_logger, monkeypatch):
         monkeypatch.setenv("FASTMDX_LOG_STYLE", "plain")
         log = setup_console(style="pretty")
-        handler = _owned_handlers(log)[0]
+        handler = _owned_console_handler(log)
         assert isinstance(handler.formatter, _PlainISOFormatter)
 
     def test_pretty_is_default(self, fresh_logger):
         log = setup_console()
-        handler = _owned_handlers(log)[0]
+        handler = _owned_console_handler(log)
         assert isinstance(handler.formatter, _PrettyFormatter)
+
+    def test_external_handler_is_ignored_for_console_idempotency(self, fresh_logger):
+        external = logging.StreamHandler()
+        external.setLevel(logging.ERROR)
+        fresh_logger.addHandler(external)
+
+        log = setup_console(level=logging.INFO)
+
+        assert external in log.handlers
+        assert getattr(external, "_fastmdx_owned", False) is False
+        assert external.level == logging.ERROR
+        assert len(_owned_handlers_of_kind(log, "console")) == 1
+
+        setup_console(level=logging.DEBUG)
+
+        assert external in log.handlers
+        assert external.level == logging.ERROR
+        assert len(_owned_handlers_of_kind(log, "console")) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -189,12 +227,10 @@ class TestAttachFileLogger:
         log = attach_file_logger(first)
         attach_file_logger(second)
 
-        # Count file handlers attached to the logger; should be exactly 1.
-        file_handlers = [
-            h for h in log.handlers
-            if isinstance(h, logging.FileHandler)
-        ]
+        # Count FastMDXplora-owned file handlers attached to the logger.
+        file_handlers = _owned_file_handlers(log)
         assert len(file_handlers) == 1
+        assert isinstance(file_handlers[0], logging.FileHandler)
         assert Path(file_handlers[0].baseFilename) == second
 
 
@@ -217,7 +253,7 @@ class TestGetLogger:
         # The child has no handlers of its own — it relies on the root.
         assert child.handlers == []
         # The root has exactly one handler from setup_console.
-        assert len(_owned_handlers(fresh_logger)) == 1
+        assert len(_owned_handlers_of_kind(fresh_logger, "console")) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +268,7 @@ class TestSetLevel:
     def test_changes_handler_level(self, fresh_logger):
         setup_console(level=logging.INFO)
         set_level(logging.DEBUG)
-        for h in fresh_logger.handlers:
+        for h in _owned_handlers(fresh_logger):
             assert h.level == logging.DEBUG
 
     def test_accepts_string_level(self, fresh_logger):

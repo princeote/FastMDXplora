@@ -86,11 +86,44 @@ conda activate fastmdxplora
 pip install -e ".[test]"               # editable, with the test dependencies
 ```
 
+On Windows PowerShell, use the Python launcher and the virtual environment's
+activation script:
+
+```powershell
+cd C:\Users\User\OneDrive\Documents\GitHub\FastMDXplora
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e ".[test]"
+python -m fastmdxplora.cli.main --version
+python -m fastmdxplora.cli.main info
+```
+
+If PowerShell blocks activation, allow local scripts for your user account:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+You can also skip activation and call the environment's Python directly:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[test]"
+.\.venv\Scripts\python.exe -m fastmdxplora.cli.main --version
+```
+
 ### Verify
 
 ```bash
 fastmdx --version
 fastmdx info                           # versions + detected backends (OpenMM/PDBFixer)
+```
+
+If `fastmdx` is not on PATH, these module commands are the safest fallback:
+
+```bash
+python -m fastmdxplora.cli.main --version
+python -m fastmdxplora.cli.main info
 ```
 
 Check which OpenMM platforms are available (CPU/CUDA/OpenCL):
@@ -126,6 +159,37 @@ conda install -n base -c conda-forge mamba
 ```
 
 For other operating systems (macOS Intel/Apple Silicon, Linux ARM64, Windows), grab the matching installer from the [Miniforge releases page](https://conda-forge.org/miniforge/).
+
+### Troubleshooting: `fastmdx` is not recognized
+
+On Windows, especially with Microsoft Store Python or PowerShell, you may see:
+
+```text
+fastmdx : The term 'fastmdx' is not recognized as the name of a cmdlet, function, script file, or operable program.
+```
+
+First check which Python installed FastMDXplora and where console scripts are
+written:
+
+```powershell
+python -m pip show fastmdxplora
+python -c "import sys; print(sys.executable)"
+python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+python -m fastmdxplora.cli.main --version
+```
+
+If `import fastmdxplora` works but `fastmdx` is missing, the console-script
+directory is not on PATH. Use `python -m fastmdxplora.cli.main ...` as the
+portable fallback, or reinstall from the same Python to recreate the script:
+
+```powershell
+python -m pip install -e .
+python -m fastmdxplora.cli.main info
+```
+
+Avoid mixing multiple Python installs in the same terminal. The Python used for
+`python -m pip install ...` should be the same one used for
+`python -m fastmdxplora.cli.main ...`.
 
 ## Examples
 

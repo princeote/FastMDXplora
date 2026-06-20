@@ -7,6 +7,8 @@ They intentionally parse commands rather than executing MD-heavy workflows.
 from __future__ import annotations
 
 import shlex
+import subprocess
+import sys
 
 import pytest
 
@@ -56,6 +58,17 @@ def test_documented_campaign_command_parses() -> None:
 
     assert args.preset == "gentle"
     assert args.continue_on_error is True
+
+
+def test_documented_module_entrypoint_fallback_runs() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "fastmdxplora.cli.main", "--version"],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+    assert "fastmdx" in result.stdout
 
 
 def test_documented_configuration_shape_validates() -> None:

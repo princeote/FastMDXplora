@@ -86,6 +86,50 @@ The campaign writes `campaign_summary.csv` / `campaign_summary.json` under
 the output root, plus compatibility copies named `summary.csv` /
 `summary.json`. Each protein gets its own output directory.
 
+## Windows PowerShell Commands
+
+If the installed `fastmdx` command is not on PATH, use
+`python -m fastmdxplora.cli.main info` to verify the package and run the
+campaign script with `python`.
+
+Download two local PDB inputs:
+
+```powershell
+mkdir local_pdbs -Force
+curl.exe -L -o local_pdbs\1L2Y.pdb https://files.rcsb.org/download/1L2Y.pdb
+curl.exe -L -o local_pdbs\1CRN.pdb https://files.rcsb.org/download/1CRN.pdb
+python -m fastmdxplora.cli.main info
+```
+
+Run a small professor/demo output campaign with the gentle preset:
+
+```powershell
+python scripts\run_pdb_smoke_campaign.py `
+  --output-root local_runs\professor_outputs `
+  --preset gentle `
+  --continue-on-error `
+  local_pdbs\1L2Y.pdb local_pdbs\1CRN.pdb
+```
+
+Verify the expected outputs:
+
+```powershell
+Get-ChildItem local_runs\professor_outputs -Recurse |
+  Where-Object { $_.Name -match 'report\.md|slides\.pptx|project_bundle\.zip|production\.dcd|state_minimized\.xml|summary\.csv|summary\.json|manifest\.json|\.png|\.dat' } |
+  Select-Object FullName
+Get-Content local_runs\professor_outputs\summary.csv
+```
+
+Package outputs for review:
+
+```powershell
+New-Item -ItemType Directory -Force private_reports
+Compress-Archive -Path local_runs\professor_outputs, README.md, docs\pdb_smoke_campaign.md, examples\pdb_list.txt -DestinationPath private_reports\FastMDXplora_professor_outputs.zip -Force
+```
+
+`local_runs/`, `local_pdbs/`, and `private_reports/` are intended for local
+artifacts and are ignored by git.
+
 ## HPC Commands
 
 ```bash

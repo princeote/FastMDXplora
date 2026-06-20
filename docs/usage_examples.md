@@ -13,6 +13,19 @@ The form is auto-detected, so there is no separate `--pdb-id` flag.
 
 ## Command-line interface
 
+The examples use the installed `fastmdx` console script. If Windows
+PowerShell says `fastmdx` is not recognized, use the module entrypoint with
+the same arguments:
+
+```powershell
+python -m fastmdxplora.cli.main info
+python -m fastmdxplora.cli.main explore --system protein.pdb
+```
+
+That usually means FastMDXplora is importable but the Python console-script
+directory is not on PATH. See the installation troubleshooting section for
+PATH checks.
+
 ### The simplest run
 
 Run the whole pipeline on a structure file:

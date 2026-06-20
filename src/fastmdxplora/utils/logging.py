@@ -104,6 +104,10 @@ class _PlainISOFormatter(logging.Formatter):
 # ---------------------------------------------------------------------------
 _console_handler: logging.Handler | None = None
 _file_handler: logging.Handler | None = None
+_OWNED_ATTR = "_fastmdx_owned"
+_KIND_ATTR = "_fastmdx_handler_kind"
+_CONSOLE_KIND = "console"
+_FILE_KIND = "file"
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +147,31 @@ def _resolve_style(default: str | None = None, *, env_wins: bool = True) -> str:
     return default or "pretty"
 
 
+def _mark_owned(handler: logging.Handler, kind: str) -> logging.Handler:
+    """Mark a handler as created by FastMDXplora."""
+    setattr(handler, _OWNED_ATTR, True)
+    setattr(handler, _KIND_ATTR, kind)
+    return handler
+
+
+def _is_owned_handler(handler: logging.Handler, kind: str | None = None) -> bool:
+    """Return whether ``handler`` is owned by FastMDXplora."""
+    if not getattr(handler, _OWNED_ATTR, False):
+        return False
+    return kind is None or getattr(handler, _KIND_ATTR, None) == kind
+
+
+def _find_owned_handler(
+    logger: logging.Logger,
+    kind: str,
+) -> logging.Handler | None:
+    """Find the first attached FastMDXplora-owned handler of a given kind."""
+    for handler in logger.handlers:
+        if _is_owned_handler(handler, kind):
+            return handler
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -179,6 +208,9 @@ def setup_console(
 
     style = _resolve_style(style)
 
+    if _console_handler is None or _console_handler not in base.handlers:
+        _console_handler = _find_owned_handler(base, _CONSOLE_KIND)
+
     if _console_handler is None:
         handler = logging.StreamHandler(sys.stdout)
         if style == "plain":
@@ -188,6 +220,7 @@ def setup_console(
             fmt = _PrettyFormatter(use_color)
         handler.setFormatter(fmt)
         handler.setLevel(base.level)
+        _mark_owned(handler, _CONSOLE_KIND)
         base.addHandler(handler)
         _console_handler = handler
     else:
@@ -224,6 +257,9 @@ def attach_file_logger(
 
     # Replace any prior file handler. This lets each new FastMDXplora
     # session redirect its file log without leaking handlers.
+    if _file_handler is None or _file_handler not in base.handlers:
+        _file_handler = _find_owned_handler(base, _FILE_KIND)
+
     if _file_handler is not None:
         try:
             base.removeHandler(_file_handler)
@@ -246,6 +282,9 @@ def attach_file_logger(
 
     env_level = os.getenv("FASTMDX_LOGLEVEL")
     handler.setLevel(_to_level(env_level) if env_level else _to_level(level))
+    if base.level == logging.NOTSET or base.level > handler.level:
+        base.setLevel(handler.level)
+    _mark_owned(handler, _FILE_KIND)
     base.addHandler(handler)
     _file_handler = handler
     return base

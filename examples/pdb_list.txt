@@ -1,0 +1,19 @@
+# Starter FastMDXplora PDB smoke-campaign list.
+# Keep this small for local/HPC shakedowns; expand only after these are classified.
+#
+# PDB ID  Why included / expected behavior
+1L2Y      # tiny Trp-cage; should be a basic protein smoke test
+1CRN      # small stable crambin; should setup/simulate if dependencies are present
+1UBQ      # compact mixed alpha/beta protein; normal protein baseline
+2MHR      # alpha-helical myohemerythrin; helical fold baseline
+1TEN      # beta-sandwich/fibronectin domain; beta-rich baseline
+1AKE      # larger mixed alpha/beta adenylate kinase; moderate-size baseline
+1A8O      # contains nonstandard selenomethionine; expected template/repair limitation
+1HHP      # protein-ligand/heterogen case; ligand may need explicit parameterization
+4HHB      # multi-chain hemoglobin with heme/iron; likely metal/cofactor limitation
+1BNA      # DNA duplex; expected limitation unless nucleic-acid workflow is supported
+1FAT      # multi-chain lectin with heterogens/waters; tests chain/heterogen handling
+1A3N      # alternate locations/multi-chain hemoglobin family; review altloc behavior
+2PTC      # protein-protein complex; multi-chain setup and size smoke
+1CAG      # large repeat-rich protein fragment; should be handled carefully
+6VXX      # large membrane/spike glycoprotein; likely skip for smoke settings

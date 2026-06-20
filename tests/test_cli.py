@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -147,6 +148,21 @@ def test_cli_per_phase_setup(tmp_path: Path) -> None:
     rc = main(["setup", "-system", str(pdb), "--output", str(out)])
     assert rc == 0
     assert (out / "setup" / "setup_parameters.json").exists()
+
+
+def test_cli_report_can_rerun_from_existing_output_without_system(tmp_path: Path) -> None:
+    pdb = _make_pdb_stub(tmp_path)
+    out = tmp_path / "run"
+    out.mkdir()
+    (out / "manifest.json").write_text(
+        json.dumps({"system": str(pdb)}),
+        encoding="utf-8",
+    )
+
+    rc = main(["report", "--output", str(out), "--no-slides", "--no-bundle"])
+
+    assert rc == 0
+    assert (out / "report" / "report.md").exists()
 
 
 def test_cli_explore_no_report(tmp_path: Path) -> None:

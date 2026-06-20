@@ -21,7 +21,19 @@ logger = get_logger("report.bundle")
 
 # Paths inside the project root that should be excluded from the bundle
 EXCLUDE_NAMES: frozenset[str] = frozenset(
-    {"project_bundle.zip", "fastmdxplora.log"}
+    {"project_bundle.zip", "fastmdxplora.log", ".DS_Store"}
+)
+EXCLUDE_DIR_NAMES: frozenset[str] = frozenset(
+    {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".cache", ".ipynb_checkpoints"}
+)
+EXCLUDE_SUFFIXES: tuple[str, ...] = (
+    ".pyc",
+    ".pyo",
+    ".tmp",
+    ".temp",
+    ".part",
+    ".swp",
+    "~",
 )
 
 
@@ -34,6 +46,10 @@ def _iter_project_files(root: Path, bundle_path: Path) -> list[Path]:
         if p.resolve() == bundle_path.resolve():
             continue
         if p.name in EXCLUDE_NAMES:
+            continue
+        if any(part in EXCLUDE_DIR_NAMES for part in p.relative_to(root).parts[:-1]):
+            continue
+        if p.name.endswith(EXCLUDE_SUFFIXES):
             continue
         files.append(p)
     return files

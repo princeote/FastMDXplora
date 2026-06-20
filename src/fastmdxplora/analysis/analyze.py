@@ -62,12 +62,10 @@ def run(
     planned analyses, and returns the list of artifact paths relative to
     ``output_dir``.
 
-    If neither the resolved trajectory nor topology exists on disk (which
-    is the normal state when the simulation phase has not yet produced
-    real trajectories — e.g. during the v0.1.x scaffold release), the
-    adapter writes a "deferred" manifest and returns gracefully. This
-    keeps the project-level pipeline runnable end-to-end while individual
-    phase backends mature.
+    If the resolved trajectory does not exist on disk, the adapter writes
+    a "deferred" manifest and returns gracefully. This keeps report-only
+    and partial-pipeline workflows runnable while clearly recording the
+    missing input.
     """
     import json
 
@@ -85,9 +83,9 @@ def run(
             "status": "deferred",
             "note": (
                 "No trajectory found at the expected path; the simulation "
-                "phase has not yet produced real output. The analysis phase "
-                "scaffolding is in place and will run once the simulation "
-                "phase is wired in v0.2+."
+                "phase has not produced the trajectory needed for analysis. "
+                "Run the simulation phase first, or pass explicit "
+                "`analysis.trajectory` and `analysis.topology` paths."
             ),
             "expected_trajectory": str(traj_path),
             "expected_topology": str(top_path),
@@ -97,7 +95,7 @@ def run(
             json.dump(deferred, fh, indent=2)
         logger.debug("analysis: trajectory not found, deferring (wrote %s)", manifest_path)
         if presenter:
-            presenter.info("(no trajectory available yet — deferred to a future release)")
+            presenter.info("(no trajectory available — analysis deferred)")
         return ["analysis_manifest.json"]
 
     # Detect a ligand from the setup manifest so scope-based selections can

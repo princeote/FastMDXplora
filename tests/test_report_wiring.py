@@ -392,3 +392,109 @@ def test_powerpoint_handles_weird_title_and_system(tmp_path: Path):
     prs = Presentation(str(pptx))
     assert len(prs.slides) >= 1
     assert "\n# heading" not in prs.slides[0].shapes.title.text
+
+
+def test_analysis_report_only_wording_uses_existing_trajectory(tmp_path: Path):
+    from pptx import Presentation
+
+    root = tmp_path / "analysis_only"
+    analysis = root / "analysis"
+    analysis.mkdir(parents=True)
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "system": "1L2Y",
+                "phases": [
+                    {"name": "analysis", "status": "ok"},
+                    {"name": "report", "status": "ok"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (analysis / "analysis_manifest.json").write_text(
+        json.dumps(
+            {
+                "plan": ["rmsd"],
+                "n_frames": 10,
+                "n_residues": 20,
+                "results": {"rmsd": {"status": "ok"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    rmsd_dir = analysis / "rmsd"
+    rmsd_dir.mkdir()
+    (rmsd_dir / "options.json").write_text(
+        json.dumps({"selection": "name CA", "options": {"align": True}}),
+        encoding="utf-8",
+    )
+
+    fmdx = FastMDXplora(system="1L2Y", output_dir=root)
+    result = fmdx.report(title="Analysis-only Trp-cage report", bundle=False)
+
+    assert result.status == "ok"
+    report = (root / "report" / "report.md").read_text(encoding="utf-8")
+    assert "end-to-end molecular dynamics study" not in report
+    assert "Simulation parameters were not recorded for this run" not in report
+    assert "This report was generated from an existing trajectory" in report
+    assert "Setup and simulation were not run in this workflow" in report
+    assert "Simulation was not run in this workflow" in report
+
+    outline = (root / "report" / "slides_outline.md").read_text(encoding="utf-8")
+    assert "Analysis/report workflow from an existing trajectory" in outline
+    assert "Setup and simulation were not run in this workflow" in outline
+    assert "## 2. Setup" not in outline
+    assert "## 3. Simulation" not in outline
+
+    prs = Presentation(str(root / "report" / "slides.pptx"))
+    all_text = "\n".join(
+        shape.text
+        for slide in prs.slides
+        for shape in slide.shapes
+        if hasattr(shape, "text")
+    )
+    assert "Analysis/report workflow from an existing trajectory" in all_text
+    assert "Setup and simulation were not run in this workflow" in all_text
+
+
+def test_full_pipeline_report_keeps_end_to_end_wording(tmp_path: Path):
+    root = tmp_path / "full_pipeline"
+    (root / "setup").mkdir(parents=True)
+    (root / "simulation").mkdir()
+    (root / "analysis").mkdir()
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "system": "1L2Y",
+                "phases": [
+                    {"name": "setup", "status": "ok"},
+                    {"name": "simulation", "status": "ok"},
+                    {"name": "analysis", "status": "ok"},
+                    {"name": "report", "status": "ok"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / "setup" / "setup_parameters.json").write_text(
+        json.dumps({"parameters": {"ph": 7.0}}),
+        encoding="utf-8",
+    )
+    (root / "simulation" / "simulation_parameters.json").write_text(
+        json.dumps({"parameters": {"duration_ns": 0.001}}),
+        encoding="utf-8",
+    )
+    (root / "analysis" / "analysis_manifest.json").write_text(
+        json.dumps({"plan": [], "results": {}}),
+        encoding="utf-8",
+    )
+
+    fmdx = FastMDXplora(system="1L2Y", output_dir=root)
+    result = fmdx.report(title="Full pipeline report", slides=False, bundle=False)
+
+    assert result.status == "ok"
+    report = (root / "report" / "report.md").read_text(encoding="utf-8")
+    assert "end-to-end molecular dynamics study" in report
+    assert "Production MD was performed" in report
+    assert "Setup and simulation were not run in this workflow" not in report

@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
+from fastmdxplora.report.context import PhaseContext, load_phase_context
+
 if TYPE_CHECKING:
     from fastmdxplora.orchestrator import FastMDXplora
 
@@ -66,7 +68,31 @@ def _load_json_safely(path: Path) -> dict | None:
         return None
 
 
-def _methods_section(project_root: Path) -> str:
+def _summary_section(phase_context: PhaseContext) -> str:
+    if phase_context.is_full_pipeline:
+        summary = (
+            "This report was generated automatically by FastMDXplora from the "
+            "outputs of an end-to-end molecular dynamics study."
+        )
+    elif phase_context.is_analysis_from_existing_trajectory:
+        summary = (
+            "This report was generated from an existing trajectory. Setup and "
+            "simulation were not run in this workflow."
+        )
+    elif phase_context.analysis_present:
+        summary = (
+            "This report summarizes the FastMDXplora phases recorded for this "
+            "workflow."
+        )
+    else:
+        summary = (
+            "This report summarizes the available FastMDXplora outputs for "
+            "this workflow."
+        )
+    return f"## Summary\n\n{summary}"
+
+
+def _methods_section(project_root: Path, phase_context: PhaseContext) -> str:
     setup = _load_json_safely(project_root / "setup" / "setup_parameters.json") or {}
     sim = _load_json_safely(project_root / "simulation" / "simulation_parameters.json") or {}
     setup_params = setup.get("parameters", {})
@@ -85,7 +111,10 @@ def _methods_section(project_root: Path) -> str:
             lines.append(f"- **{_md_text(k)}**: `{_code_text(v)}`")
     else:
         lines.append("")
-        lines.append("Setup parameters were not recorded for this run.")
+        if phase_context.setup_present:
+            lines.append("Setup ran in this workflow, but parameters were not recorded.")
+        else:
+            lines.append("Setup was not run in this workflow.")
 
     lines.append("")
     lines.append("### Molecular dynamics simulation")
@@ -99,7 +128,18 @@ def _methods_section(project_root: Path) -> str:
             lines.append(f"- **{_md_text(k)}**: `{_code_text(v)}`")
     else:
         lines.append("")
-        lines.append("Simulation parameters were not recorded for this run.")
+        if phase_context.simulation_present:
+            lines.append(
+                "Simulation ran in this workflow, but parameters were not recorded."
+            )
+        elif phase_context.analysis_present:
+            lines.append(
+                "Simulation was not run in this workflow. Analysis was performed "
+                "on externally provided or previously generated trajectory/topology "
+                "files."
+            )
+        else:
+            lines.append("Simulation was not run in this workflow.")
 
     return "\n".join(lines)
 
@@ -214,7 +254,10 @@ def _citation_section() -> str:
     )
 
 
-def _reproducibility_section(orchestrator: "FastMDXplora") -> str:
+def _reproducibility_section(
+    orchestrator: "FastMDXplora",
+    phase_context: PhaseContext,
+) -> str:
     from fastmdxplora import __version__
 
     lines = ["## Reproducibility", ""]
@@ -224,12 +267,23 @@ def _reproducibility_section(orchestrator: "FastMDXplora") -> str:
     lines.append(f"- **System input**: `{_code_text(orchestrator.system)}`")
     lines.append(f"- **Output directory**: `{_code_text(orchestrator.output_dir)}`")
     lines.append("")
-    lines.append(
-        "Per-phase parameter manifests are preserved at "
-        "`setup/setup_parameters.json`, `simulation/simulation_parameters.json`, "
-        "and `analysis/analysis_manifest.json`. The complete session manifest "
-        "is at `manifest.json` at the project root."
-    )
+    manifests: list[str] = []
+    if phase_context.setup_present:
+        manifests.append("`setup/setup_parameters.json`")
+    if phase_context.simulation_present:
+        manifests.append("`simulation/simulation_parameters.json`")
+    if phase_context.analysis_present:
+        manifests.append("`analysis/analysis_manifest.json`")
+    if manifests:
+        lines.append(
+            "Per-phase parameter manifests for phases in this workflow are "
+            f"preserved at {', '.join(manifests)}. The complete session manifest "
+            "is at `manifest.json` at the project root."
+        )
+    else:
+        lines.append(
+            "The complete session manifest is at `manifest.json` at the project root."
+        )
     return "\n".join(lines)
 
 
@@ -250,6 +304,7 @@ def build_document(
         Artifact paths relative to ``output_dir``.
     """
     project_root = orchestrator.output_dir
+    phase_context = load_phase_context(project_root)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     sections: list[str] = []
@@ -260,13 +315,10 @@ def build_document(
     header.append(f"_Tool: FastMDXplora_")
     sections.append("\n".join(header))
 
-    sections.append(
-        "## Summary\n\nThis report was generated automatically by FastMDXplora "
-        "from the outputs of an end-to-end molecular dynamics study."
-    )
+    sections.append(_summary_section(phase_context))
 
     if include_methods:
-        sections.append(_methods_section(project_root))
+        sections.append(_methods_section(project_root, phase_context))
 
     sections.append(_results_section(project_root))
 
@@ -279,7 +331,7 @@ def build_document(
     sections.append(_citation_section())
 
     if include_reproducibility:
-        sections.append(_reproducibility_section(orchestrator))
+        sections.append(_reproducibility_section(orchestrator, phase_context))
 
     doc = "\n\n".join(sections) + "\n"
     md_path = output_dir / "report.md"

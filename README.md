@@ -41,6 +41,8 @@ FastMDXplora's four phases have different dependency footprints. The **analysis 
 
 The setup/simulation chemistry stack (OpenMM, PDBFixer) installs most reliably from conda-forge, so the full install uses the bundled `environment.yml`. We recommend `mamba` (a faster conda solver); plain `conda` works too.
 
+The bundled conda environment is constrained to Python 3.9–3.12 because OpenMM/openmmforcefields and their AmberTools dependencies are not yet available for Python 3.13 on conda-forge.
+
 ```bash
 git clone https://github.com/aai-research-lab/FastMDXplora.git
 cd FastMDXplora

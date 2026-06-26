@@ -57,13 +57,27 @@ pip install .
 
 > Don't have `mamba`? Either install Miniforge (see [below](#mamba--miniforge-optional)), or just use `conda`; the `||` above falls back to it automatically.
 
-### Analysis + report only (from PyPI)
+### Install and bootstrap from pip
 
-If you only need to analyze existing trajectories and build reports (no simulation), plain pip is enough, no conda required:
+You can install FastMDXplora with plain pip and then bootstrap the full runnable environment using the new CLI helper. This is the intended one-line setup flow for Linux, macOS, and Windows:
 
 ```bash
-pip install fastmdxplora              # primary package
-pip install fastmdx                    # alias (resolves to fastmdxplora)
+pip install fastmdxplora
+fastmdx bootstrap
+```
+
+`fastmdx bootstrap` will:
+- detect the OS and architecture
+- install Miniforge/conda if needed
+- create a `fastmdxplora` conda environment
+- install `fastmdxplora` into that environment
+- verify the CLI with `fastmdx info`
+
+If you only need analysis + reporting, plain pip still works without the chemistry stack:
+
+```bash
+pip install fastmdxplora
+pip install fastmdx
 ```
 
 This gives a fully working analysis + report pipeline, slide deck included (`python-pptx` is a core dependency). The setup and simulation phases emit a clear warning and skip gracefully until the chemistry stack is present. Add it via conda-forge (recommended, reliable across platforms):

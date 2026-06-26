@@ -452,6 +452,38 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Overwrite the output file if it already exists.",
     )
 
+    bs = sub.add_parser(
+        "bootstrap",
+        help="Create a runnable conda environment and install FastMDXplora.",
+        description=(
+            "Bootstrap FastMDXplora for full setup/simulation on Linux, macOS, or "
+            "Windows by creating a conda environment, installing the package, "
+            "and verifying the CLI."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    bs.add_argument(
+        "--env-name",
+        default="fastmdxplora",
+        help="Conda environment name to create (default: fastmdxplora).",
+    )
+    bs.add_argument(
+        "--python-version",
+        default="3.12",
+        help="Python version to install in the environment (3.9-3.12).",
+    )
+    bs.add_argument(
+        "--force",
+        action="store_true",
+        help="Recreate the environment if it already exists.",
+    )
+    bs.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Skip confirmation prompts if any.",
+    )
+
     return parser
 
 
@@ -659,6 +691,22 @@ def _cmd_init_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bootstrap(args: argparse.Namespace) -> int:
+    from fastmdxplora.bootstrap import bootstrap_environment, BootstrapError
+
+    try:
+        bootstrap_environment(
+            env_name=args.env_name,
+            python_version=args.python_version,
+            yes=args.yes,
+            force=args.force,
+        )
+        return 0
+    except BootstrapError as exc:
+        print(f"fastmdx: bootstrap failed: {exc}", file=sys.stderr)
+        return 1
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -694,6 +742,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "init-config":
         return _cmd_init_config(args)
+
+    if args.command == "bootstrap":
+        return _cmd_bootstrap(args)
 
     # Commands that build an orchestrator can hit config-file errors;
     # surface those cleanly rather than as a traceback.

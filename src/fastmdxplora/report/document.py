@@ -166,6 +166,47 @@ def _results_section(project_root: Path) -> str:
     lines.append(f"Analyses performed: {', '.join(_md_text(a) for a in plan)}.")
     lines.append("")
 
+    summary_fig = project_root / "report" / "analysis_summary.png"
+    summary_manifest = project_root / "report" / "analysis_summary_manifest.json"
+    if summary_fig.is_file():
+        lines.append("### Analysis Summary Figure")
+        lines.append("")
+        lines.append("![Analysis summary](analysis_summary.png)")
+        lines.append("")
+        if summary_manifest.is_file():
+            lines.append(
+                "_Panel inclusion and skipped optional source figures are recorded "
+                "in `analysis_summary_manifest.json`._"
+            )
+            lines.append("")
+
+    region_fig = project_root / "report" / "region_highlight_summary.png"
+    region_manifest = project_root / "report" / "region_highlight_manifest.json"
+    if region_fig.is_file():
+        lines.append("### Region Highlight Figure")
+        lines.append("")
+        lines.append(
+            "User-configured residue regions are highlighted on the RMSF "
+            "profile. These labels are user-provided annotations."
+        )
+        lines.append("")
+        lines.append("![Region highlights](region_highlight_summary.png)")
+        lines.append("")
+        if region_manifest.is_file():
+            lines.append(
+                "_Generation details and any skipped optional structure panel "
+                "are recorded in `region_highlight_manifest.json`._"
+            )
+            lines.append("")
+            region_meta = _load_json_safely(region_manifest) or {}
+            skipped = region_meta.get("skipped") or []
+            for item in skipped:
+                reason = item.get("reason")
+                if reason:
+                    lines.append(f"_Structure note: {_md_text(reason)}_")
+                    lines.append("")
+                    break
+
     for analysis in plan:
         # Pretty heading: uppercase short names, title-case longer ones
         heading = analysis.upper() if len(analysis) <= 4 else analysis.title()
@@ -312,7 +353,8 @@ def build_document(
     if author:
         header.append(f"_Author: {_md_text(author, limit=200)}_  ")
     header.append(f"_Generated: {now} (UTC)_  ")
-    header.append(f"_Tool: FastMDXplora_")
+    header.append("_Tool: FastMDXplora_  ")
+    header.append("_Dashboard: [dashboard.html](dashboard.html)_")
     sections.append("\n".join(header))
 
     sections.append(_summary_section(phase_context))

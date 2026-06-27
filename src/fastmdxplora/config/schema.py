@@ -278,6 +278,11 @@ SIMULATION = PhaseSchema(
         Field("checkpoint_interval_steps", int, 10000,
               "Binary checkpoint (.chk) interval in steps, for restart / "
               "crash recovery. 0 disables checkpointing."),
+        Field("live_telemetry", bool, False,
+              "Write live_status.json, live_metrics.csv, and live_events.log "
+              "for the local live dashboard."),
+        Field("telemetry_interval", int, 1000,
+              "Minimum step interval for live dashboard telemetry updates."),
         Field("plumed", dict, None,
               "Optional PLUMED enhanced-sampling config: a dict with "
               "`enabled` (bool) and `script` (inline PLUMED text or a path "
@@ -355,6 +360,14 @@ REPORT = PhaseSchema(
               "Include the Methods section in the document."),
         Field("include_reproducibility", bool, True,
               "Include the Reproducibility section in the document."),
+        Field("region_highlights", list, None,
+              "Optional user-defined residue ranges to highlight on RMSF "
+              "report figures. Each item should include label, start, end, "
+              "and optionally color.",
+              example=[
+                  {"label": "example region 1", "start": 3, "end": 7, "color": "#4E79A7"},
+                  {"label": "example helix", "start": 10, "end": 14, "color": "#F28E2B"},
+              ]),
         Field("comparison", bool, True,
               "For a multi-run study, build the cross-run comparison report "
               "(overlays + parameter trends) under comparison/."),

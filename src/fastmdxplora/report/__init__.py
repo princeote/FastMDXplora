@@ -5,6 +5,7 @@ FastMDXplora run:
 
   - Slides (.pptx) — auto-generated slide deck
   - Document (.md, .pdf) — structured study report
+  - Dashboard (.html) — static dashboard for browser viewing
   - Bundle (.zip) — self-contained project archive
 
 This is genuinely new functionality unique to FastMDXplora (not inherited

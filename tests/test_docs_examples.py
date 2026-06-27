@@ -37,6 +37,7 @@ from scripts.run_pdb_smoke_campaign import build_parser as build_campaign_parser
         ),
         "analyze --output ./trpcage_study --analyses rmsd rg --selection 'name CA'",
         "report --output ./trpcage_study --no-slides",
+        "dashboard serve --output ./trpcage_study --port 8765",
         "init-config --minimal -o study.yml",
         "info",
     ],
@@ -78,7 +79,19 @@ def test_documented_configuration_shape_validates() -> None:
             "setup": {"ph": 7.0, "forcefield": "charmm36"},
             "simulation": {"preset": "gentle", "duration_ns": 10},
             "analysis": {"scope": "solute", "include": ["rmsd", "rmsf", "rg"]},
-            "report": {"title": "My study", "slides": True, "comparison": True},
+            "report": {
+                "title": "My study",
+                "slides": True,
+                "comparison": True,
+                "region_highlights": [
+                    {
+                        "label": "example flexible loop",
+                        "start": 3,
+                        "end": 7,
+                        "color": "#4E79A7",
+                    }
+                ],
+            },
         },
         require_systems=True,
     )

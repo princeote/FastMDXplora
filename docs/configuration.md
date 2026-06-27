@@ -42,6 +42,11 @@ analysis:
 report:
   title: "My study"
   slides: true
+  region_highlights:
+    - label: "example region 1"
+      start: 3
+      end: 7
+      color: "#4E79A7"
 ```
 
 ## Protein-ligand studies
@@ -78,4 +83,12 @@ keys:
 - **analysis**: `scope`, `selection`, `include`, `exclude`, `stride`,
   `first`, `last`, `options`.
 - **report**: `title`, `author`, `document`, `slides`, `bundle`,
-  `include_methods`, `include_reproducibility`, `comparison`.
+  `include_methods`, `include_reproducibility`, `region_highlights`,
+  `comparison`.
+
+See [Region highlight figures](region_highlights.md) for RMSF-specific
+residue-region highlight examples and output paths.
+
+`fastmdx report` also writes a static dashboard at
+`<output>/report/dashboard.html` using only metrics and plots present in
+the run outputs.

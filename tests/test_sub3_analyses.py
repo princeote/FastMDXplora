@@ -262,6 +262,20 @@ class TestCluster:
             assert m in result.data
             assert (result.output_dir / f"cluster_{m}.dat").exists()
             assert (result.output_dir / f"cluster_{m}.png").exists()
+            assert (result.output_dir / f"cluster_{m}_counts.png").exists()
+        dendrogram = result.output_dir / "cluster_hierarchical_dendrogram.png"
+        skipped = result.output_dir / "cluster_hierarchical_dendrogram_skipped.json"
+        distance_matrix = result.output_dir / "hierarchical_distance_matrix.npy"
+        linkage_matrix = result.output_dir / "hierarchical_linkage.npy"
+        assert distance_matrix.exists()
+        assert dendrogram.exists() or skipped.exists()
+        if dendrogram.exists():
+            assert linkage_matrix.exists()
+            assert str(linkage_matrix) in [str(path) for path in result.artifacts]
+        if skipped.exists():
+            skip_info = json.loads(skipped.read_text(encoding="utf-8"))
+            assert skip_info["status"] == "skipped"
+            assert skip_info["reason"]
 
     def test_unknown_method_raises(self):
         with pytest.raises(ValueError, match="Unknown clustering"):

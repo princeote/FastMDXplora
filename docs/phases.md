@@ -52,6 +52,7 @@ Key outputs: `<analysis>/*.dat`, `<analysis>/*.png`, `analysis_manifest.json`.
 ## report
 
 Assembles the results into shareable deliverables: a structured Markdown
-report, a slide deck, and a self-contained project bundle.
+report, a static browser dashboard, a slide deck, and a self-contained
+project bundle.
 
-Key outputs: `report.md`, `slides.pptx`, `project_bundle.zip`.
+Key outputs: `report.md`, `dashboard.html`, `slides.pptx`, `project_bundle.zip`.

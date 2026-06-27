@@ -502,6 +502,46 @@ def _run_md_stage(
         raise _validation_error(label, f"OpenMM integration failed ({exc})") from exc
 
 
+def _run_md_stage_with_live_metrics(
+    omm: dict,
+    simulation: Any,
+    telemetry: Any,
+    *,
+    n_steps: int,
+    label: str,
+    on_progress: Callable[[str], None] | None,
+    current_step: int,
+    total_steps: int,
+    timestep_fs: float,
+    telemetry_interval: int,
+) -> int:
+    """Run an MD stage in chunks so live telemetry can sample real state."""
+    if n_steps <= 0:
+        return current_step
+    if on_progress:
+        on_progress(f"{label}: {n_steps:,} steps")
+    remaining = int(n_steps)
+    interval = max(1, int(telemetry_interval or DEFAULT_STATE_INTERVAL_STEPS))
+    while remaining > 0:
+        chunk = min(interval, remaining)
+        try:
+            simulation.step(chunk)
+        except Exception as exc:  # noqa: BLE001
+            raise _validation_error(label, f"OpenMM integration failed ({exc})") from exc
+        current_step += chunk
+        remaining -= chunk
+        _append_live_metric(
+            omm,
+            simulation,
+            telemetry,
+            stage=label,
+            step=current_step,
+            total_steps=total_steps,
+            timestep_fs=timestep_fs,
+        )
+    return current_step
+
+
 # ---------------------------------------------------------------------------
 # Stage planning
 # ---------------------------------------------------------------------------
@@ -621,6 +661,8 @@ def run_simulation(
     trajectory_interval_steps: int | None = None,
     state_interval_steps: int = DEFAULT_STATE_INTERVAL_STEPS,
     checkpoint_interval_steps: int = DEFAULT_CHECKPOINT_INTERVAL_STEPS,
+    live_telemetry: bool = False,
+    telemetry_interval: int = DEFAULT_STATE_INTERVAL_STEPS,
     # Hooks
     on_progress: Callable[[str], None] | None = None,
     # Enhanced sampling
@@ -671,6 +713,7 @@ def run_simulation(
     )
     if trajectory_interval_steps is None:
         trajectory_interval_steps = trajectory_interval_for(plan["production_steps"])
+    total_planned_steps = plan["nvt_steps"] + plan["npt_steps"] + plan["production_steps"]
 
     # ---- Deserialize System + State + Topology -------------------------
     if on_progress:
@@ -732,15 +775,46 @@ def run_simulation(
     # Open the log file once and route the per-stage progress notes
     # through it in addition to whatever on_progress does.
     log_fh = log_path.open("w", encoding="utf-8")
+    telemetry = None
+    if live_telemetry:
+        from fastmdxplora.live.telemetry import TelemetryWriter
+
+        planned_frames = (
+            plan["production_steps"] // trajectory_interval_steps
+            if trajectory_interval_steps and plan["production_steps"] > 0 else 0
+        )
+        telemetry = TelemetryWriter(
+            output_dir,
+            enabled=True,
+            total_steps=total_planned_steps,
+            planned_frames=planned_frames,
+            timestep_fs=timestep_fs,
+            platform=platform_name,
+            target_temperature_K=temperature_K,
+        )
+        telemetry.event("Live simulation telemetry started")
+        telemetry.write_status(
+            stage="loading",
+            status="running",
+            current_step=0,
+            total_planned_steps=total_planned_steps,
+            current_checkpoint_path=(output_dir / "checkpoint.chk").as_posix(),
+        )
+
     def _log_step(msg: str) -> None:
         log_fh.write(msg + "\n")
         log_fh.flush()
+        if telemetry is not None:
+            telemetry.event(msg)
         if on_progress:
             on_progress(msg)
 
     try:
         # ---- Stage 1: Minimize ----------------------------------------
         if minimize:
+            if telemetry is not None:
+                telemetry.write_status(stage="minimization", status="running", current_step=0)
+                telemetry.event("Minimization started")
             _run_minimize(
                 omm,
                 simulation,
@@ -766,6 +840,17 @@ def run_simulation(
             )
             with minimized_state_path.open("w", encoding="utf-8") as fh:
                 fh.write(omm["openmm"].XmlSerializer.serialize(minimized_state))
+            if telemetry is not None:
+                _append_live_metric(
+                    omm,
+                    simulation,
+                    telemetry,
+                    stage="minimization",
+                    step=0,
+                    total_steps=total_planned_steps,
+                    timestep_fs=timestep_fs,
+                )
+                telemetry.event("Minimization completed")
 
         # ---- Stage 2: NVT equilibration -------------------------------
         # Use the integrator's existing thermostat (Langevin). No barostat.
@@ -774,13 +859,43 @@ def run_simulation(
             interval=state_interval_steps,
             total_steps=plan["nvt_steps"] + plan["npt_steps"] + plan["production_steps"],
         )
-        _run_md_stage(
-            simulation,
-            n_steps=plan["nvt_steps"],
-            label="NVT equilibration",
-            on_progress=_log_step,
-        )
+        current_step = 0
+        if telemetry is not None:
+            telemetry.write_status(stage="NVT", status="running", current_step=current_step)
+            telemetry.event("NVT started")
+        if telemetry is not None:
+            current_step = _run_md_stage_with_live_metrics(
+                omm,
+                simulation,
+                telemetry,
+                n_steps=plan["nvt_steps"],
+                label="NVT equilibration",
+                on_progress=_log_step,
+                current_step=current_step,
+                total_steps=total_planned_steps,
+                timestep_fs=timestep_fs,
+                telemetry_interval=telemetry_interval,
+            )
+        else:
+            _run_md_stage(
+                simulation,
+                n_steps=plan["nvt_steps"],
+                label="NVT equilibration",
+                on_progress=_log_step,
+            )
+            current_step += plan["nvt_steps"]
         _validate_state_finite(omm, simulation, stage="NVT equilibration")
+        if telemetry is not None:
+            _append_live_metric(
+                omm,
+                simulation,
+                telemetry,
+                stage="NVT",
+                step=current_step,
+                total_steps=total_planned_steps,
+                timestep_fs=timestep_fs,
+            )
+            telemetry.event("NVT completed")
 
         # ---- Stage 3: NPT equilibration -------------------------------
         # Add the barostat and reinitialize the context so the system picks up
@@ -793,13 +908,42 @@ def run_simulation(
                 frequency=barostat_frequency,
             )
             simulation.context.reinitialize(preserveState=True)
-            _run_md_stage(
-                simulation,
-                n_steps=plan["npt_steps"],
-                label="NPT equilibration",
-                on_progress=_log_step,
-            )
+            if telemetry is not None:
+                telemetry.write_status(stage="NPT", status="running", current_step=current_step)
+                telemetry.event("NPT started")
+            if telemetry is not None:
+                current_step = _run_md_stage_with_live_metrics(
+                    omm,
+                    simulation,
+                    telemetry,
+                    n_steps=plan["npt_steps"],
+                    label="NPT equilibration",
+                    on_progress=_log_step,
+                    current_step=current_step,
+                    total_steps=total_planned_steps,
+                    timestep_fs=timestep_fs,
+                    telemetry_interval=telemetry_interval,
+                )
+            else:
+                _run_md_stage(
+                    simulation,
+                    n_steps=plan["npt_steps"],
+                    label="NPT equilibration",
+                    on_progress=_log_step,
+                )
+                current_step += plan["npt_steps"]
             _validate_state_finite(omm, simulation, stage="NPT equilibration")
+            if telemetry is not None:
+                _append_live_metric(
+                    omm,
+                    simulation,
+                    telemetry,
+                    stage="NPT",
+                    step=current_step,
+                    total_steps=total_planned_steps,
+                    timestep_fs=timestep_fs,
+                )
+                telemetry.event("NPT completed")
 
         # ---- Stage 4: Production --------------------------------------
         # Production runs in NPT (the standard default ensemble).
@@ -820,12 +964,30 @@ def run_simulation(
             omm, simulation, output_dir / "checkpoint.chk",
             interval=checkpoint_interval_steps,
         )
-        _run_md_stage(
-            simulation,
-            n_steps=plan["production_steps"],
-            label="Production",
-            on_progress=_log_step,
-        )
+        if telemetry is not None:
+            telemetry.write_status(stage="production", status="running", current_step=current_step)
+            telemetry.event("Production started")
+        if telemetry is not None:
+            current_step = _run_md_stage_with_live_metrics(
+                omm,
+                simulation,
+                telemetry,
+                n_steps=plan["production_steps"],
+                label="Production",
+                on_progress=_log_step,
+                current_step=current_step,
+                total_steps=total_planned_steps,
+                timestep_fs=timestep_fs,
+                telemetry_interval=telemetry_interval,
+            )
+        else:
+            _run_md_stage(
+                simulation,
+                n_steps=plan["production_steps"],
+                label="Production",
+                on_progress=_log_step,
+            )
+            current_step += plan["production_steps"]
 
         # ---- Finalize -------------------------------------------------
         # Capture the final State for restarts.
@@ -836,8 +998,36 @@ def run_simulation(
         )
         with final_state_path.open("w", encoding="utf-8") as fh:
             fh.write(omm["openmm"].XmlSerializer.serialize(final_state))
+        if telemetry is not None:
+            n_frames = (
+                plan["production_steps"] // trajectory_interval_steps
+                if plan["production_steps"] > 0 else 0
+            )
+            _append_live_metric(
+                omm,
+                simulation,
+                telemetry,
+                stage="production",
+                step=current_step,
+                total_steps=total_planned_steps,
+                timestep_fs=timestep_fs,
+                frame_count=n_frames,
+            )
+            telemetry.event("Production completed")
+            telemetry.write_status(
+                stage="completed",
+                status="completed",
+                current_step=current_step,
+                current_frame_count=n_frames,
+                simulation_time_completed_ns=plan["production_steps"] * timestep_fs / 1_000_000.0,
+            )
 
         _detach_all_reporters(simulation)
+    except Exception as exc:
+        if telemetry is not None:
+            telemetry.event(f"error: {type(exc).__name__}: {exc}", level="error")
+            telemetry.write_status(status="failed", latest_error=f"{type(exc).__name__}: {exc}")
+        raise
     finally:
         log_fh.close()
 
@@ -874,3 +1064,55 @@ def read_energy_csv(path: str | Path) -> list[dict[str, str]]:
     with p.open(newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
         return list(reader)
+
+
+def _append_live_metric(
+    omm: dict,
+    simulation: Any,
+    telemetry: Any,
+    *,
+    stage: str,
+    step: int,
+    total_steps: int,
+    timestep_fs: float,
+    frame_count: int | None = None,
+) -> None:
+    """Append one real state sample to live telemetry if OpenMM can provide it."""
+    unit = omm["unit"]
+    try:
+        state = simulation.context.getState(getEnergy=True, enforcePeriodicBox=True)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.event(f"warning: could not sample live metrics ({exc})", level="warning")
+        return
+    potential = _quantity_to_float(state.getPotentialEnergy(), unit.kilojoules_per_mole)
+    kinetic = _quantity_to_float(state.getKineticEnergy(), unit.kilojoules_per_mole)
+    total = None
+    if potential is not None and kinetic is not None:
+        total = potential + kinetic
+    sim_time_ns = float(step) * float(timestep_fs) / 1_000_000.0
+    progress = (float(step) / float(total_steps) * 100.0) if total_steps else None
+    telemetry.append_metric(
+        stage=stage,
+        step=step,
+        simulation_time_ns=sim_time_ns,
+        potential_energy=potential,
+        kinetic_energy=kinetic,
+        total_energy=total,
+        progress_percent=progress,
+    )
+    telemetry.write_status(
+        stage=stage,
+        status="running",
+        current_step=step,
+        current_frame_count=frame_count,
+        simulation_time_completed_ns=sim_time_ns,
+    )
+
+
+def _quantity_to_float(quantity: Any, unit_value: Any) -> float | None:
+    try:
+        value = _value_in_unit(quantity, unit_value)
+    except Exception:  # noqa: BLE001
+        return None
+    numbers = list(_flatten_numbers(value))
+    return numbers[0] if numbers else None

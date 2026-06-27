@@ -133,6 +133,10 @@ _SIMULATION_OPTIONS: list[tuple[str, str, dict[str, Any]]] = [
         "help": "GPU device index for multi-GPU machines (e.g. '0' or '0,1')."}),
     ("checkpoint-interval-steps", "checkpoint_interval_steps", {"type": int,
         "help": "Checkpoint (.chk) interval in steps; 0 disables (default 10000)."}),
+    ("live-telemetry", "live_telemetry", {"action": "store_true", "default": None,
+        "help": "Write lightweight live dashboard telemetry during simulation."}),
+    ("telemetry-interval", "telemetry_interval", {"type": int,
+        "help": "Minimum step interval for live telemetry updates (default 1000)."}),
     ("trajectory-interval-steps", "trajectory_interval_steps", {"type": int,
         "help": "Trajectory (.dcd) frame interval in steps (default: adaptive, ~2000 frames)."}),
     ("random-seed", "random_seed", {"type": int,
@@ -423,6 +427,38 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    dashboard = sub.add_parser(
+        "dashboard",
+        help="Serve local dashboard views for an existing output directory.",
+        description=(
+            "Serve a local-only dashboard for completed outputs and live "
+            "simulation telemetry. Binds to 127.0.0.1 by default."
+        ),
+    )
+    dashboard_sub = dashboard.add_subparsers(dest="dashboard_command", metavar="<dashboard-command>")
+    serve = dashboard_sub.add_parser(
+        "serve",
+        help="Serve the live dashboard for an output directory.",
+        description="Start the local dashboard server for an existing FastMDXplora output.",
+    )
+    serve.add_argument(
+        "--output",
+        required=True,
+        metavar="DIR",
+        help="FastMDXplora output directory to watch.",
+    )
+    serve.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address (default: 127.0.0.1).",
+    )
+    serve.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Port to serve on (default: 8765).",
+    )
+
     # init-config: write a commented YAML template
     ic = sub.add_parser(
         "init-config",
@@ -686,6 +722,16 @@ def _cmd_init_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    if args.dashboard_command != "serve":
+        print("fastmdx: dashboard requires a subcommand, e.g. `dashboard serve`.", file=sys.stderr)
+        return 2
+    from fastmdxplora.live.server import serve_dashboard
+
+    serve_dashboard(output=args.output, host=args.host, port=args.port)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -721,6 +767,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "init-config":
         return _cmd_init_config(args)
+    if args.command == "dashboard":
+        return _cmd_dashboard(args)
 
     # Commands that build an orchestrator can hit config-file errors;
     # surface those cleanly rather than as a traceback.

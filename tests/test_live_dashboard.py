@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import socket
 from pathlib import Path
 from urllib.request import urlopen
 
 from fastmdxplora.cli.main import _build_parser
 from fastmdxplora.live import protein_preview
 from fastmdxplora.live.protein_preview import protein_preview_payload
-from fastmdxplora.live.server import start_test_server
+from fastmdxplora.live.server import start_dashboard_session, start_test_server
 from fastmdxplora.live.telemetry import TelemetryWriter, analyze_health, read_events, read_metrics, read_status
 
 
@@ -255,6 +256,42 @@ def test_static_3dmol_asset_is_served_locally(tmp_path: Path) -> None:
     assert "$3Dmol" in body
     assert "http://" not in body[:1000]
     assert "https://" not in body[:1000]
+
+
+def test_dashboard_session_uses_next_port_when_requested_port_is_busy(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen()
+    requested_port = blocker.getsockname()[1]
+
+    session = start_dashboard_session(
+        output=run,
+        host="127.0.0.1",
+        port=requested_port,
+        max_port_tries=5,
+    )
+    try:
+        assert session.requested_port == requested_port
+        assert session.port != requested_port
+        assert session.port_was_changed is True
+        assert session.url == f"http://127.0.0.1:{session.port}"
+    finally:
+        session.stop()
+        blocker.close()
+
+
+def test_dashboard_session_stop_is_safe(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    session = start_dashboard_session(output=run, port=0)
+
+    assert session.thread.is_alive()
+    session.stop()
+    assert not session.thread.is_alive()
 
 
 def test_protein_preview_unavailable_without_structure(tmp_path: Path) -> None:

@@ -315,6 +315,35 @@ def _common_input_args(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Also stream debug logging to the terminal.",
     )
+    dash = p.add_argument_group("dashboard")
+    dash.add_argument(
+        "--dashboard",
+        "--live-dashboard",
+        dest="dashboard",
+        action="store_true",
+        default=False,
+        help=(
+            "Launch the local live dashboard for this output folder before "
+            "the workflow starts. Implies live telemetry when simulation runs."
+        ),
+    )
+    dash.add_argument(
+        "--dashboard-host",
+        default="127.0.0.1",
+        help="Dashboard bind address (default: 127.0.0.1).",
+    )
+    dash.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=8765,
+        help="Dashboard port (default: 8765; next free port is used if busy).",
+    )
+    dash.add_argument(
+        "--dashboard-stop-on-complete",
+        action="store_true",
+        default=False,
+        help="Stop the dashboard automatically when the command completes.",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -604,6 +633,62 @@ def _build_explore_config(args: argparse.Namespace) -> dict[str, Any]:
     return config
 
 
+def _dashboard_requested(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "dashboard", False))
+
+
+def _enable_dashboard_telemetry(config: dict[str, Any]) -> None:
+    simulation = dict(config.get("simulation", {}))
+    simulation["live_telemetry"] = True
+    config["simulation"] = simulation
+
+
+def _start_dashboard_for_command(args: argparse.Namespace, output_dir: Path):
+    from fastmdxplora.live.server import start_dashboard_session
+
+    session = start_dashboard_session(
+        output=output_dir,
+        host=args.dashboard_host,
+        port=args.dashboard_port,
+    )
+    print(f"Live dashboard running at: {session.url}")
+    if session.port_was_changed:
+        print(
+            f"Requested port {session.requested_port} was busy, "
+            f"so FastMDXplora used {session.port}."
+        )
+    if args.dashboard_host == "0.0.0.0":
+        print(
+            "Warning: dashboard is bound to 0.0.0.0 and may be visible on your network."
+        )
+        print("Use --dashboard-host 127.0.0.1 for local-only access.")
+    print(f"Watching output folder: {output_dir}")
+    print("Open this URL in your browser to monitor the run.")
+    if args.dashboard_stop_on_complete:
+        print("Dashboard will stop automatically after the workflow completes.")
+    else:
+        print("Press Ctrl+C to stop the dashboard after the workflow completes.")
+    print()
+    return session
+
+
+def _finish_dashboard_for_command(session, args: argparse.Namespace) -> None:
+    if session is None:
+        return
+    if args.dashboard_stop_on_complete:
+        session.stop()
+        return
+    print()
+    print(f"Workflow complete. Live dashboard is still running at: {session.url}")
+    print("Press Ctrl+C to stop the dashboard.")
+    try:
+        session.wait_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        session.stop()
+
+
 def _cmd_explore(args: argparse.Namespace) -> int:
     from fastmdxplora import FastMDXplora
 
@@ -627,12 +712,27 @@ def _cmd_explore(args: argparse.Namespace) -> int:
         if "report" not in existing:
             config["exclude"] = [*existing, "report"]
 
+    if _dashboard_requested(args):
+        _enable_dashboard_telemetry(config)
+
     fmdx = FastMDXplora(
         config_data=config,
         output_dir=args.output_dir,
         verbose=args.verbose,
     )
-    results = fmdx.explore(dry_run=getattr(args, "dry_run", False))
+    session = None
+    if _dashboard_requested(args) and not getattr(args, "dry_run", False):
+        session = _start_dashboard_for_command(args, fmdx.output_dir)
+    try:
+        results = fmdx.explore(dry_run=getattr(args, "dry_run", False))
+    except KeyboardInterrupt:
+        if session is not None:
+            session.stop()
+        return 130
+    except Exception:
+        if session is not None:
+            session.stop()
+        raise
 
     # Dry run: the plan was printed; nothing executed.
     if getattr(args, "dry_run", False):
@@ -643,13 +743,17 @@ def _cmd_explore(args: argparse.Namespace) -> int:
         print()
         print(f"Project output: {fmdx.output_dir}")
         print(f"Manifest:       {fmdx.output_dir / 'manifest.json'}")
-    return 0 if all(r.status == "ok" for r in results) else 1
+    rc = 0 if all(r.status == "ok" for r in results) else 1
+    _finish_dashboard_for_command(session, args)
+    return rc
 
 
 def _cmd_phase(phase: str, args: argparse.Namespace) -> int:
     fmdx = _make_orchestrator(args, phase=phase)
     opts_list, _ = _PHASE_SPEC[phase]
     kwargs = _harvest_phase_options(args, opts_list)
+    if _dashboard_requested(args) and phase == "simulate":
+        kwargs["live_telemetry"] = True
 
     method = {
         "setup":    fmdx.setup,
@@ -660,13 +764,27 @@ def _cmd_phase(phase: str, args: argparse.Namespace) -> int:
 
     # Bracket the single-phase invocation with presenter output so the
     # user sees the same visual structure as during `fastmdx explore`.
-    fmdx._presenter.phase_start(phase)  # noqa: SLF001 -- internal hook
-    result = method(**kwargs)
-    fmdx._presenter.phase_end(phase, status=result.status)
-    fmdx._write_manifest()  # noqa: SLF001 -- single-phase still records
+    session = None
+    if _dashboard_requested(args):
+        session = _start_dashboard_for_command(args, fmdx.output_dir)
+    try:
+        fmdx._presenter.phase_start(phase)  # noqa: SLF001 -- internal hook
+        result = method(**kwargs)
+        fmdx._presenter.phase_end(phase, status=result.status)
+        fmdx._write_manifest()  # noqa: SLF001 -- single-phase still records
+    except KeyboardInterrupt:
+        if session is not None:
+            session.stop()
+        return 130
+    except Exception:
+        if session is not None:
+            session.stop()
+        raise
     print()
     print(f"Project output: {fmdx.output_dir}")
-    return 0 if result.status == "ok" else 1
+    rc = 0 if result.status == "ok" else 1
+    _finish_dashboard_for_command(session, args)
+    return rc
 
 
 def _cmd_info() -> int:

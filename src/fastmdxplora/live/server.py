@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import mimetypes
 import threading
+import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -93,6 +95,35 @@ PLOT_CATEGORY_BY_TITLE = {
 }
 
 KEY_PLOT_TITLES = {"RMSD", "RMSF", "Radius of gyration", "Hydrogen bonds", "PCA", "SASA"}
+
+
+@dataclass
+class DashboardSession:
+    """Background local dashboard server session."""
+
+    server: ThreadingHTTPServer
+    thread: threading.Thread
+    root: Path
+    host: str
+    port: int
+    requested_port: int
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    @property
+    def port_was_changed(self) -> bool:
+        return self.port != self.requested_port
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def wait_forever(self) -> None:
+        while self.thread.is_alive():
+            time.sleep(0.2)
 
 
 def make_handler(project_root: str | Path) -> type[BaseHTTPRequestHandler]:
@@ -223,17 +254,60 @@ def serve_dashboard(
     host: str = "127.0.0.1",
     port: int = 8765,
 ) -> None:
-    root = Path(output).resolve()
-    handler = make_handler(root)
-    server = ThreadingHTTPServer((host, int(port)), handler)
-    url = f"http://{host}:{server.server_address[1]}"
-    print(f"Live dashboard running at {url}")
-    print(f"Watching: {root}")
+    session = start_dashboard_session(output=output, host=host, port=port)
+    print(f"Live dashboard running at {session.url}")
+    if session.port_was_changed:
+        print(
+            f"Requested port {session.requested_port} was busy, "
+            f"so FastMDXplora used {session.port}."
+        )
+    print(f"Watching: {session.root}")
     print("Press Ctrl+C to stop.")
     try:
-        server.serve_forever()
+        session.wait_forever()
+    except KeyboardInterrupt:
+        pass
     finally:
-        server.server_close()
+        session.stop()
+
+
+def start_dashboard_session(
+    *,
+    output: str | Path,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    max_port_tries: int = 50,
+) -> DashboardSession:
+    """Start the local dashboard server in a background thread."""
+    root = Path(output).resolve()
+    handler = make_handler(root)
+    requested_port = int(port)
+    candidates = [0] if requested_port == 0 else range(requested_port, requested_port + max_port_tries)
+    last_error: OSError | None = None
+    for candidate in candidates:
+        try:
+            server = ThreadingHTTPServer((host, int(candidate)), handler)
+        except OSError as exc:
+            last_error = exc
+            continue
+        actual_port = int(server.server_address[1])
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name=f"FastMDXLiveDashboard:{actual_port}",
+            daemon=True,
+        )
+        thread.start()
+        return DashboardSession(
+            server=server,
+            thread=thread,
+            root=root,
+            host=host,
+            port=actual_port,
+            requested_port=requested_port,
+        )
+    if last_error is not None:
+        raise last_error
+    raise OSError("No dashboard ports were available")
 
 
 def start_test_server(project_root: str | Path) -> tuple[ThreadingHTTPServer, str]:

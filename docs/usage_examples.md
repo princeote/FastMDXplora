@@ -109,19 +109,22 @@ The report phase writes `report/report.md`, `report/dashboard.html`,
 `<output>/report/dashboard.html` directly in a browser for the static
 dashboard view.
 
-For local live monitoring during a simulation, enable telemetry and serve the
-output directory:
+For local live monitoring, add `--dashboard` to the workflow command. This
+starts the localhost dashboard before the workflow begins and automatically
+enables live telemetry when simulation runs:
 
 ```bash
-fastmdx explore --system protein.pdb --output ./trpcage_study --include setup simulation --simulate-live-telemetry
-fastmdx dashboard serve --output ./trpcage_study
+fastmdx explore --system protein.pdb --output ./trpcage_study --include setup simulation --dashboard
 ```
 
 PowerShell fallback when `fastmdx` is not on PATH:
 
 ```powershell
-python -m fastmdxplora.cli.main dashboard serve --output .\trpcage_study
+python -m fastmdxplora.cli.main explore --system protein.pdb --output .\trpcage_study --include setup simulation --dashboard
 ```
+
+`fastmdx dashboard serve --output ./trpcage_study` remains available when you
+want to reopen an existing run folder manually.
 
 ### MD engine controls
 

@@ -30,13 +30,19 @@ from scripts.run_pdb_smoke_campaign import build_parser as build_campaign_parser
             "explore -s protein.pdb --include setup simulation "
             "--simulate-preset gentle --simulate-platform CPU --dry-run"
         ),
+        (
+            "explore --system local_pdbs/1L2Y.pdb "
+            "--output local_runs/trpcage_live_full "
+            "--include setup simulation analysis report "
+            "--simulate-preset gentle --dashboard"
+        ),
         "setup --system protein.pdb --ph 6.5 --box-shape octahedron",
         (
             "simulate --system protein.pdb --output ./trpcage_study "
-            "--duration-ns 50.0 --platform CUDA"
+            "--duration-ns 50.0 --platform CUDA --dashboard"
         ),
         "analyze --output ./trpcage_study --analyses rmsd rg --selection 'name CA'",
-        "report --output ./trpcage_study --no-slides",
+        "report --output ./trpcage_study --no-slides --dashboard",
         "dashboard serve --output ./trpcage_study --port 8765",
         "init-config --minimal -o study.yml",
         "info",

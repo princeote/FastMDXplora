@@ -12,50 +12,96 @@ The live dashboard does not replace the static report dashboard. It adds a
 separate monitoring view for progress, health messages, recent events, and
 available energy/temperature samples.
 
-## Start the local server
+## Recommended: start it with the workflow
 
-From a run output folder:
+For normal runs, add `--dashboard` to the command that creates or watches the
+output folder. FastMDXplora starts the localhost dashboard before setup or
+simulation begins, prints the URL, and automatically enables live telemetry
+when simulation runs:
+
+```bash
+fastmdx explore --system local_pdbs/1L2Y.pdb \
+  --output local_runs/trpcage_live_full \
+  --include setup simulation analysis report \
+  --simulate-preset gentle \
+  --dashboard
+```
+
+If the `fastmdx` console script is not on PATH, use the module entrypoint.
+This is also the recommended form for Windows PowerShell:
+
+```powershell
+python -m fastmdxplora.cli.main explore `
+  --system local_pdbs\1L2Y.pdb `
+  --output local_runs\trpcage_live_full `
+  --include setup simulation analysis report `
+  --simulate-preset gentle `
+  --dashboard
+```
+
+The CLI prints the selected URL before the workflow starts:
+
+```text
+Live dashboard running at: http://127.0.0.1:8765
+Watching output folder: local_runs/trpcage_live_full
+Open this URL in your browser to monitor the run.
+Press Ctrl+C to stop the dashboard after the workflow completes.
+```
+
+By default the server binds to `127.0.0.1:8765`, so it is local to your
+machine. If the requested port is busy, FastMDXplora chooses the next
+available port and prints the actual URL:
+
+```text
+Live dashboard running at: http://127.0.0.1:8766
+Requested port 8765 was busy, so FastMDXplora used 8766.
+Watching output folder: local_runs/my_run
+```
+
+Use `--dashboard-port` or `--dashboard-host` to customize the bind address:
+
+```bash
+fastmdx explore --system protein.pdb --output local_runs/my_run --dashboard --dashboard-port 8770
+```
+
+Binding to all interfaces can expose the dashboard on your network:
+
+```bash
+fastmdx explore --system protein.pdb --output local_runs/my_run --dashboard --dashboard-host 0.0.0.0
+```
+
+FastMDXplora prints a warning when `--dashboard-host 0.0.0.0` is used. Prefer
+`--dashboard-host 127.0.0.1` for local-only access.
+
+By default the dashboard stays open after the workflow completes so you can
+inspect final Analysis Plots and Generated Files. Press Ctrl+C to stop it. Use
+`--dashboard-stop-on-complete` when you want the command to exit immediately
+after the workflow finishes.
+
+## Manual fallback for existing runs
+
+You can still reopen an existing output directory without running a workflow:
 
 ```bash
 fastmdx dashboard serve --output local_runs/my_run
 ```
 
-If the `fastmdx` console script is not on PATH, use the module entrypoint:
+If the `fastmdx` console script is not on PATH:
 
 ```bash
 python -m fastmdxplora.cli.main dashboard serve --output local_runs/my_run
 ```
 
-PowerShell:
+## Live telemetry
 
-```powershell
-python -m fastmdxplora.cli.main dashboard serve --output local_runs\my_run
-```
-
-By default the server binds to `127.0.0.1:8765`, so it is local to your
-machine:
-
-```text
-Live dashboard running at http://127.0.0.1:8765
-Watching: local_runs/my_run
-Press Ctrl+C to stop.
-```
-
-Use `--port` if that port is already busy:
-
-```bash
-fastmdx dashboard serve --output local_runs/my_run --port 8770
-```
-
-## Record live telemetry during simulation
-
-Enable telemetry on simulation runs:
+`--dashboard` automatically implies `--simulate-live-telemetry` when simulation
+runs. Existing explicit telemetry flags still work for tuning:
 
 ```bash
 fastmdx explore --system protein.pdb \
   --output local_runs/my_run \
   --include setup simulation \
-  --simulate-live-telemetry \
+  --dashboard \
   --simulate-telemetry-interval 1000
 ```
 
@@ -155,7 +201,7 @@ Dashboard. It now also includes a Live Simulation sidebar entry:
 
 - If telemetry exists, it shows the last recorded status.
 - If telemetry does not exist, it explains how to start
-  `fastmdx dashboard serve --output ...`.
+  `fastmdx explore ... --dashboard` or `fastmdx dashboard serve --output ...`.
 
 ## Demo or preview output
 
@@ -166,11 +212,5 @@ fastmdx explore --system local_pdbs/1L2Y.pdb \
   --output local_runs/live_demo \
   --include setup simulation analysis report \
   --simulate-preset gentle \
-  --simulate-live-telemetry
-```
-
-Then serve the output:
-
-```bash
-fastmdx dashboard serve --output local_runs/live_demo
+  --dashboard
 ```

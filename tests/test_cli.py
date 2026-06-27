@@ -273,6 +273,75 @@ def test_cli_dashboard_starts_server_and_prints_url(tmp_path: Path, capsys) -> N
     assert "Open this URL in your browser to monitor the run." in text
 
 
+def test_cli_explore_dashboard_does_not_read_missing_output_dir(
+    tmp_path: Path,
+) -> None:
+    pdb = _make_pdb_stub(tmp_path)
+    out = tmp_path / "run"
+    session = _FakeDashboardSession()
+
+    def fake_explore(self, *, dry_run=False):
+        self.output_dir = out
+        return [SimpleNamespace(status="ok")]
+
+    with patch(
+        "fastmdxplora.live.server.start_dashboard_session",
+        return_value=session,
+    ) as start, patch.object(FastMDXplora, "explore", fake_explore):
+        rc = main(
+            [
+                "explore",
+                "--system",
+                str(pdb),
+                "--output",
+                str(out),
+                "--include",
+                "setup",
+                "simulation",
+                "analysis",
+                "report",
+                "--simulate-preset",
+                "gentle",
+                "--dashboard",
+                "--dashboard-stop-on-complete",
+            ]
+        )
+
+    assert rc == 0
+    assert start.call_args.kwargs["output"] == out.resolve()
+    assert session.stopped is True
+
+
+def test_cli_phase_dashboard_uses_cli_output_path(tmp_path: Path) -> None:
+    pdb = _make_pdb_stub(tmp_path)
+    out = tmp_path / "phase_run"
+    session = _FakeDashboardSession()
+
+    with patch(
+        "fastmdxplora.live.server.start_dashboard_session",
+        return_value=session,
+    ) as start, patch.object(
+        FastMDXplora,
+        "setup",
+        return_value=SimpleNamespace(status="ok"),
+    ):
+        rc = main(
+            [
+                "setup",
+                "--system",
+                str(pdb),
+                "--output",
+                str(out),
+                "--dashboard",
+                "--dashboard-stop-on-complete",
+            ]
+        )
+
+    assert rc == 0
+    assert start.call_args.kwargs["output"] == out.resolve()
+    assert session.stopped is True
+
+
 def test_cli_dashboard_prints_port_conflict_and_host_warning(
     tmp_path: Path,
     capsys,

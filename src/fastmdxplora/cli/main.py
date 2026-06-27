@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -643,6 +644,16 @@ def _enable_dashboard_telemetry(config: dict[str, Any]) -> None:
     config["simulation"] = simulation
 
 
+def _resolve_dashboard_output_dir(args: argparse.Namespace, config: dict[str, Any] | None = None) -> Path:
+    raw_output = getattr(args, "output_dir", None)
+    if not raw_output and config:
+        raw_output = config.get("output")
+    if not raw_output:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        raw_output = f"fastmdxplora_output_{timestamp}"
+    return Path(raw_output).expanduser().resolve()
+
+
 def _start_dashboard_for_command(args: argparse.Namespace, output_dir: Path):
     from fastmdxplora.live.server import start_dashboard_session
 
@@ -714,6 +725,10 @@ def _cmd_explore(args: argparse.Namespace) -> int:
 
     if _dashboard_requested(args):
         _enable_dashboard_telemetry(config)
+    dashboard_output_dir: Path | None = None
+    if _dashboard_requested(args):
+        dashboard_output_dir = _resolve_dashboard_output_dir(args, config)
+        config["output"] = str(dashboard_output_dir)
 
     fmdx = FastMDXplora(
         config_data=config,
@@ -722,7 +737,7 @@ def _cmd_explore(args: argparse.Namespace) -> int:
     )
     session = None
     if _dashboard_requested(args) and not getattr(args, "dry_run", False):
-        session = _start_dashboard_for_command(args, fmdx.output_dir)
+        session = _start_dashboard_for_command(args, dashboard_output_dir)
     try:
         results = fmdx.explore(dry_run=getattr(args, "dry_run", False))
     except KeyboardInterrupt:
@@ -766,7 +781,10 @@ def _cmd_phase(phase: str, args: argparse.Namespace) -> int:
     # user sees the same visual structure as during `fastmdx explore`.
     session = None
     if _dashboard_requested(args):
-        session = _start_dashboard_for_command(args, fmdx.output_dir)
+        output_dir = _resolve_dashboard_output_dir(args)
+        if not getattr(args, "output_dir", None):
+            output_dir = Path(fmdx.output_dir).expanduser().resolve()
+        session = _start_dashboard_for_command(args, output_dir)
     try:
         fmdx._presenter.phase_start(phase)  # noqa: SLF001 -- internal hook
         result = method(**kwargs)

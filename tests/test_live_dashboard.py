@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import socket
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 from fastmdxplora.cli.main import _build_parser
@@ -240,6 +241,66 @@ def test_live_json_endpoints_are_no_store(tmp_path: Path) -> None:
         server.server_close()
 
 
+def test_live_json_endpoints_are_sane_for_empty_run(tmp_path: Path) -> None:
+    run = tmp_path / "empty_run"
+
+    server, base_url = start_test_server(run)
+    try:
+        status_payload = json.loads(urlopen(f"{base_url}/api/status", timeout=5).read())
+        metrics_payload = json.loads(urlopen(f"{base_url}/api/metrics", timeout=5).read())
+        events_payload = json.loads(urlopen(f"{base_url}/api/events", timeout=5).read())
+        artifacts_payload = json.loads(urlopen(f"{base_url}/api/artifacts", timeout=5).read())
+        results_payload = json.loads(urlopen(f"{base_url}/api/results", timeout=5).read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert status_payload["status"] == {}
+    assert status_payload["health"]["state"] == "unknown"
+    assert metrics_payload["metrics"] == []
+    assert events_payload["events"] == []
+    assert artifacts_payload["artifacts"] == []
+    assert results_payload["has_analysis"] is False
+    assert results_payload["has_report"] is False
+    assert results_payload["plots"] == []
+
+
+def test_live_server_rejects_artifact_path_traversal(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    server, base_url = start_test_server(run)
+    try:
+        try:
+            urlopen(f"{base_url}/artifacts/../outside.txt", timeout=5)
+        except HTTPError as exc:
+            assert exc.code in {403, 404}
+        else:
+            raise AssertionError("path traversal unexpectedly succeeded")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_live_server_does_not_serve_static_path_traversal(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+
+    server, base_url = start_test_server(run)
+    try:
+        try:
+            urlopen(f"{base_url}/static/../server.py", timeout=5)
+        except HTTPError as exc:
+            assert exc.code == 404
+        else:
+            raise AssertionError("static traversal unexpectedly succeeded")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_static_3dmol_asset_is_served_locally(tmp_path: Path) -> None:
     run = tmp_path / "run"
     run.mkdir()
@@ -294,6 +355,43 @@ def test_dashboard_session_stop_is_safe(tmp_path: Path) -> None:
     assert not session.thread.is_alive()
 
 
+def test_telemetry_readers_handle_missing_and_malformed_files(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    sim = run / "simulation"
+    sim.mkdir(parents=True)
+
+    assert read_status(run) == {}
+    assert read_metrics(run) == []
+    assert read_events(run) == []
+
+    (sim / "live_status.json").write_text("{not-json", encoding="utf-8")
+    (sim / "live_metrics.csv").write_text('timestamp,stage,total_energy\n"unterminated', encoding="utf-8")
+    (sim / "live_events.log").write_text("free-form event without tabs\n", encoding="utf-8")
+
+    assert read_status(run) == {}
+    assert isinstance(read_metrics(run), list)
+    assert read_events(run) == [
+        {"timestamp": "", "level": "info", "message": "free-form event without tabs"}
+    ]
+
+
+def test_analyze_health_temperature_and_stale_warning() -> None:
+    stale = analyze_health(
+        {"status": "running", "last_update_timestamp": "2000-01-01T00:00:00+00:00"},
+        [],
+        stale_after_seconds=1,
+    )
+    assert stale["state"] == "warning"
+    assert "stale" in stale["message"].lower()
+
+    hot = analyze_health(
+        {"status": "running", "target_temperature_K": 300.0},
+        [{"temperature": "420.0"}],
+    )
+    assert hot["state"] == "warning"
+    assert "Temperature" in hot["message"]
+
+
 def test_protein_preview_unavailable_without_structure(tmp_path: Path) -> None:
     payload = protein_preview_payload(tmp_path / "run")
 
@@ -320,6 +418,47 @@ def test_protein_preview_requires_pymol_when_missing(tmp_path: Path, monkeypatch
     assert payload["fallback_available"] is True
     assert payload["fallback_mode"] == "schematic"
     assert "PyMOL preview unavailable" in payload["message"]
+
+
+def test_protein_preview_uses_existing_image_without_structure(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    preview = run / "report" / "dashboard_assets" / "protein_preview.png"
+    preview.parent.mkdir(parents=True)
+    preview.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    payload = protein_preview_payload(run)
+
+    assert payload["available"] is True
+    assert payload["static_available"] is True
+    assert payload["static_mode"] == "existing"
+    assert payload["path"] == "report/dashboard_assets/protein_preview.png"
+    assert payload["structure_available"] is False
+    assert payload["viewer_available"] is False
+
+
+def test_protein_preview_finds_manifest_system_path_and_handles_missing_viewer(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    system_pdb = tmp_path / "source.pdb"
+    system_pdb.write_text(_tiny_pdb(), encoding="utf-8")
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "manifest.json").write_text(json.dumps({"system": str(system_pdb)}), encoding="utf-8")
+
+    monkeypatch.setattr("fastmdxplora.live.protein_preview._find_pymol_executable", lambda _root: None)
+    monkeypatch.setattr("fastmdxplora.live.protein_preview.viewer_asset_available", lambda: False)
+
+    payload = protein_preview_payload(run)
+
+    assert payload["available"] is True
+    assert payload["static_available"] is False
+    assert payload["structure_path"] == str(system_pdb)
+    assert payload["structure_url"] is None
+    assert payload["structure_available"] is False
+    assert payload["viewer_available"] is False
+    assert payload["fallback_available"] is False
+    assert payload["fallback_mode"] is None
 
 
 def test_protein_preview_api_finds_topology(tmp_path: Path, monkeypatch) -> None:

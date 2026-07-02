@@ -342,6 +342,41 @@ def test_cli_phase_dashboard_uses_cli_output_path(tmp_path: Path) -> None:
     assert session.stopped is True
 
 
+@pytest.mark.parametrize("command", ["simulate", "analyze", "report"])
+def test_cli_dashboard_uses_cli_output_path_for_other_phases(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    pdb = _make_pdb_stub(tmp_path)
+    out = tmp_path / f"{command}_run"
+    session = _FakeDashboardSession()
+
+    method_name = {"simulate": "simulate", "analyze": "analyze", "report": "report"}[command]
+    with patch(
+        "fastmdxplora.live.server.start_dashboard_session",
+        return_value=session,
+    ) as start, patch.object(
+        FastMDXplora,
+        method_name,
+        return_value=SimpleNamespace(status="ok"),
+    ):
+        rc = main(
+            [
+                command,
+                "--system",
+                str(pdb),
+                "--output",
+                str(out),
+                "--dashboard",
+                "--dashboard-stop-on-complete",
+            ]
+        )
+
+    assert rc == 0
+    assert start.call_args.kwargs["output"] == out.resolve()
+    assert session.stopped is True
+
+
 def test_cli_dashboard_prints_port_conflict_and_host_warning(
     tmp_path: Path,
     capsys,

@@ -336,6 +336,7 @@ def test_dashboard_session_uses_next_port_when_requested_port_is_busy(
         max_port_tries=5,
     )
     try:
+        assert session.server.allow_reuse_address is False
         assert session.requested_port == requested_port
         assert session.port != requested_port
         assert session.port_was_changed is True

@@ -2,8 +2,9 @@
 
 FastMDXplora's four phases have different dependency footprints. The analysis
 and report phases work from pip alone; the setup and simulation phases need
-PDBFixer and OpenMM, which are distributed primarily through conda-forge. Pick
-the route that matches what you need.
+PDBFixer and OpenMM, which are distributed primarily through conda-forge. The
+full conda-based install is supported on Python 3.9 through 3.12. For a new
+user, installing Python 3.10 or 3.11 first is the simplest path.
 
 ## Full install (all four phases)
 
@@ -19,6 +20,34 @@ mamba env create -f environment.yml || conda env create -f environment.yml
 conda activate fastmdxplora
 pip install -e .
 ```
+
+## Git clone + setup using the install flow
+
+If you are starting from a fresh clone, the recommended path is to run the
+built-in install command through Python’s module entry point. This works even
+before the `fastmdx` console script is installed, so it is the most reliable
+option for a brand-new user:
+
+```bash
+git clone https://github.com/aai-research-lab/FastMDXplora.git
+cd FastMDXplora
+python -m fastmdxplora.cli.main install
+```
+
+For contributors who want an editable install while developing, use:
+
+```bash
+python -m fastmdxplora.cli.main install-e
+```
+
+If you want a health check or want to repair an existing setup, run:
+
+```bash
+python -m fastmdxplora.cli.main health
+```
+
+The standalone helper remains available as `python health.py` if you prefer to
+run the diagnostics directly.
 
 ### Optional extras
 

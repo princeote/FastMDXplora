@@ -35,45 +35,55 @@
 
 ## Installation
 
-FastMDXplora's four phases have different dependency footprints. The **analysis and report** phases work from pip alone; the **setup and simulation** phases need PDBFixer + OpenMM, which are distributed primarily through conda-forge. So there are two routes; pick by what you need.
+FastMDXplora's four phases have different dependency footprints. The **analysis and report** phases work from pip alone; the **setup and simulation** phases need PDBFixer + OpenMM, which are distributed primarily through conda-forge. The supported Python range for the full conda-based install is **3.9 through 3.12**. For a brand-new user, the simplest path is to install Python 3.10 or 3.11 first, then run the built-in install command below.
 
-### Full install (all four phases, from the git repo)
+### Install from a git clone
 
-The setup/simulation chemistry stack (OpenMM, PDBFixer) installs most reliably from conda-forge, so the full install uses the bundled `environment.yml`. We recommend `mamba` (a faster conda solver); plain `conda` works too.
-
-The bundled conda environment is constrained to Python 3.9–3.12 because OpenMM/openmmforcefields and their AmberTools dependencies are not yet available for Python 3.13 on conda-forge.
+For a fresh checkout, the recommended path is to use the built-in install command through Python’s module entry point. That works even before the `fastmdx` console script is installed, so a brand-new user can start from a plain clone.
 
 ```bash
 git clone https://github.com/aai-research-lab/FastMDXplora.git
 cd FastMDXplora
+python -m fastmdxplora.cli.main install
 ```
+
+This creates a `fastmdxplora` conda environment, installs the current repository checkout into it, and verifies the CLI. If you already installed the package and want the console-script form, the equivalent command is:
+
 ```bash
-mamba env create -f environment.yml || conda env create -f environment.yml
+fastmdx install
 ```
+
+For contributors who want an editable install while developing, use:
+
 ```bash
-conda activate fastmdxplora
-pip install .
+python -m fastmdxplora.cli.main install-e
 ```
 
-> Don't have `mamba`? Either install Miniforge (see [below](#mamba--miniforge-optional)), or just use `conda`; the `||` above falls back to it automatically.
+If you only want to diagnose or repair an existing setup, run:
 
-### Install and bootstrap from pip
+```bash
+python -m fastmdxplora.cli.main health
+```
 
-You can install FastMDXplora with plain pip and then bootstrap the full runnable environment using the new CLI helper. This is the intended one-line setup flow for Linux, macOS, and Windows:
+`fastmdx health` runs the repository diagnostics (and can fix common issues when you do not pass `--no-fix`). The older standalone helper remains available as `python health.py`.
+
+### Install from pip
+
+If you are installing the published package instead of working from a clone, the intended setup flow is:
 
 ```bash
 pip install fastmdxplora
-fastmdx bootstrap
+fastmdx install
 ```
 
-`fastmdx bootstrap` will:
-- detect the OS and architecture
+`fastmdx install` will:
+- detect your OS and architecture
 - install Miniforge/conda if needed
 - create a `fastmdxplora` conda environment
 - install `fastmdxplora` into that environment
 - verify the CLI with `fastmdx info`
 
-If you only need analysis + reporting, plain pip still works without the chemistry stack:
+If you only need analysis + reporting, plain pip still works without the chemistry stack. This is the easiest route for users who already have Python 3.9–3.12 installed and do not need the full setup/simulation backend:
 
 ```bash
 pip install fastmdxplora

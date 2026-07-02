@@ -207,9 +207,12 @@ def _update_conda_env(conda_cli: str, env_name: str, yaml_path: Path) -> None:
     _print(f"Conda environment '{env_name}' updated successfully")
 
 
-def _install_package_in_env(conda_cli: str, env_name: str, package: str) -> None:
+def _install_package_in_env(conda_cli: str, env_name: str, package: str, *, editable: bool = False) -> None:
     _print(f"Installing package '{package}' into '{env_name}'")
-    cmd = [conda_cli, "run", "-n", env_name, sys.executable, "-m", "pip", "install", "--upgrade", package]
+    cmd = [conda_cli, "run", "-n", env_name, sys.executable, "-m", "pip", "install", "--upgrade"]
+    if editable:
+        cmd.append("--editable")
+    cmd.append(package)
     result = _run_command(cmd)
     if result.returncode != 0:
         raise BootstrapError(
@@ -260,10 +263,11 @@ def _format_conda_error(stderr: str, env_name: str, create: bool) -> str:
 def bootstrap_environment(
     *,
     env_name: str = DEFAULT_ENV_NAME,
-    python_version: str = "3.12",
+    python_version: str = "3.10",
     yes: bool = False,
     force: bool = False,
     package_name: str = "fastmdxplora",
+    editable: bool = False,
 ) -> None:
     if not python_version.startswith("3."):
         raise BootstrapError("Only Python 3.9–3.12 is supported for the full conda environment.")
@@ -292,7 +296,7 @@ def bootstrap_environment(
         else:
             _create_conda_env(conda_cli[0], env_name, yaml_path)
 
-        _install_package_in_env(conda_cli[0], env_name, package_name)
+        _install_package_in_env(conda_cli[0], env_name, package_name, editable=editable)
         _verify_env(conda_cli[0], env_name)
     finally:
         try:
@@ -319,7 +323,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     parser.add_argument("--env-name", default=DEFAULT_ENV_NAME,
                         help="Name of the conda environment to create.")
-    parser.add_argument("--python-version", default="3.12",
+    parser.add_argument("--python-version", default="3.10",
                         help="Python version to install into the environment (3.9-3.12).")
     parser.add_argument("--force", action="store_true",
                         help="Recreate the conda environment if it already exists.")

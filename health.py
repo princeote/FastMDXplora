@@ -3,7 +3,7 @@
 
 Place this file in the repository root and run it once after cloning:
 
-    python doctor.py
+    python health.py
 
 It detects the host OS and architecture, validates the repository layout,
 checks Python/runtime dependencies, attempts to fix missing imports with pip
@@ -395,7 +395,7 @@ def verify_paths() -> bool:
         print(fmt("No environment.yml found; conda-based full install is optional", Status.SKIPPED))
     if missing:
         print(help_note("Run this script from the FastMDXplora repository root directory."))
-        print(help_note("If you just cloned the repository, use: cd <repo_path> && python doctor.py"))
+        print(help_note("If you just cloned the repository, use: cd <repo_path> && python health.py"))
     return not missing
 
 
@@ -438,8 +438,8 @@ def install_local_package(env_cmd: list[str] | None = None) -> bool:
         print(fmt("Local package installed", Status.OK))
         return True
     print(fmt(f"Local package installation failed: {result.stderr.strip()}", Status.FAILED))
-    print(help_note("The doctor script attempted to install the local package automatically."))
-    print(help_note("Fix the environment issue or permissions, then rerun: python doctor.py"))
+    print(help_note("The health script attempted to install the local package automatically."))
+    print(help_note("Fix the environment issue or permissions, then rerun: python health.py"))
     return False
 
 
@@ -510,8 +510,8 @@ def smoke_test(env_cmd: list[str] | None = None, env_name: str | None = None) ->
     print(fmt("Smoke test failed", Status.FAILED))
     print(process.stdout)
     print(process.stderr)
-    print(help_note("The doctor script installs the local package automatically."))
-    print(help_note("Fix the underlying installation issue or dependency error, then rerun: python doctor.py"))
+    print(help_note("The health script installs the local package automatically."))
+    print(help_note("Fix the underlying installation issue or dependency error, then rerun: python health.py"))
     return False
 
 
@@ -547,11 +547,11 @@ def ensure_local_package_installed(env_cmd: list[str] | None = None) -> bool:
         return False
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="FastMDXplora repository doctor and initialization tool")
     parser.add_argument("--no-fix", action="store_true", help="Only diagnose problems; do not install or modify anything")
     parser.add_argument("--yes", action="store_true", help="Accept all fixes automatically")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     print("\nFastMDXplora Repository Doctor")
     print("=" * 36)
@@ -636,13 +636,13 @@ def main() -> int:
         if not command_exists("python"):
             print(help_note("Install Python 3.9+ and rerun this script."))
         if ENVIRONMENT_YML.exists() and not (command_exists("mamba") or command_exists("conda")):
-            print(help_note("Install Miniforge, Miniconda, or Anaconda, then rerun doctor.py for the full simulation stack."))
+            print(help_note("Install Miniforge, Miniconda, or Anaconda, then rerun health.py for the full simulation stack."))
         if ENVIRONMENT_YML.exists() and (command_exists("mamba") or command_exists("conda")):
             print(help_note("If environment creation failed earlier, retry: conda env create -f environment.yml"))
-        print(help_note("The doctor script installs the local package automatically."))
-        print(help_note("Fix any installation or permission issue, then rerun: python doctor.py"))
+        print(help_note("The health script installs the local package automatically."))
+        print(help_note("Fix any installation or permission issue, then rerun: python health.py"))
         if ENVIRONMENT_YML.exists():
-            print(help_note("After environment creation, rerun doctor.py to verify everything."))
+            print(help_note("After environment creation, rerun health.py to verify everything."))
     return 0 if status_ok else 1
 
 

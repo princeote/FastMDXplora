@@ -53,6 +53,34 @@ def _workflow_lines(phase_context: PhaseContext) -> list[str]:
     return lines
 
 
+def _figure_title(analysis: str, fig_path: Path) -> tuple[str, str]:
+    friendly = {
+        "rmsd": "RMSD over frames",
+        "rmsf": "RMSF by residue",
+        "rg": "Radius of gyration",
+        "hbonds": "Hydrogen bonds",
+        "sasa": "SASA",
+        "ss": "Secondary structure",
+        "dihedrals": "Ramachandran / dihedrals",
+        "qvalue": "Fraction of native contacts",
+        "cluster": "Clustering",
+        "dimred": "PCA / dimensionality reduction",
+    }
+    title = friendly.get(analysis, analysis.replace("_", " ").title())
+    subtitle = ""
+    if fig_path.stem != analysis:
+        suffix = fig_path.stem.replace(f"{analysis}_", "", 1)
+        if suffix.endswith("_counts") or suffix == "counts":
+            title = "Cluster populations"
+            method = suffix.replace("_counts", "")
+            subtitle = f"method: {method.replace('_', ' ')}" if method else ""
+        elif suffix == "hierarchical_dendrogram":
+            title = "Hierarchical clustering dendrogram"
+        else:
+            subtitle = f"method: {suffix.replace('_', ' ')}"
+    return title, subtitle
+
+
 def _outline_markdown(orchestrator: "FastMDXplora", title: str) -> str:
     from fastmdxplora import __citation__, __version__
 
@@ -89,6 +117,7 @@ def _outline_markdown(orchestrator: "FastMDXplora", title: str) -> str:
 
     if phase_context.analysis_present:
         section_no += 1
+        summary_figure = orchestrator.output_dir / "report" / "analysis_summary.png"
         lines.extend(
             [
                 "",
@@ -97,6 +126,11 @@ def _outline_markdown(orchestrator: "FastMDXplora", title: str) -> str:
                 "- Per-analysis options in `analysis/<analysis>/options.json`",
             ]
         )
+        if summary_figure.is_file():
+            lines.append("- Summary figure: `report/analysis_summary.png`")
+        region_figure = orchestrator.output_dir / "report" / "region_highlight_summary.png"
+        if region_figure.is_file():
+            lines.append("- Region highlights: `report/region_highlight_summary.png`")
 
     section_no += 1
     lines.extend(["", f"## {section_no}. Citation", f"- {__citation__}", ""])
@@ -118,6 +152,15 @@ def _build_pptx(orchestrator: "FastMDXplora", title: str, out_path: Path) -> Non
     slide_w = prs.slide_width
     slide_h = prs.slide_height
 
+    def _set_title_font(slide, size: int = 24) -> None:
+        title_shape = slide.shapes.title
+        if title_shape is None or not title_shape.has_text_frame:
+            return
+        for paragraph in title_shape.text_frame.paragraphs:
+            for run in paragraph.runs:
+                run.font.size = Pt(size)
+            paragraph.font.size = Pt(size)
+
     # Title slide
     s = prs.slides.add_slide(title_layout)
     s.shapes.title.text = _slide_text(title)
@@ -128,6 +171,7 @@ def _build_pptx(orchestrator: "FastMDXplora", title: str, out_path: Path) -> Non
     def _section_slide(heading: str, body_lines: list[str]) -> None:
         slide = prs.slides.add_slide(blank)
         slide.shapes.title.text = _slide_text(heading)
+        _set_title_font(slide)
         textbox = slide.shapes.add_textbox(Inches(0.5), Inches(1.5), Inches(9), Inches(5))
         tf = textbox.text_frame
         tf.word_wrap = True
@@ -144,6 +188,7 @@ def _build_pptx(orchestrator: "FastMDXplora", title: str, out_path: Path) -> Non
         """
         slide = prs.slides.add_slide(blank)
         slide.shapes.title.text = _slide_text(heading)
+        _set_title_font(slide)
 
         # Optional subtitle just under the title
         if subtitle:
@@ -232,6 +277,14 @@ def _build_pptx(orchestrator: "FastMDXplora", title: str, out_path: Path) -> Non
             )
         _section_slide("Analysis", cover_lines)
 
+        summary_figure = project_root / "report" / "analysis_summary.png"
+        if summary_figure.is_file():
+            _image_slide("Analysis summary", summary_figure)
+
+        region_figure = project_root / "report" / "region_highlight_summary.png"
+        if region_figure.is_file():
+            _image_slide("Region highlights", region_figure)
+
         # One image slide per produced figure, in plan order.
         for analysis in plan:
             sub_dir = analysis_dir / analysis
@@ -239,16 +292,7 @@ def _build_pptx(orchestrator: "FastMDXplora", title: str, out_path: Path) -> Non
                 continue
             figures = sorted(sub_dir.glob("*.png"))
             for fig_path in figures:
-                # Heading: analysis name in caps + a hint for multi-method
-                # analyses (figure stem differs from the analysis name).
-                if fig_path.stem == analysis:
-                    heading = analysis.upper()
-                    subtitle = ""
-                else:
-                    heading = analysis.upper()
-                    # cluster_kmeans → "method: kmeans"
-                    suffix = fig_path.stem.replace(f"{analysis}_", "", 1)
-                    subtitle = f"method: {suffix}"
+                heading, subtitle = _figure_title(analysis, fig_path)
                 _image_slide(heading, fig_path, subtitle=subtitle)
     else:
         _section_slide(

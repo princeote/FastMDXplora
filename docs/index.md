@@ -15,6 +15,8 @@ installation
 phases
 usage_examples
 configuration
+region_highlights
+live_dashboard
 ```
 
 ```{toctree}

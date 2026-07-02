@@ -89,7 +89,10 @@ def project_with_multi_method(tmp_path: Path) -> Path:
             "analysis": {
                 "include": ["cluster", "dimred"],
                 "options": {
-                    "cluster": {"methods": ["kmeans", "hierarchical"], "n_clusters": 3},
+                    "cluster": {
+                        "methods": ["kmeans", "hierarchical", "dbscan"],
+                        "n_clusters": 3,
+                    },
                     "dimred": {"methods": ["pca", "tsne"]},
                 },
             }
@@ -111,6 +114,7 @@ class TestReportDocument:
         fmdx.report()
         text = (project_with_analysis / "report" / "report.md").read_text(encoding="utf-8")
         # Each analysis's figure should be referenced
+        assert "analysis_summary.png" in text
         assert "analysis/rmsd/rmsd.png" in text
         assert "analysis/rg/rg.png" in text
         # No "deferred" / placeholder language
@@ -155,10 +159,34 @@ class TestReportDocument:
         text = (project_with_multi_method / "report" / "report.md").read_text(encoding="utf-8")
         # cluster has two methods
         assert "cluster/cluster_kmeans.png" in text
+        assert "cluster/cluster_kmeans_counts.png" in text
         assert "cluster/cluster_hierarchical.png" in text
+        assert "cluster/cluster_hierarchical_counts.png" in text
+        assert "cluster/cluster_hierarchical_dendrogram.png" in text
         # dimred has two methods
         assert "dimred/dimred_pca.png" in text
         assert "dimred/dimred_tsne.png" in text
+
+    def test_report_writes_combined_analysis_summary(
+        self, project_with_multi_method: Path
+    ):
+        fmdx = FastMDXplora(
+            system=str(project_with_multi_method / "simulation" / "topology.pdb"),
+            output_dir=project_with_multi_method,
+        )
+        fmdx.report()
+
+        summary = project_with_multi_method / "report" / "analysis_summary.png"
+        summary_manifest = (
+            project_with_multi_method / "report" / "analysis_summary_manifest.json"
+        )
+        assert summary.is_file()
+        assert summary_manifest.is_file()
+        manifest = json.loads(summary_manifest.read_text(encoding="utf-8"))
+        included_sources = {item["source"] for item in manifest["included"]}
+        assert "analysis/cluster/cluster_kmeans_counts.png" in included_sources
+        assert "analysis/cluster/cluster_hierarchical_dendrogram.png" in included_sources
+        assert "analysis/dimred/dimred_pca.png" in included_sources
 
 
 # ===========================================================================
@@ -182,11 +210,11 @@ class TestSlideDeck:
             s for s in prs.slides
             if any(shape.shape_type == MSO_SHAPE_TYPE.PICTURE for shape in s.shapes)
         ]
-        # We ran RMSD + Rg → exactly 2 image slides
-        assert len(image_slides) == 2
+        # We ran RMSD + Rg, plus the combined summary slide.
+        assert len(image_slides) == 3
 
     def test_pptx_image_slides_titled_by_analysis(self, project_with_analysis: Path):
-        """Image-slide titles should be the analysis names (uppercase)."""
+        """Image-slide titles should be readable, not giant all-caps IDs."""
         from pptx import Presentation
         from pptx.enum.shapes import MSO_SHAPE_TYPE
 
@@ -202,13 +230,15 @@ class TestSlideDeck:
             for slide in prs.slides
             if any(shape.shape_type == MSO_SHAPE_TYPE.PICTURE for shape in slide.shapes)
         }
-        assert "RMSD" in titles
-        assert "RG" in titles
+        assert "Analysis summary" in titles
+        assert "RMSD over frames" in titles
+        assert "Radius of gyration" in titles
+        assert "RG" not in titles
 
     def test_pptx_fans_out_multi_method_analyses(
         self, project_with_multi_method: Path
     ):
-        """A two-method cluster should produce two image slides."""
+        """Multi-method analyses should produce individual restored plot slides."""
         from pptx import Presentation
         from pptx.enum.shapes import MSO_SHAPE_TYPE
 
@@ -223,8 +253,9 @@ class TestSlideDeck:
             s for s in prs.slides
             if any(shape.shape_type == MSO_SHAPE_TYPE.PICTURE for shape in s.shapes)
         ]
-        # cluster: 2 methods, dimred: 2 methods → 4 image slides total
-        assert len(image_slides) == 4
+        # cluster: timelines + count plots + dendrogram, dimred: 2 methods,
+        # plus the combined summary slide.
+        assert len(image_slides) >= 8
 
     def test_pptx_multi_method_subtitle_records_method(
         self, project_with_multi_method: Path
@@ -254,6 +285,383 @@ class TestSlideDeck:
         # The subtitle text should include method names somewhere
         for method in ("kmeans", "hierarchical", "pca", "tsne"):
             assert method in joined, f"method {method} missing from slide text"
+        assert "analysis summary" in joined
+
+
+# ===========================================================================
+# Static HTML dashboard
+# ===========================================================================
+class TestDashboard:
+    def test_dashboard_is_generated_and_links_outputs(self, project_with_analysis: Path):
+        rmsd_png = project_with_analysis / "analysis" / "rmsd" / "rmsd.png"
+        rg_png = project_with_analysis / "analysis" / "rg" / "rg.png"
+        original_rmsd = rmsd_png.read_bytes()
+        original_rg = rg_png.read_bytes()
+        fmdx = FastMDXplora(
+            system=str(project_with_analysis / "simulation" / "topology.pdb"),
+            output_dir=project_with_analysis,
+        )
+        result = fmdx.report()
+
+        assert result.status == "ok"
+        dashboard = project_with_analysis / "report" / "dashboard.html"
+        assert dashboard.is_file()
+        text = dashboard.read_text(encoding="utf-8")
+
+        assets = project_with_analysis / "report" / "dashboard_assets"
+        assert (assets / "rmsd_dashboard.png").is_file()
+        assert (assets / "rg_dashboard.png").is_file()
+        assert rmsd_png.read_bytes() == original_rmsd
+        assert rg_png.read_bytes() == original_rg
+
+        assert '<aside class="sidebar">' in text
+        assert "Run Progress" in text
+        assert "Live Simulation" in text
+        assert "Live simulation telemetry was not recorded for this run" in text
+        assert "Top Metrics" in text
+        assert "Recent Outputs" in text
+        assert "Quick Actions" in text
+        assert 'class="plot-frame"' in text
+        assert 'class="plot-grid"' in text
+        assert "plot-card card-md" in text
+        assert "card-sm" in text
+        assert "card-lg" in text
+        assert "card-wide" in text
+        assert "resize-handle" in text
+        assert 'title="Drag to resize"' in text
+        assert 'data-card-size="sm"' in text
+        assert 'data-card-size="md"' in text
+        assert 'data-card-size="lg"' in text
+        assert 'data-card-size="wide"' in text
+        assert "Reset layout" in text
+        assert "data-reset-layout" in text
+        assert "grid-auto-flow: dense" in text
+        assert "grid-auto-rows: 8px" in text
+        assert "grid-column: span var(--col-span, 1)" in text
+        assert "grid-row: span var(--row-span, 20)" in text
+        assert "pointerdown" in text
+        assert "pointermove" in text
+        assert "setPointerCapture" in text
+        assert "localStorage" in text
+        assert "ResizeObserver" not in text
+        assert "resize: both" not in text
+        assert ".panels" not in text
+        assert "repeat(auto-fill, minmax(280px, 1fr))" in text
+        assert "min-height: 180px" in text
+        assert "overflow: hidden" in text
+        assert "max-height: 100%" in text
+        assert "object-fit: contain" in text
+        assert "plot-card large" not in text
+        assert ".plot-card.card-lg { --col-span: 2; --row-span: 38; }" in text
+        assert ".plot-card.card-wide { --col-span: 2; --row-span: 24; }" in text
+        assert "dashboard view" in text
+        assert "dashboard_assets/rmsd_dashboard.png" in text
+        assert "dashboard_assets/rg_dashboard.png" in text
+        assert "Open Markdown Report" in text
+        assert "Open Analysis Manifest" in text
+        assert "output-list" in text
+        assert "outputs-extra" in text
+        assert "repeat(auto-fit, minmax(220px, 1fr))" in text
+        assert "action-title" in text
+        assert "action-subtitle" in text
+        assert "artifact-path" in text
+        assert "Std. Dev." in text
+        assert "original: <a href=\"../analysis/rmsd/rmsd.png\"" in text
+        assert "original: <a href=\"../analysis/rg/rg.png\"" in text
+        assert "../analysis/analysis_manifest.json" in text
+        assert "report.md" in text
+        assert "slides.pptx" in text
+        assert "project_bundle.zip" in text
+        assert "dashboard.html" in text
+        assert "TODO" not in text
+        assert "fake" not in text.lower()
+        assert "dummy" not in text.lower()
+        with zipfile.ZipFile(project_with_analysis / "report" / "project_bundle.zip") as zf:
+            names = set(zf.namelist())
+        assert "report/dashboard_assets/rmsd_dashboard.png" in names
+        assert "report/dashboard_assets/rg_dashboard.png" in names
+
+    def test_dashboard_analysis_only_phase_aware_text(self, tmp_path: Path):
+        root = tmp_path / "analysis_only_dashboard"
+        analysis = root / "analysis"
+        rmsd_dir = analysis / "rmsd"
+        rg_dir = analysis / "rg"
+        rmsd_dir.mkdir(parents=True)
+        rg_dir.mkdir()
+        (rmsd_dir / "rmsd.png").write_bytes(b"png")
+        (rg_dir / "rg.png").write_bytes(b"png")
+        (root / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "system": "1L2Y",
+                    "phases": [
+                        {"name": "analysis", "status": "ok"},
+                        {"name": "report", "status": "ok"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (analysis / "analysis_manifest.json").write_text(
+            json.dumps(
+                {
+                    "plan": ["rmsd", "rg"],
+                    "n_frames": 10,
+                    "n_atoms": 100,
+                    "results": {"rmsd": {"status": "ok"}, "rg": {"status": "ok"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        fmdx = FastMDXplora(system="1L2Y", output_dir=root)
+        result = fmdx.report(title="Analysis-only dashboard", slides=False, bundle=False)
+
+        assert result.status == "ok"
+        text = (root / "report" / "dashboard.html").read_text(encoding="utf-8")
+        assert (
+            "Analysis/report workflow from existing trajectory. Setup and "
+            "simulation were not run in this workflow."
+        ) in text
+        assert "Existing trajectory analysis" in text
+        assert "<span>Setup</span><span class=\"phase-detail\">Not run</span>" in text
+        assert "<span>Simulation</span><span class=\"phase-detail\">Not run</span>" in text
+        assert "<span>Analysis</span><span class=\"phase-detail\">Completed</span>" in text
+        assert "<span>Report</span><span class=\"phase-detail\">Completed</span>" in text
+        assert 'class="plot-frame"' in text
+        assert "artifact fallback" in text
+        assert "dashboard_assets" not in text
+        assert "Quick Actions" in text
+        assert "Recent Outputs" in text
+        assert "Simulation time" not in text
+        assert "Temperature" not in text
+        assert "Production MD completed" not in text
+        assert "../analysis/rmsd/rmsd.png" in text
+        assert "../analysis/rg/rg.png" in text
+        assert "project_bundle.zip" not in text
+
+    def test_dashboard_single_artifact_sections_use_normal_plot_grid(
+        self, tmp_path: Path
+    ):
+        root = tmp_path / "single_artifact_sections"
+        artifacts = [
+            "analysis/sasa/sasa.png",
+            "analysis/ss/ss.png",
+            "analysis/dimred/dimred_pca.png",
+        ]
+        png = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+            b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+            b"\x00\x00\x00\x0cIDATx\x9cc```\x00\x00\x00\x04\x00\x01"
+            b"\xf6\x178U\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        for rel in artifacts:
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(png)
+        (root / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "system": "1L2Y",
+                    "phases": [
+                        {"name": "analysis", "status": "ok"},
+                        {"name": "report", "status": "ok"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (root / "analysis" / "analysis_manifest.json").write_text(
+            json.dumps(
+                {
+                    "plan": ["sasa", "ss", "dimred"],
+                    "results": {
+                        "sasa": {"status": "ok"},
+                        "ss": {"status": "ok"},
+                        "dimred": {"status": "ok"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        fmdx = FastMDXplora(system="1L2Y", output_dir=root)
+        result = fmdx.report(document=False, slides=False, bundle=False)
+
+        assert result.status == "ok"
+        text = (root / "report" / "dashboard.html").read_text(encoding="utf-8")
+        assert text.count('class="plot-grid"') == 1
+        assert "Additional Analysis" in text
+        assert 'id="additional-analysis"' in text
+        assert 'id="sasa-section"' not in text
+        assert 'id="secondary-structure-section"' not in text
+        assert 'id="dimensionality-reduction"' not in text
+        assert "Total SASA" in text
+        assert "Secondary structure" in text
+        assert "PCA" in text
+        assert text.count('class="plot-card fallback card-md"') == len(artifacts)
+        assert text.count('class="resize-handle"') == len(artifacts)
+        assert text.count('class="plot-frame"') == len(artifacts)
+        assert "plot-card large" not in text
+        assert ".plot-card.card-lg { --col-span: 2; --row-span: 38; }" in text
+        assert ".plot-card.card-wide { --col-span: 2; --row-span: 24; }" in text
+        assert "section-secondary-structure-section { --plot-min" not in text
+        assert "section-sasa-section { --plot-min" not in text
+        assert "artifact fallback" in text
+        assert "data-card-key=" in text
+
+    def test_dashboard_multi_method_dark_assets(self, project_with_multi_method: Path):
+        original_pngs = {
+            path: path.read_bytes()
+            for path in (
+                project_with_multi_method / "analysis" / "cluster" / "cluster_kmeans.png",
+                project_with_multi_method
+                / "analysis"
+                / "cluster"
+                / "cluster_hierarchical.png",
+                project_with_multi_method / "analysis" / "dimred" / "dimred_pca.png",
+            )
+        }
+        fmdx = FastMDXplora(
+            system=str(project_with_multi_method / "simulation" / "topology.pdb"),
+            output_dir=project_with_multi_method,
+        )
+        result = fmdx.report()
+
+        assert result.status == "ok"
+        text = (
+            project_with_multi_method / "report" / "dashboard.html"
+        ).read_text(encoding="utf-8")
+        assets = project_with_multi_method / "report" / "dashboard_assets"
+        expected_assets = [
+            "pca_dashboard.png",
+            "tsne_dashboard.png",
+            "kmeans_trajectory_dashboard.png",
+            "kmeans_population_dashboard.png",
+            "dbscan_trajectory_dashboard.png",
+            "dbscan_population_dashboard.png",
+            "hierarchical_trajectory_dashboard.png",
+            "hierarchical_population_dashboard.png",
+            "hierarchical_dendrogram_dashboard.png",
+        ]
+        for name in expected_assets:
+            assert (assets / name).is_file()
+            assert f"dashboard_assets/{name}" in text
+        assert "Hierarchical dendrogram" in text
+        assert "dashboard_assets/hierarchical_dendrogram_dashboard.png" in text
+        assert "original: <a href=\"../analysis/cluster/cluster_hierarchical_dendrogram.png\"" in text
+        assert "dashboard_assets/dbscan_trajectory_dashboard.png" in text
+        assert "dashboard_assets/dbscan_population_dashboard.png" in text
+        assert "dashboard view" in text
+        with zipfile.ZipFile(
+            project_with_multi_method / "report" / "project_bundle.zip"
+        ) as zf:
+            names = set(zf.namelist())
+        for name in expected_assets:
+            assert f"report/dashboard_assets/{name}" in names
+        for path, data in original_pngs.items():
+            assert path.read_bytes() == data
+
+    def test_dashboard_discovers_all_analysis_image_artifacts(self, tmp_path: Path):
+        root = tmp_path / "artifact_complete"
+        artifact_names = [
+            "analysis/sasa/total_sasa.png",
+            "analysis/sasa/residue_sasa.png",
+            "analysis/sasa/average_residue_sasa.png",
+            "analysis/dimred/dimred_pca.png",
+            "analysis/dimred/dimred_mds.png",
+            "analysis/dimred/dimred_tsne.png",
+            "analysis/cluster/dbscan_pop.png",
+            "analysis/cluster/dbscan_traj_hist.png",
+            "analysis/cluster/dbscan_traj_scatter.png",
+            "analysis/cluster/dbscan_distance_matrix.png",
+            "analysis/cluster/kmeans_pop.png",
+            "analysis/cluster/kmeans_traj_hist.png",
+            "analysis/cluster/kmeans_traj_scatter.png",
+            "analysis/cluster/hierarchical_pop.png",
+            "analysis/cluster/hierarchical_traj_hist.png",
+            "analysis/cluster/hierarchical_traj_scatter.png",
+            "analysis/cluster/hierarchical_dendrogram.png",
+        ]
+        png = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+            b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+            b"\x00\x00\x00\x0cIDATx\x9cc```\x00\x00\x00\x04\x00\x01"
+            b"\xf6\x178U\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        for rel in artifact_names:
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(png)
+        (root / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "system": "1L2Y",
+                    "phases": [
+                        {"name": "analysis", "status": "ok"},
+                        {"name": "report", "status": "ok"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (root / "analysis" / "analysis_manifest.json").write_text(
+            json.dumps(
+                {
+                    "plan": ["sasa", "dimred", "cluster"],
+                    "results": {
+                        "sasa": {"status": "ok"},
+                        "dimred": {"status": "ok"},
+                        "cluster": {"status": "ok"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        fmdx = FastMDXplora(system="1L2Y", output_dir=root)
+        result = fmdx.report(document=False, slides=False, bundle=False)
+
+        assert result.status == "ok"
+        text = (root / "report" / "dashboard.html").read_text(encoding="utf-8")
+        assert text.count('<div class="plot-frame">') == len(artifact_names)
+        assert text.count('class="plot-card fallback card-md"') == len(artifact_names)
+        assert text.count('class="resize-handle"') == len(artifact_names)
+        assert text.count('<span class="tag">artifact fallback</span>') == len(artifact_names)
+        assert "artifact fallback" in text
+        assert "dashboard view" not in text
+        assert "output-list" in text
+        assert "outputs-extra" in text
+        assert "Show all outputs" in text
+        assert "plot-card large" not in text
+        assert ".plot-card.card-lg { --col-span: 2; --row-span: 38; }" in text
+        assert ".plot-card.card-wide { --col-span: 2; --row-span: 24; }" in text
+        for rel in artifact_names:
+            assert f"../{rel}" in text
+        for label in (
+            "Total SASA",
+            "Per-residue SASA heatmap",
+            "Average per-residue SASA",
+            "PCA",
+            "MDS",
+            "t-SNE",
+            "DBSCAN population plot",
+            "DBSCAN trajectory histogram",
+            "DBSCAN trajectory scatter",
+            "DBSCAN distance matrix",
+            "KMeans population plot",
+            "KMeans trajectory histogram",
+            "KMeans trajectory scatter",
+            "Hierarchical population plot",
+            "Hierarchical trajectory histogram",
+            "Hierarchical trajectory scatter",
+            "Hierarchical dendrogram",
+        ):
+            assert label in text
+        assert "Core Metrics" not in text
+        assert "SASA" in text
+        assert "Dimensionality Reduction" in text
+        assert "Clustering" in text
 
 
 # ===========================================================================
@@ -349,7 +757,7 @@ def test_report_phase_manifest_artifacts_exist(tmp_path: Path):
     assert report_phase is not None
     manifest = json.loads((fmdx.output_dir / "manifest.json").read_text(encoding="utf-8"))
     report_record = next(p for p in manifest["phases"] if p["name"] == "report")
-    assert report_record["artifacts"] == ["report.md"]
+    assert report_record["artifacts"] == ["report.md", "dashboard.html"]
     for artifact in report_record["artifacts"]:
         assert (Path(report_record["output_dir"]) / artifact).is_file()
 
@@ -372,6 +780,7 @@ def test_report_bundle_excludes_cache_and_temp_files(tmp_path: Path):
     with zipfile.ZipFile(bundle) as zf:
         names = set(zf.namelist())
     assert "keep.dat" in names
+    assert "report/dashboard.html" in names
     assert "scratch.tmp" not in names
     assert "__pycache__/module.cpython-310.pyc" not in names
     assert ".cache/plot.tmp" not in names
@@ -498,3 +907,187 @@ def test_full_pipeline_report_keeps_end_to_end_wording(tmp_path: Path):
     assert "end-to-end molecular dynamics study" in report
     assert "Production MD was performed" in report
     assert "Setup and simulation were not run in this workflow" not in report
+
+
+def test_region_highlight_report_from_existing_rmsf_outputs(tmp_path: Path):
+    from pptx import Presentation
+
+    root = tmp_path / "region_run"
+    rmsf_dir = root / "analysis" / "rmsf"
+    rmsf_dir.mkdir(parents=True)
+    np.savetxt(
+        rmsf_dir / "rmsf.dat",
+        np.column_stack([np.arange(1, 9), np.linspace(0.02, 0.12, 8)]),
+    )
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "system": "example.pdb",
+                "phases": [
+                    {"name": "analysis", "status": "ok"},
+                    {"name": "report", "status": "ok"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / "analysis" / "analysis_manifest.json").write_text(
+        json.dumps(
+            {
+                "plan": ["rmsf"],
+                "n_frames": 5,
+                "n_residues": 8,
+                "topology_input": None,
+                "results": {"rmsf": {"status": "ok"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fmdx = FastMDXplora(system="example.pdb", output_dir=root)
+    result = fmdx.report(
+        bundle=False,
+        region_highlights=[
+            {"label": "example region 1", "start": 2, "end": 4, "color": "#4E79A7"},
+            {"label": "example region 2", "start": 6, "end": 7, "color": "#F28E2B"},
+        ],
+    )
+
+    assert result.status == "ok"
+    assert (root / "analysis" / "rmsf" / "rmsf_region_highlights.png").is_file()
+    assert (root / "report" / "region_highlight_summary.png").is_file()
+    manifest = json.loads(
+        (root / "report" / "region_highlight_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "ok"
+    assert manifest["skipped"][0]["artifact"] == "structure_region_highlights.png"
+    reason = manifest["skipped"][0]["reason"]
+    assert "PyMOL" in reason or "topology" in reason
+
+    report = (root / "report" / "report.md").read_text(encoding="utf-8")
+    assert "Region Highlight Figure" in report
+    assert "region_highlight_summary.png" in report
+    outline = (root / "report" / "slides_outline.md").read_text(encoding="utf-8")
+    assert "region_highlight_summary.png" in outline
+    prs = Presentation(str(root / "report" / "slides.pptx"))
+    titles = [s.shapes.title.text for s in prs.slides if s.shapes.title is not None]
+    assert "Region highlights" in titles
+
+
+def test_region_highlight_invalid_range_records_error(tmp_path: Path):
+    root = tmp_path / "bad_region"
+    rmsf_dir = root / "analysis" / "rmsf"
+    rmsf_dir.mkdir(parents=True)
+    np.savetxt(rmsf_dir / "rmsf.dat", np.column_stack([np.arange(1, 5), np.ones(4)]))
+    (root / "analysis" / "analysis_manifest.json").write_text(
+        json.dumps({"plan": ["rmsf"], "results": {"rmsf": {"status": "ok"}}}),
+        encoding="utf-8",
+    )
+
+    fmdx = FastMDXplora(system="example.pdb", output_dir=root)
+    result = fmdx.report(
+        document=False,
+        slides=False,
+        bundle=False,
+        region_highlights=[{"label": "bad", "start": 0, "end": 2}],
+    )
+
+    assert result.status == "ok"
+    manifest = json.loads(
+        (root / "report" / "region_highlight_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "error"
+    assert "start must be >= 1" in manifest["error"]
+    assert not (root / "analysis" / "rmsf" / "rmsf_region_highlights.png").exists()
+
+
+def test_report_without_region_highlights_has_no_region_artifacts(
+    project_with_analysis: Path,
+):
+    fmdx = FastMDXplora(
+        system=str(project_with_analysis / "simulation" / "topology.pdb"),
+        output_dir=project_with_analysis,
+    )
+    fmdx.report(bundle=False)
+
+    assert not (project_with_analysis / "report" / "region_highlight_summary.png").exists()
+    text = (project_with_analysis / "report" / "report.md").read_text(encoding="utf-8")
+    assert "Region Highlight Figure" not in text
+
+
+def test_region_highlight_structure_panel_when_pymol_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import subprocess
+
+    from fastmdxplora.report import region_highlights as rh
+
+    def fake_run(cmd, check, text, capture_output, timeout):
+        import matplotlib.pyplot as plt
+
+        script_path = Path(cmd[-1])
+        script = script_path.read_text(encoding="utf-8")
+        out_line = next(line for line in script.splitlines() if line.startswith("png "))
+        out_path = Path(out_line.split(" ", 1)[1].split(",", 1)[0])
+        plt.imsave(out_path, np.ones((4, 4, 3)))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(
+        rh,
+        "detect_pymol_renderer",
+        lambda: rh.PymolRenderer(kind="command", command=("pymol", "-cq")),
+    )
+    monkeypatch.setattr(rh.subprocess, "run", fake_run)
+
+    root = _make_traj_files(tmp_path / "region_structure", n_residues=8, n_frames=10)
+    fmdx = FastMDXplora(
+        system=str(root / "simulation" / "topology.pdb"),
+        output_dir=root,
+    )
+    fmdx.explore(
+        include=["analysis", "report"],
+        options={
+            "analysis": {"include": ["rmsf"]},
+            "report": {
+                "bundle": False,
+                "region_highlights": [
+                    {"label": "example region", "start": 2, "end": 5}
+                ],
+            },
+        },
+    )
+
+    assert (root / "report" / "structure_region_highlights.png").is_file()
+    assert (root / "report" / "structure_region_highlights.pml").is_file()
+    assert (root / "report" / "region_highlight_summary.png").is_file()
+    manifest = json.loads(
+        (root / "report" / "region_highlight_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["renderer"] == "PyMOL"
+    assert "report/structure_region_highlights.png" in manifest["artifacts"]
+    assert "report/structure_region_highlights.pml" in manifest["artifacts"]
+    assert manifest["skipped"] == []
+
+
+def test_pymol_script_generation_uses_cartoon_and_regions(tmp_path: Path):
+    from fastmdxplora.report.region_highlights import (
+        RegionHighlight,
+        build_pymol_script,
+    )
+
+    script = build_pymol_script(
+        topology_path=tmp_path / "topology.pdb",
+        output_path=tmp_path / "structure.png",
+        regions=[
+            RegionHighlight("example A", 2, 5, "#4E79A7"),
+            RegionHighlight("example B", 7, 9, "orange"),
+        ],
+    )
+
+    assert "show cartoon, prot" in script
+    assert "color gray70, prot" in script
+    assert "resi 2-5" in script
+    assert "resi 7-9" in script
+    assert "ray 1800, 1200" in script
+    assert "png " in script

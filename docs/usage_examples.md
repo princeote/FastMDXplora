@@ -104,6 +104,28 @@ artifacts the earlier phases wrote. `analyze` and `report` can infer the
 system from an existing run manifest; `setup` and `simulate` still need
 `--system` or `--config`.
 
+The report phase writes `report/report.md`, `report/dashboard.html`,
+`report/slides.pptx`, and `report/project_bundle.zip`. Open
+`<output>/report/dashboard.html` directly in a browser for the static
+dashboard view.
+
+For local live monitoring, add `--dashboard` to the workflow command. This
+starts the localhost dashboard before the workflow begins and automatically
+enables live telemetry when simulation runs:
+
+```bash
+fastmdx explore --system protein.pdb --output ./trpcage_study --include setup simulation --dashboard
+```
+
+PowerShell fallback when `fastmdx` is not on PATH:
+
+```powershell
+python -m fastmdxplora.cli.main explore --system protein.pdb --output .\trpcage_study --include setup simulation --dashboard
+```
+
+`fastmdx dashboard serve --output ./trpcage_study` remains available when you
+want to reopen an existing run folder manually.
+
 ### MD engine controls
 
 Integrator, pressure (in bar **or** atm), GPU device, and checkpointing:

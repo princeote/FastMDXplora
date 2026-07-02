@@ -148,7 +148,10 @@ def run(
 
     artifacts: list[str] = []
     for r in results.values():
-        for p in (r.data_path, r.figure_path, r.options_path):
+        paths = r.artifacts or [
+            p for p in (r.data_path, r.figure_path, r.options_path) if p is not None
+        ]
+        for p in paths:
             if p is not None:
                 try:
                     artifacts.append(p.relative_to(output_dir).as_posix())

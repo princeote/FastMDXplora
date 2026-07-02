@@ -6,10 +6,12 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+from fastmdxplora.orchestrator import FastMDXplora
 from fastmdxplora.cli.main import main
 
 
@@ -189,3 +191,223 @@ def test_cli_explore_include_and_exclude_mutually_exclusive(tmp_path: Path) -> N
         ]
     )
     assert rc == 2
+
+
+def test_cli_dashboard_flags_parse_on_workflow_commands() -> None:
+    from fastmdxplora.cli.main import _build_parser
+
+    parser = _build_parser()
+    parser.parse_args(["explore", "--system", "1L2Y", "--dashboard"])
+    parser.parse_args(["explore", "--system", "1L2Y", "--live-dashboard"])
+    parser.parse_args(
+        [
+            "explore",
+            "--system",
+            "1L2Y",
+            "--dashboard",
+            "--dashboard-host",
+            "127.0.0.1",
+            "--dashboard-port",
+            "8877",
+            "--dashboard-stop-on-complete",
+        ]
+    )
+    for command in ("setup", "simulate", "analyze", "report"):
+        parser.parse_args([command, "--system", "1L2Y", "--dashboard"])
+
+
+class _FakeDashboardSession:
+    def __init__(
+        self,
+        *,
+        url: str = "http://127.0.0.1:8765",
+        requested_port: int = 8765,
+        port: int = 8765,
+    ) -> None:
+        self.url = url
+        self.requested_port = requested_port
+        self.port = port
+        self.port_was_changed = requested_port != port
+        self.stopped = False
+        self.waited = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def wait_forever(self) -> None:
+        self.waited = True
+
+
+def test_cli_dashboard_starts_server_and_prints_url(tmp_path: Path, capsys) -> None:
+    pdb = _make_pdb_stub(tmp_path)
+    out = tmp_path / "run"
+    out.mkdir()
+    (out / "manifest.json").write_text(json.dumps({"system": str(pdb)}), encoding="utf-8")
+    session = _FakeDashboardSession()
+
+    with patch(
+        "fastmdxplora.live.server.start_dashboard_session",
+        return_value=session,
+    ) as start:
+        rc = main(
+            [
+                "report",
+                "--output",
+                str(out),
+                "--no-slides",
+                "--no-bundle",
+                "--dashboard",
+                "--dashboard-stop-on-complete",
+            ]
+        )
+
+    assert rc == 0
+    start.assert_called_once()
+    assert start.call_args.kwargs["output"] == out
+    assert start.call_args.kwargs["host"] == "127.0.0.1"
+    assert start.call_args.kwargs["port"] == 8765
+    assert session.stopped is True
+    text = capsys.readouterr().out
+    assert "Live dashboard running at: http://127.0.0.1:8765" in text
+    assert f"Watching output folder: {out}" in text
+    assert "Open this URL in your browser to monitor the run." in text
+
+
+def test_cli_explore_dashboard_does_not_read_missing_output_dir(
+    tmp_path: Path,
+) -> None:
+    pdb = _make_pdb_stub(tmp_path)
+    out = tmp_path / "run"
+    session = _FakeDashboardSession()
+
+    def fake_explore(self, *, dry_run=False):
+        self.output_dir = out
+        return [SimpleNamespace(status="ok")]
+
+    with patch(
+        "fastmdxplora.live.server.start_dashboard_session",
+        return_value=session,
+    ) as start, patch.object(FastMDXplora, "explore", fake_explore):
+        rc = main(
+            [
+                "explore",
+                "--system",
+                str(pdb),
+                "--output",
+                str(out),
+                "--include",
+                "setup",
+                "simulation",
+                "analysis",
+                "report",
+                "--simulate-preset",
+                "gentle",
+                "--dashboard",
+                "--dashboard-stop-on-complete",
+            ]
+        )
+
+    assert rc == 0
+    assert start.call_args.kwargs["output"] == out.resolve()
+    assert session.stopped is True
+
+
+def test_cli_phase_dashboard_uses_cli_output_path(tmp_path: Path) -> None:
+    pdb = _make_pdb_stub(tmp_path)
+    out = tmp_path / "phase_run"
+    session = _FakeDashboardSession()
+
+    with patch(
+        "fastmdxplora.live.server.start_dashboard_session",
+        return_value=session,
+    ) as start, patch.object(
+        FastMDXplora,
+        "setup",
+        return_value=SimpleNamespace(status="ok"),
+    ):
+        rc = main(
+            [
+                "setup",
+                "--system",
+                str(pdb),
+                "--output",
+                str(out),
+                "--dashboard",
+                "--dashboard-stop-on-complete",
+            ]
+        )
+
+    assert rc == 0
+    assert start.call_args.kwargs["output"] == out.resolve()
+    assert session.stopped is True
+
+
+def test_cli_dashboard_prints_port_conflict_and_host_warning(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    pdb = _make_pdb_stub(tmp_path)
+    out = tmp_path / "run"
+    out.mkdir()
+    (out / "manifest.json").write_text(json.dumps({"system": str(pdb)}), encoding="utf-8")
+    session = _FakeDashboardSession(
+        url="http://0.0.0.0:8766",
+        requested_port=8765,
+        port=8766,
+    )
+
+    with patch(
+        "fastmdxplora.live.server.start_dashboard_session",
+        return_value=session,
+    ):
+        rc = main(
+            [
+                "report",
+                "--output",
+                str(out),
+                "--no-slides",
+                "--no-bundle",
+                "--dashboard",
+                "--dashboard-host",
+                "0.0.0.0",
+                "--dashboard-port",
+                "8765",
+                "--dashboard-stop-on-complete",
+            ]
+        )
+
+    assert rc == 0
+    text = capsys.readouterr().out
+    assert "Live dashboard running at: http://0.0.0.0:8766" in text
+    assert "Requested port 8765 was busy, so FastMDXplora used 8766." in text
+    assert "Warning: dashboard is bound to 0.0.0.0" in text
+
+
+def test_cli_dashboard_implies_live_telemetry_for_simulation(tmp_path: Path) -> None:
+    pdb = _make_pdb_stub(tmp_path)
+    out = tmp_path / "run"
+    session = _FakeDashboardSession()
+
+    with patch(
+        "fastmdxplora.live.server.start_dashboard_session",
+        return_value=session,
+    ), patch.object(
+        FastMDXplora,
+        "simulate",
+        return_value=SimpleNamespace(status="ok"),
+    ) as simulate:
+        rc = main(
+            [
+                "simulate",
+                "--system",
+                str(pdb),
+                "--output",
+                str(out),
+                "--dashboard",
+                "--dashboard-stop-on-complete",
+            ]
+        )
+
+    assert rc == 0
+    assert simulate.call_args.kwargs["live_telemetry"] is True
+    assert session.stopped is True

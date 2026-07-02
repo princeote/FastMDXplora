@@ -67,6 +67,7 @@ class AnalysisResult:
     figure_path: Path | None = None
     data_path: Path | None = None
     options_path: Path | None = None
+    artifacts: list[Path] = field(default_factory=list)
     message: str = ""
     started_at: str = ""
     finished_at: str = ""
@@ -80,6 +81,7 @@ class AnalysisResult:
             "figure_path": str(self.figure_path) if self.figure_path else None,
             "data_path": str(self.data_path) if self.data_path else None,
             "options_path": str(self.options_path) if self.options_path else None,
+            "artifacts": [str(path) for path in self.artifacts],
             "message": self.message,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -276,6 +278,7 @@ class Analysis(ABC):
                 figure_path=figure_path,
                 data_path=data_path,
                 options_path=options_path,
+                artifacts=[data_path, figure_path, options_path],
                 message=f"{self.name}: ok",
                 started_at=started,
                 finished_at=finished,

@@ -30,13 +30,20 @@ from scripts.run_pdb_smoke_campaign import build_parser as build_campaign_parser
             "explore -s protein.pdb --include setup simulation "
             "--simulate-preset gentle --simulate-platform CPU --dry-run"
         ),
+        (
+            "explore --system local_pdbs/1L2Y.pdb "
+            "--output local_runs/trpcage_live_full "
+            "--include setup simulation analysis report "
+            "--simulate-preset gentle --dashboard"
+        ),
         "setup --system protein.pdb --ph 6.5 --box-shape octahedron",
         (
             "simulate --system protein.pdb --output ./trpcage_study "
-            "--duration-ns 50.0 --platform CUDA"
+            "--duration-ns 50.0 --platform CUDA --dashboard"
         ),
         "analyze --output ./trpcage_study --analyses rmsd rg --selection 'name CA'",
-        "report --output ./trpcage_study --no-slides",
+        "report --output ./trpcage_study --no-slides --dashboard",
+        "dashboard serve --output ./trpcage_study --port 8765",
         "init-config --minimal -o study.yml",
         "info",
     ],
@@ -78,7 +85,19 @@ def test_documented_configuration_shape_validates() -> None:
             "setup": {"ph": 7.0, "forcefield": "charmm36"},
             "simulation": {"preset": "gentle", "duration_ns": 10},
             "analysis": {"scope": "solute", "include": ["rmsd", "rmsf", "rg"]},
-            "report": {"title": "My study", "slides": True, "comparison": True},
+            "report": {
+                "title": "My study",
+                "slides": True,
+                "comparison": True,
+                "region_highlights": [
+                    {
+                        "label": "example flexible loop",
+                        "start": 3,
+                        "end": 7,
+                        "color": "#4E79A7",
+                    }
+                ],
+            },
         },
         require_systems=True,
     )

@@ -13,10 +13,12 @@ MDTraj's QCP algorithm), which is the standard featurization for
 conformational clustering. Outputs per method:
 
   - ``cluster_<method>.dat`` — per-frame integer cluster labels.
-  - ``cluster_<method>.png`` — combined plot: top panel shows cluster
-    labels as a function of time; bottom panel shows a hierarchical
-    dendrogram (for hierarchical) or a scatter against the first PC
-    (for k-means and DBSCAN).
+  - ``cluster_<method>.png`` — cluster labels as a function of time.
+  - ``cluster_<method>_counts.png`` — cluster population bar chart.
+  - ``cluster_hierarchical_dendrogram.png`` — hierarchical dendrogram
+    when hierarchical clustering is requested and SciPy is available.
+  - ``hierarchical_distance_matrix.npy`` and ``hierarchical_linkage.npy`` —
+    reproducibility data for dashboard/report-native dendrogram rendering.
 
 Because this analysis produces multiple files per run, it overrides the
 base class's :meth:`save_data` and :meth:`_do_plot` methods.
@@ -29,6 +31,7 @@ Lloyd, S. *IEEE Trans. Inf. Theory* **1982**, 28, 129 (k-means).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -94,7 +97,7 @@ class Cluster(Analysis):
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        methods = list(methods) if methods else ["kmeans"]
+        methods = list(methods) if methods else ["kmeans", "hierarchical"]
         methods = [m.lower() for m in methods]
         unknown = [m for m in methods if m not in VALID_METHODS]
         if unknown:
@@ -192,6 +195,53 @@ class Cluster(Analysis):
                 save_figure(fig, fig_path)
                 artifacts.append(fig_path)
 
+                counts_path = self.output_dir / f"cluster_{method}_counts.png"
+                fig_counts, ax_counts = new_figure(
+                    title=f"Cluster populations ({method})",
+                    figsize=(5.8, 3.6),
+                )
+                _plot_cluster_counts(ax_counts, labels)
+                save_figure(fig_counts, counts_path)
+                artifacts.append(counts_path)
+
+                if method == "hierarchical":
+                    dendro_path = self.output_dir / "cluster_hierarchical_dendrogram.png"
+                    skip_path = self.output_dir / "cluster_hierarchical_dendrogram_skipped.json"
+                    distance_path = self.output_dir / "hierarchical_distance_matrix.npy"
+                    np.save(distance_path, self._distances)
+                    artifacts.append(distance_path)
+                    try:
+                        linkage_matrix = _hierarchical_linkage_matrix(
+                            self._distances,
+                            self.linkage,
+                        )
+                        linkage_path = self.output_dir / "hierarchical_linkage.npy"
+                        np.save(linkage_path, linkage_matrix)
+                        artifacts.append(linkage_path)
+                        fig_den, ax_den = new_figure(
+                            title="Hierarchical clustering dendrogram",
+                            figsize=(6.5, 3.8),
+                        )
+                        _plot_hierarchical_dendrogram_from_linkage(ax_den, linkage_matrix)
+                        save_figure(fig_den, dendro_path)
+                        artifacts.append(dendro_path)
+                        if skip_path.exists():
+                            skip_path.unlink()
+                    except Exception as dendro_exc:  # noqa: BLE001
+                        skip_path.write_text(
+                            json.dumps(
+                                {
+                                    "artifact": dendro_path.name,
+                                    "status": "skipped",
+                                    "reason": str(dendro_exc),
+                                },
+                                indent=2,
+                            )
+                            + "\n",
+                            encoding="utf-8",
+                        )
+                        artifacts.append(skip_path)
+
             finished = datetime.now(timezone.utc).isoformat()
 
             # Use the first method's outputs as the "primary" data/figure
@@ -206,6 +256,7 @@ class Cluster(Analysis):
                 figure_path=self.output_dir / f"cluster_{primary_method}.png",
                 data_path=self.output_dir / f"cluster_{primary_method}.dat",
                 options_path=options_path,
+                artifacts=[options_path, *artifacts],
                 message=f"{self.name}: ok ({', '.join(self.methods)})",
                 started_at=started,
                 finished_at=finished,
@@ -334,6 +385,57 @@ def _plot_cluster_timeline(ax: plt.Axes, labels: np.ndarray, method: str) -> Non
     ax.set_yticks(unique)
     if len(unique) <= 10:
         ax.legend(loc="best", fontsize=8, ncol=2)
+
+
+def _plot_cluster_counts(ax: plt.Axes, labels: np.ndarray) -> None:
+    unique, counts = np.unique(labels, return_counts=True)
+    palette = plt.cm.tab10.colors
+    colors = ["#BBBBBB" if k == -1 else palette[int(k) % len(palette)] for k in unique]
+    ax.bar(unique, counts, color=colors, width=0.75)
+    ax.set_xlabel("Cluster")
+    ax.set_ylabel("Frames")
+    ax.set_xticks(unique)
+
+
+def _plot_hierarchical_dendrogram(
+    ax: plt.Axes,
+    distances: np.ndarray,
+    linkage_method: str,
+) -> None:
+    z = _hierarchical_linkage_matrix(distances, linkage_method)
+    _plot_hierarchical_dendrogram_from_linkage(ax, z)
+
+
+def _hierarchical_linkage_matrix(
+    distances: np.ndarray,
+    linkage_method: str,
+) -> np.ndarray:
+    try:
+        from scipy.cluster.hierarchy import linkage
+        from scipy.spatial.distance import squareform
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError("SciPy is required for dendrogram generation") from exc
+
+    if distances.shape[0] < 2:
+        raise ValueError("at least two frames are required for a dendrogram")
+    condensed = squareform(distances, checks=False)
+    method = "average" if linkage_method == "ward" else linkage_method
+    return linkage(condensed, method=method)
+
+
+def _plot_hierarchical_dendrogram_from_linkage(
+    ax: plt.Axes,
+    linkage_matrix: np.ndarray,
+) -> None:
+    try:
+        from scipy.cluster.hierarchy import dendrogram
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError("SciPy is required for dendrogram generation") from exc
+
+    dendrogram(linkage_matrix, ax=ax, no_labels=True, color_threshold=None)
+    ax.set_xlabel("Frame")
+    ax.set_ylabel("Distance")
+    ax.set_ylim(bottom=0)
 
 
 register_analysis(Cluster.name, Cluster)

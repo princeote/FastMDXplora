@@ -11,8 +11,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fastmdxplora.report.bundle import build_bundle
+from fastmdxplora.report.dashboard import build_dashboard
 from fastmdxplora.report.document import build_document
+from fastmdxplora.report.region_highlights import build_region_highlight_artifacts
 from fastmdxplora.report.slides import build_slides
+from fastmdxplora.report.summary_figure import build_analysis_summary_figure
 
 if TYPE_CHECKING:
     from fastmdxplora.orchestrator import FastMDXplora
@@ -28,6 +31,7 @@ DEFAULTS: dict[str, Any] = {
     "author": None,
     "include_methods": True,
     "include_reproducibility": True,
+    "region_highlights": None,
 }
 
 
@@ -59,6 +63,25 @@ def run(
     presenter = getattr(orchestrator, "_presenter", None)
     artifacts: list[str] = []
 
+    region_artifacts = build_region_highlight_artifacts(
+        project_root=orchestrator.output_dir,
+        output_dir=output_dir,
+        region_highlights=params.get("region_highlights"),
+    )
+    artifacts.extend(region_artifacts)
+    if presenter:
+        for art in region_artifacts:
+            presenter.step(f"Wrote {art}")
+
+    summary_artifacts = build_analysis_summary_figure(
+        project_root=orchestrator.output_dir,
+        output_dir=output_dir,
+    )
+    artifacts.extend(summary_artifacts)
+    if presenter:
+        for art in summary_artifacts:
+            presenter.step(f"Wrote {art}")
+
     if params["document"]:
         doc_artifacts = build_document(
             orchestrator=orchestrator,
@@ -82,6 +105,17 @@ def run(
         if presenter:
             for art in slide_artifacts:
                 presenter.step(f"Wrote {art}")
+
+    dashboard_artifacts = build_dashboard(
+        orchestrator=orchestrator,
+        output_dir=output_dir,
+        title=title,
+        include_bundle_link=bool(params["bundle"]),
+    )
+    artifacts.extend(dashboard_artifacts)
+    if presenter:
+        for art in dashboard_artifacts:
+            presenter.step(f"Wrote {art}")
 
     if params["bundle"]:
         bundle_artifacts = build_bundle(

@@ -22,6 +22,7 @@
 - Explore a protein's full dynamics with a single command, covering setup, simulation, analysis, and reporting
 - Probe protein-ligand binding automatically with analyses for pose stability, contacts, and protein-ligand hydrogen bonds
 - Reach beyond plain MD with built-in PLUMED enhanced sampling (metadynamics, umbrella sampling, steered MD) and a full analysis suite that turns trajectories into slide-ready, publication-quality figures
+- Highlight user-defined residue regions on RMSF report figures for loops, helices, active-site neighborhoods, or other known intervals
 - Scale from a quick single-protein exploration to large-scale parallel campaigns, driven the same way from the CLI or the Python API
 
 ## Phases of FastMDXplora
@@ -416,7 +417,7 @@ Each phase writes to a dedicated subdirectory under the project output root, wit
 | `setup` | `prepared.pdb`, `solvated.pdb`, `setup_parameters.json` |
 | `simulation` | `production.dcd`, `topology.pdb`, `simulation_parameters.json` |
 | `analysis` | `<analysis>/*.dat`, `<analysis>/*.png`, `analysis_manifest.json` |
-| `report` | `report.md`, `slides.pptx`, `project_bundle.zip` |
+| `report` | `report.md`, `dashboard.html`, `slides.pptx`, `project_bundle.zip` |
 
 ## Documentation
 

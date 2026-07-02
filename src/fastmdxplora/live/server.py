@@ -97,12 +97,6 @@ PLOT_CATEGORY_BY_TITLE = {
 KEY_PLOT_TITLES = {"RMSD", "RMSF", "Radius of gyration", "Hydrogen bonds", "PCA", "SASA"}
 
 
-class DashboardHTTPServer(ThreadingHTTPServer):
-    """Dashboard server with portable occupied-port detection."""
-
-    allow_reuse_address = False
-
-
 @dataclass
 class DashboardSession:
     """Background local dashboard server session."""
@@ -292,7 +286,7 @@ def start_dashboard_session(
     last_error: OSError | None = None
     for candidate in candidates:
         try:
-            server = DashboardHTTPServer((host, int(candidate)), handler)
+            server = ThreadingHTTPServer((host, int(candidate)), handler)
         except OSError as exc:
             last_error = exc
             continue
@@ -318,7 +312,7 @@ def start_dashboard_session(
 
 def start_test_server(project_root: str | Path) -> tuple[ThreadingHTTPServer, str]:
     handler = make_handler(project_root)
-    server = DashboardHTTPServer(("127.0.0.1", 0), handler)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, f"http://127.0.0.1:{server.server_address[1]}"

@@ -336,7 +336,6 @@ def test_dashboard_session_uses_next_port_when_requested_port_is_busy(
         max_port_tries=5,
     )
     try:
-        assert session.server.allow_reuse_address is False
         assert session.requested_port == requested_port
         assert session.port != requested_port
         assert session.port_was_changed is True
@@ -454,7 +453,7 @@ def test_protein_preview_finds_manifest_system_path_and_handles_missing_viewer(
 
     assert payload["available"] is True
     assert payload["static_available"] is False
-    assert payload["structure_path"] == str(system_pdb)
+    assert Path(payload["structure_path"]).resolve() == system_pdb.resolve()
     assert payload["structure_url"] is None
     assert payload["structure_available"] is False
     assert payload["viewer_available"] is False

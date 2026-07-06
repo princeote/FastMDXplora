@@ -768,6 +768,64 @@ def _cmd_health(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Self-healing prologue
+# ---------------------------------------------------------------------------
+# `explore` / `xplore` / `setup` / `simulate` need OpenMM (and PDBFixer
+# for setup). Without the chemistry stack installed, the user would
+# otherwise get a long stack trace. Detect this here and offer a one-stop
+# install hint instead, while still letting `info` / `health` / etc.
+# proceed normally.
+_CHEMISTRY_PHASES = frozenset({"setup", "simulation"})
+
+
+def _needs_chemistry(args: argparse.Namespace) -> bool:
+    """Return True if this command will actually invoke a chemistry phase."""
+    cmd = getattr(args, "command", None)
+    if cmd in ("setup", "simulate"):
+        return True
+    if cmd in ("explore", "xplore"):
+        # Dry runs only print the plan; they must work without chemistry so
+        # users can use them as a teaching tool when explaining the install gap.
+        if getattr(args, "dry_run", False):
+            return False
+        include = getattr(args, "include", None)
+        exclude = set(getattr(args, "exclude", None) or ())
+        if include is not None:
+            return bool(set(include) & _CHEMISTRY_PHASES)
+        if exclude >= _CHEMISTRY_PHASES:
+            return False
+        return True  # default plan runs every phase
+    return False
+
+
+def _missing_chemistry_backends() -> list[str]:
+    """Return the chemistry backend modules that aren't importable here.
+
+    Probes the *actual* import shape used by setup and simulation
+    (e.g. ``from openmm.app import PDBFile``) so a broken partial install
+    fails fast here instead of mid-phase.
+    """
+    probes: tuple[tuple[str, str], ...] = (
+        ("openmm", None),                                # top-level package
+        ("openmm.app", "from openmm.app import PDBFile"),
+        ("openmm", "from openmm import unit"),
+        ("pdbfixer", "from pdbfixer import PDBFixer"),
+    )
+    failing: list[str] = []
+    for name, stmt in probes:
+        try:
+            if stmt is None:
+                __import__(name)
+            else:
+                exec(stmt, {})  # noqa: S102 — string intentional, gated by probes tuple
+        except ImportError:
+            failing.append(name)
+    # Reduce to the *top-level* packages the user has to install, so the
+    # hint stays short and actionable.
+    return sorted({("openmm" if name.startswith("openmm") else name) for name in failing})
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main(argv: Sequence[str] | None = None) -> int:
@@ -792,13 +850,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
+    # Short-circuit cheap flags first so a missing chemistry backend never
+    # *blocks* `--cite`, `--version`, or `--help`. These flags are how
+    # users diagnose the install gap, so guarding them would defeat their
+    # purpose.
     if args.cite:
         print(__citation__)
         return 0
-
     if args.command is None:
         parser.print_help()
         return 0
+
+    # Self-heal before dispatch: if this command needs the chemistry stack
+    # and it's missing from the current interpreter, surface the install
+    # hint instead of letting a later ImportError crash the run.
+    if _needs_chemistry(args):
+        missing = _missing_chemistry_backends()
+        if missing:
+            joined = " and ".join(missing) if len(missing) == 2 else missing[0]
+            print(
+                f"fastmdx: this command needs the chemistry backend ({joined}), "
+                "which isn't importable from the current Python environment.",
+                file=sys.stderr,
+            )
+            print("", file=sys.stderr)
+            print("Install it with one of:", file=sys.stderr)
+            print("  conda install -c conda-forge openmm pdbfixer  # recommended across platforms", file=sys.stderr)
+            print('  pip install "fastmdxplora[md]"  # best-effort (PDBFixer wheels are unreliable)', file=sys.stderr)
+            print("", file=sys.stderr)
+            print("Or run only the phases that don't need chemistry:", file=sys.stderr)
+            print("  fastmdx explore --system <PDB> --include analyze report", file=sys.stderr)
+            print("Tip: run `fastmdx info` to see which backends are detected.", file=sys.stderr)
+            return 2
 
     if args.command == "init-config":
         return _cmd_init_config(args)

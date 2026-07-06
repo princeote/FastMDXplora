@@ -52,6 +52,24 @@ __citation__ = (
 )
 __doi__ = "10.1002/jcc.70350"
 
+# Canonical Python version range for the full conda install (setup +
+# simulation stages). MAX_PYTHON is the *exclusive* upper bound — 3.12.x
+# is the highest supported, matching `pyproject.toml`'s
+# ``requires-python = ">=3.9, <3.13"``. Update all three (this file,
+# pyproject, and the embedded env yaml in bootstrap.py) together when
+# the OpenMM / PDBFixer compatibility window moves.
+MIN_PYTHON: tuple[int, int] = (3, 9)
+MAX_PYTHON: tuple[int, int] = (3, 13)
+
+
+def python_range_string() -> str:
+    """Human-readable supported Python range, e.g. ``"Python 3.9-3.12"``."""
+    return (
+        f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
+        f"\u2013{MAX_PYTHON[0]}.{MAX_PYTHON[1] - 1}"
+    )
+
+
 from fastmdxplora.orchestrator import FastMDXplora
 
 # Expose the analysis-level orchestrator for users who want it directly.
@@ -69,6 +87,9 @@ def __getattr__(name: str):
 __all__ = [
     "FastMDXplora",
     "AnalysisOrchestrator",
+    "MIN_PYTHON",
+    "MAX_PYTHON",
+    "python_range_string",
     "__version__",
     "__author__",
     "__license__",

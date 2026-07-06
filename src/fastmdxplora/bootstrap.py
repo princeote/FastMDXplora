@@ -10,6 +10,8 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable
 
+from fastmdxplora import MAX_PYTHON, MIN_PYTHON, python_range_string
+
 DEFAULT_ENV_NAME = "fastmdxplora"
 MINIFORGE_BASE_URL = "https://github.com/conda-forge/miniforge/releases/latest/download"
 MINIFORGE_PREFIX = Path.home() / "miniforge3"
@@ -22,11 +24,21 @@ MINIFORGE_INSTALLERS = {
     ("Windows", "aarch64"): "Miniforge3-Windows-aarch64.exe",
 }
 
-BOOTSTRAP_ENV_YAML = """name: fastmdxplora
+
+def _build_bootstrap_yaml() -> str:
+    """Render the conda env file using the canonical Python range.
+
+    Kept in sync with ``pyproject.toml`` and the doctor check in
+    ``health.py`` via :data:`fastmdxplora.MIN_PYTHON` /
+    :data:`fastmdxplora.MAX_PYTHON`.
+    """
+    min_str = f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
+    max_str = f"{MAX_PYTHON[0]}.{MAX_PYTHON[1]}"
+    return f"""name: fastmdxplora
 channels:
   - conda-forge
 dependencies:
-  - python>=3.9,<3.13
+  - python>={min_str},<{max_str}
   - pip
   - numpy>=1.22
   - pyyaml>=6.0
@@ -39,6 +51,11 @@ dependencies:
   - pdbfixer
   - openmmforcefields
 """
+
+
+# Constant kept for backwards compatibility with any external callers
+# that imported it before the range-sync refactor.
+BOOTSTRAP_ENV_YAML: str = _build_bootstrap_yaml()
 
 
 class BootstrapError(Exception):
@@ -163,7 +180,7 @@ def _ensure_conda_available() -> list[str]:
 def _write_environment_yaml() -> Path:
     temp_dir = Path(tempfile.mkdtemp(prefix="fastmdxplora-env-"))
     yaml_path = temp_dir / "environment.yml"
-    yaml_path.write_text(BOOTSTRAP_ENV_YAML, encoding="utf-8")
+    yaml_path.write_text(_build_bootstrap_yaml(), encoding="utf-8")
     return yaml_path
 
 
@@ -269,11 +286,18 @@ def bootstrap_environment(
     package_name: str = "fastmdxplora",
     editable: bool = False,
 ) -> None:
+    supported = python_range_string()
     if not python_version.startswith("3."):
-        raise BootstrapError("Only Python 3.9–3.12 is supported for the full conda environment.")
+        raise BootstrapError(
+            f"Invalid Python version {python_version!r}. FastMDXplora supports {supported}."
+        )
     major_minor = tuple(int(part) for part in python_version.split(".")[:2])
-    if major_minor < (3, 9) or major_minor >= (3, 13):
-        raise BootstrapError("Only Python 3.9–3.12 is supported for the full conda environment.")
+    if major_minor < MIN_PYTHON or major_minor >= MAX_PYTHON:
+        raise BootstrapError(
+            f"Python {python_version} is outside the supported range. "
+            f"FastMDXplora supports {supported} (the OpenMM/PDBFixer stack "
+            f"is the bottleneck; pick 3.10 or 3.11 for the smoothest ride)."
+        )
 
     conda_cli = _ensure_conda_available()
     if conda_cli is None:
@@ -284,7 +308,9 @@ def bootstrap_environment(
     try:
         # Embed the requested Python version in the YAML before env creation.
         text = yaml_path.read_text(encoding="utf-8")
-        text = text.replace("python>=3.9,<3.13", f"python=={python_version}")
+        min_str = f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
+        max_str = f"{MAX_PYTHON[0]}.{MAX_PYTHON[1]}"
+        text = text.replace(f"python>={min_str},<{max_str}", f"python=={python_version}")
         yaml_path.write_text(text, encoding="utf-8")
 
         if existing and force:

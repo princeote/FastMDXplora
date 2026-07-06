@@ -33,8 +33,31 @@ PYPROJECT_TOML = ROOT / "pyproject.toml"
 REQUIREMENTS_TXT = ROOT / "requirements.txt"
 ENVIRONMENT_YML = ROOT / "environment.yml"
 
-REQUIRED_PYTHON = (3, 9)
 DEFAULT_CONDA_ENV = "fastmdxplora"
+
+# Insert the in-tree source root on sys.path so we can read the canonical
+# Python-version range straight out of the package. Keeps the doctor
+# honest with what bootstrap.py / pyproject.toml will actually enforce.
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+try:
+    from fastmdxplora import (
+        MAX_PYTHON as _MAX_PYTHON,
+        MIN_PYTHON as _MIN_PYTHON,
+        python_range_string as _PYTHON_RANGE_STR,
+    )
+except Exception:  # pragma: no cover — only hit if checkout is broken
+    _MIN_PYTHON = (3, 9)
+    _MAX_PYTHON = (3, 13)
+
+    def _PYTHON_RANGE_STR() -> str:
+        return (
+            f"Python {_MIN_PYTHON[0]}.{_MIN_PYTHON[1]}"
+            f"\u2013{_MAX_PYTHON[0]}.{_MAX_PYTHON[1] - 1}"
+        )
+MAX_PYTHON_STR = _PYTHON_RANGE_STR().rsplit("\u2013", 1)[-1]
+MIN_PYTHON_STR = f"{_MIN_PYTHON[0]}.{_MIN_PYTHON[1]}"
 
 CORE_PATHS = [
     ROOT / "README.md",
@@ -326,9 +349,13 @@ def import_name_for_package(dist_name: str) -> str:
 
 def check_python_version() -> bool:
     current = sys.version_info[:2]
-    if current < REQUIRED_PYTHON:
-        print(fmt(f"Python {REQUIRED_PYTHON[0]}.{REQUIRED_PYTHON[1]} or newer is required; found {platform.python_version()}", Status.FAILED))
-        print(help_note("Install Python 3.9+ and rerun this script. Use https://python.org or Miniforge/Conda on Linux/macOS/Windows."))
+    if current < _MIN_PYTHON:
+        print(fmt(f"Python {MIN_PYTHON_STR} or newer is required; found {platform.python_version()}", Status.FAILED))
+        print(help_note(f"Install {_PYTHON_RANGE_STR()} from https://python.org or Miniforge/Conda on Linux/macOS/Windows, then rerun this script."))
+        return False
+    if current >= _MAX_PYTHON:
+        print(fmt(f"Python {platform.python_version()} is too new; FastMDXplora supports {_PYTHON_RANGE_STR()} (the OpenMM/PDBFixer chemistry stack caps out at 3.12)", Status.FAILED))
+        print(help_note(f"Install {_PYTHON_RANGE_STR()} (3.10 or 3.11 recommended) into a dedicated environment with conda/Miniforge, then rerun this script."))
         return False
     print(fmt(f"Python {platform.python_version()} is present", Status.OK))
     return True

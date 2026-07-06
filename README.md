@@ -35,123 +35,80 @@
 
 ## Installation
 
-FastMDXplora's four phases have different dependency footprints. The **analysis and report** phases work from pip alone; the **setup and simulation** phases need PDBFixer + OpenMM, which are distributed primarily through conda-forge. The supported Python range for the full conda-based install is **3.9 through 3.12**. For a brand-new user, the simplest path is to install Python 3.10 or 3.11 first, then run the built-in install command below.
+FastMDXplora runs on **Linux, macOS, and Windows** with the same three commands — no per-OS scripts and no manual environment wrangling. **Miniforge is auto-installed** when no conda is on PATH, so a brand-new user on a fresh machine is enough.
 
-### Install from a git clone
-
-For a fresh checkout, the recommended path is to use the built-in install command through Python’s module entry point. That works even before the `fastmdx` console script is installed, so a brand-new user can start from a plain clone.
+### Quick install (any OS)
 
 ```bash
-git clone https://github.com/aai-research-lab/FastMDXplora.git
-cd FastMDXplora
-python -m fastmdxplora.cli.main install
+git clone https://github.com/aai-research-lab/FastMDXplora.git   # 1
+cd FastMDXplora                                                  # 2
+python -m fastmdxplora.cli.main install                         # 3
 ```
 
-This creates a `fastmdxplora` conda environment, installs the current repository checkout into it, and verifies the CLI. If you already installed the package and want the console-script form, the equivalent command is:
+The third command:
+
+- detects whether conda/mamba is already installed; if not, downloads and installs **Miniforge** for your platform automatically
+- creates a `fastmdxplora` conda environment with Python 3.10
+- installs **OpenMM** and **PDBFixer** (the only heavy chemistry dependencies)
+- installs FastMDXplora itself
+- runs `fastmdx info` as a smoke test to confirm everything works
+
+Then activate and run your first simulation:
 
 ```bash
-fastmdx install
-```
-
-For contributors who want an editable install while developing, use:
-
-```bash
-python -m fastmdxplora.cli.main install-e
-```
-
-If you only want to diagnose or repair an existing setup, run:
-
-```bash
-python -m fastmdxplora.cli.main health
-```
-
-`fastmdx health` runs the repository diagnostics (and can fix common issues when you do not pass `--no-fix`). The older standalone helper remains available as `python health.py`.
-
-### Install from pip
-
-If you are installing the published package instead of working from a clone, the intended setup flow is:
-
-```bash
-pip install fastmdxplora
-fastmdx install
-```
-
-`fastmdx install` will:
-- detect your OS and architecture
-- install Miniforge/conda if needed
-- create a `fastmdxplora` conda environment
-- install `fastmdxplora` into that environment
-- verify the CLI with `fastmdx info`
-
-If you only need analysis + reporting, plain pip still works without the chemistry stack. This is the easiest route for users who already have Python 3.9–3.12 installed and do not need the full setup/simulation backend:
-
-```bash
-pip install fastmdxplora
-pip install fastmdx
-```
-
-This gives a fully working analysis + report pipeline, slide deck included (`python-pptx` is a core dependency). The setup and simulation phases emit a clear warning and skip gracefully until the chemistry stack is present. Add it via conda-forge (recommended, reliable across platforms):
-
-```bash
-conda install -c conda-forge pdbfixer openmm
-```
-
-or best-effort via the `[md]` pip extras (PDBFixer wheels are unavailable on some platforms, so conda is preferred):
-
-```bash
-pip install "fastmdxplora[md]"
-```
-
-### Development install
-
-```bash
-git clone https://github.com/aai-research-lab/FastMDXplora.git
-cd FastMDXplora
-mamba env create -f environment.yml || conda env create -f environment.yml
 conda activate fastmdxplora
-pip install -e ".[test]"               # editable, with the test dependencies
+fastmdx explore --system 1L2Y
 ```
+
+`1L2Y` is a small trp-cage PDB that exercises every phase on a fast turnaround. Replace it with any 4-character PDB ID or with the path to a local `.pdb` / `.cif` file.
+
+### Three scenarios, two install paths
+
+| Starting point | What you run |
+|---|---|
+| **Fresh machine, nothing installed** (cold start) | The 3 commands below. Miniforge is downloaded and installed automatically. No prior Python needed. |
+| **You already have conda or mamba** | The same 3 commands. Miniforge download is skipped; the `fastmdxplora` environment is created directly. |
+| **You only want analysis + reports, no MD** | Skip the `install` step. Just `pip install fastmdxplora` then `fastmdx explore --system 1L2Y --include analyze report` (2 commands, no conda env required). To upgrade later to the full chemistry stack, see [Install from PyPI](#install-from-pypi-no-git-clone) below. |
+
+### Install from PyPI (no git clone)
+
+If you don't want to clone the repository — for example, you only need FastMDXplora as a library to call from a script — install the published version straight from PyPI. FastMDXplora is published under two names that resolve to the same package: `fastmdxplora` (canonical) and `fastmdx` (a one-line alias). Either command installs the same software:
+
+```bash
+pip install fastmdxplora       # canonical name
+pip install fastmdx            # shorter alias; same install underneath
+```
+
+The CLI is exposed by either install as a real platform-native `fastmdx` console script on `PATH` (declared by `[project.scripts]` in `pyproject.toml`), so it behaves identically on Linux / macOS / Windows — no App Execution Aliases trap, no per-OS wrapper script.
+
+After install:
+
+- **Analysis + reports** (no MD): all four pip deps (MDTraj, matplotlib, scikit-learn, python-pptx) are present out of the box. Run `fastmdx explore --system 1L2Y --include analyze report`.
+- **Setup + simulation** (full chemistry stack): OpenMM and PDBFixer are **not** installed by plain pip because PDBFixer wheels aren't reliable across all platforms. Run `python -m fastmdxplora.cli.main install` after the pip install to drop them into the `fastmdxplora` conda env (auto-installs Miniforge if needed, same flow as the git-clone path).
+
+To upgrade a pip-only install to the full chemistry stack on any OS:
+
+```bash
+pip install fastmdxplora                                      # 1
+python -m fastmdxplora.cli.main install                        # 2 — creates the conda env, auto-installs Miniforge if needed
+conda activate fastmdxplora                                   # 3
+fastmdx explore --system 1L2Y                                 # 4 — first full sim
+```
+
+Miniforge is auto-installed on a fresh machine, OpenMM + PDBFixer drop into the `fastmdxplora` conda env, and `fastmdx info` is used as a smoke test — same flow as the git-clone path.
 
 ### Verify
 
 ```bash
-fastmdx --version
-fastmdx info                           # versions + detected backends (OpenMM/PDBFixer)
+fastmdx --version    # reports the installed FastMDXplora version
+fastmdx info         # version + detected backends (OpenMM, PDBFixer, ...)
 ```
 
-Check which OpenMM platforms are available (CPU/CUDA/OpenCL):
+### Where to go next
 
-```bash
-python - <<'PY'
-import openmm as mm
-plats = [mm.Platform.getPlatform(i).getName() for i in range(mm.Platform.getNumPlatforms())]
-print("Available platforms:", plats)
-print("CUDA available" if "CUDA" in plats else "CPU-only: simulations will run on CPU")
-PY
-```
-
-> **conda-forge package (coming soon).** A single-command `conda install -c conda-forge fastmdxplora` (pulling every dependency, all four phases working out of the box) is planned once the recipe clears review. Until then, use the git + `environment.yml` route above.
-
-### Mamba / Miniforge (optional)
-
-`mamba` is a drop-in, faster replacement for the conda solver, helpful because solving the OpenMM/CUDA stack is exactly where the classic solver is slow. If you don't have it, the easiest source is **Miniforge** (conda + mamba, preconfigured for conda-forge):
-
-```bash
-# Linux (x86_64); see https://conda-forge.org/miniforge/ for macOS/Windows/ARM
-curl -L -o "$HOME/Miniforge3.sh" \
-  "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
-bash "$HOME/Miniforge3.sh" -b -p "$HOME/miniforge3"
-source "$HOME/miniforge3/etc/profile.d/conda.sh"
-conda init "$(basename "$SHELL")"
-```
-
-If `mamba` still isn't on PATH afterward, add it to the base environment:
-
-```bash
-conda install -n base -c conda-forge mamba
-```
-
-For other operating systems (macOS Intel/Apple Silicon, Linux ARM64, Windows), grab the matching installer from the [Miniforge releases page](https://conda-forge.org/miniforge/).
+- **Need the full walkthrough, GPU notes, or troubleshooting?** See [`docs/installation.md`](docs/installation.md).
+- **Already installed and ready to run?** Skip to [Examples](#examples).
+- **Want to contribute?** See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Examples
 

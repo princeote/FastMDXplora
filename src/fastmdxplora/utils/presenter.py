@@ -205,16 +205,63 @@ class SessionPresenter:
             except Exception:
                 version = "unknown"
 
-        platform = arg_value("--simulate-platform", default="auto")
-        precision = arg_value("--simulate-precision", default="mixed")
+        def field_value(*keys: str, default: object = "") -> str:
+            """Return a banner value from explicit fields, falling back to a default."""
+            for key in keys:
+                value = fields.get(key)
+                if value not in (None, ""):
+                    return str(value)
+            return str(default)
 
-        setup_ph = arg_value("--setup-ph", default="7.4")
-        ion_conc = arg_value("--setup-ion-concentration-M", default="0.15")
-        forcefield = arg_value("--setup-forcefield", default="charmm36")
+        try:
+            from fastmdxplora.setup.pipeline import DEFAULTS as _SETUP_DEFAULTS
+        except Exception:
+            _SETUP_DEFAULTS = {}
 
-        timestep = arg_value("--simulate-timestep-fs", default="2.0")
-        temperature = arg_value("--simulate-temperature-K", default="300")
-        friction = arg_value("--simulate-friction-per-ps", default="1.0")
+        try:
+            from fastmdxplora.simulation.pipeline import DEFAULTS as _SIM_DEFAULTS
+        except Exception:
+            _SIM_DEFAULTS = {}
+
+        platform = arg_value(
+            "--simulate-platform",
+            default=field_value("Platform", "platform", default=_SIM_DEFAULTS.get("platform", "auto")),
+        )
+        precision = arg_value(
+            "--simulate-precision",
+            default=field_value("Precision", "precision", default=_SIM_DEFAULTS.get("precision", "mixed")),
+        )
+
+        setup_ph = arg_value(
+            "--setup-ph",
+            default=field_value("pH", "ph", "setup_ph", default=_SETUP_DEFAULTS.get("ph", 7.0)),
+        )
+        ion_conc = arg_value(
+            "--setup-ion-concentration-M",
+            default=field_value(
+                "Ion Conc.",
+                "ion_concentration_M",
+                "setup_ion_concentration_M",
+                default=_SETUP_DEFAULTS.get("ion_concentration_M", 0.15),
+            ),
+        )
+        forcefield = arg_value(
+            "--setup-forcefield",
+            default=field_value("Force Field", "forcefield", "setup_forcefield", default=_SETUP_DEFAULTS.get("forcefield", "charmm36")),
+        )
+
+        timestep = arg_value(
+            "--simulate-timestep-fs",
+            default=field_value("Timestep", "timestep_fs", "simulate_timestep_fs", default=_SIM_DEFAULTS.get("timestep_fs", 2.0)),
+        )
+        temperature = arg_value(
+            "--simulate-temperature-K",
+            default=field_value("Temperature", "temperature_K", "simulate_temperature_K", default=_SIM_DEFAULTS.get("temperature_K", 300.0)),
+        )
+        friction = arg_value(
+            "--simulate-friction-per-ps",
+            default=field_value("Friction", "friction_per_ps", "simulate_friction_per_ps", default=_SIM_DEFAULTS.get("friction_per_ps", 1.0)),
+        )
 
         def maybe_int(value: str) -> int | None:
             if value == "":
@@ -294,26 +341,7 @@ class SessionPresenter:
             except Exception:
                 return "adaptive frame saving during production"
 
-        def resolve_checkpoint_display() -> str:
-            try:
-                from fastmdxplora.simulation.pipeline import DEFAULTS as _SIM_DEFAULTS
-            except Exception:
-                _SIM_DEFAULTS = {"checkpoint_interval_steps": "auto"}
-            raw_setting = arg_value(
-                "--simulate-checkpoint-interval-steps",
-                default=str(_SIM_DEFAULTS.get("checkpoint_interval_steps", "auto")),
-            ).strip()
-            if raw_setting.lower() == "auto":
-                return "every 20% of production"
-            raw_int = maybe_int(raw_setting)
-            if raw_int is None:
-                return raw_setting or "not set"
-            if raw_int <= 0:
-                return "disabled"
-            return f"every {raw_int:,} steps"
-
         trajectory_display = resolve_trajectory_display()
-        checkpoint_display = resolve_checkpoint_display()
 
         report_title = arg_value("--report-title", default="FastMDXplora Run")
         dashboard_link = _os.environ.get("FASTMDX_DASHBOARD_URL", "")
@@ -402,7 +430,6 @@ class SessionPresenter:
         kv("Temperature", f"{temperature} K", "orange")
         kv("Friction", f"{friction} / ps", "orange")
         kv("DCD Frames", trajectory_display, "orange")
-        kv("Checkpoint", checkpoint_display, "orange")
         bottom("orange")
         self._write("")
 

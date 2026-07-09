@@ -37,7 +37,7 @@ DEFAULT_CONDA_ENV = "fastmdxplora"
 
 # Insert the in-tree source root on sys.path so we can read the canonical
 # Python-version range straight out of the package. Keeps the doctor
-# honest with what bootstrap.py / pyproject.toml will actually enforce.
+# honest with what install.py / pyproject.toml will actually enforce.
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 

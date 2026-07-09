@@ -42,7 +42,7 @@ FastMDXplora runs on **Linux, macOS, and Windows** with the same three commands 
 ```bash
 git clone https://github.com/aai-research-lab/FastMDXplora.git   # 1
 cd FastMDXplora                                                  # 2
-python -m fastmdxplora.cli.main install                         # 3
+python fastmdx install                                           # 3
 ```
 
 The third command:
@@ -52,6 +52,8 @@ The third command:
 - installs **OpenMM** and **PDBFixer** (the only heavy chemistry dependencies)
 - installs FastMDXplora itself
 - runs `fastmdx info` as a smoke test to confirm everything works
+
+> Why the `python fastmdx …` prefix? The repo includes a tiny `fastmdx` shim at its root so the CLI can run before any `pip install` step. See [`docs/installation.md § Why python fastmdx`](docs/installation.md#why-python-fastmdx) for the full behavior and the canonical `python -m fastmdxplora.cli.main …` fallback.
 
 Then activate and run your first simulation:
 
@@ -84,13 +86,13 @@ The CLI is exposed by either install as a real platform-native `fastmdx` console
 After install:
 
 - **Analysis + reports** (no MD): all four pip deps (MDTraj, matplotlib, scikit-learn, python-pptx) are present out of the box. Run `fastmdx explore --system 1L2Y --include analyze report`.
-- **Setup + simulation** (full chemistry stack): OpenMM and PDBFixer are **not** installed by plain pip because PDBFixer wheels aren't reliable across all platforms. Run `python -m fastmdxplora.cli.main install` after the pip install to drop them into the `fastmdxplora` conda env (auto-installs Miniforge if needed, same flow as the git-clone path).
+- **Setup + simulation** (full chemistry stack): OpenMM and PDBFixer are **not** installed by plain pip because PDBFixer wheels aren't reliable across all platforms. Run `fastmdx install` after the pip install to drop them into the `fastmdxplora` conda env (auto-installs Miniforge if needed, same flow as the git-clone path).
 
 To upgrade a pip-only install to the full chemistry stack on any OS:
 
 ```bash
 pip install fastmdxplora                                      # 1
-python -m fastmdxplora.cli.main install                        # 2 — creates the conda env, auto-installs Miniforge if needed
+fastmdx install                                               # 2 — creates the conda env, auto-installs Miniforge if needed
 conda activate fastmdxplora                                   # 3
 fastmdx explore --system 1L2Y                                 # 4 — first full sim
 ```

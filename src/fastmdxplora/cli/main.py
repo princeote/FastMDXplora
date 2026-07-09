@@ -734,7 +734,7 @@ def _cmd_init_config(args: argparse.Namespace) -> int:
 
 
 def _cmd_bootstrap(args: argparse.Namespace, *, editable: bool = False, package_name: str = "fastmdxplora") -> int:
-    from fastmdxplora.bootstrap import bootstrap_environment, BootstrapError
+    from fastmdxplora.install import bootstrap_environment, BootstrapError
 
     repo_root = Path.cwd()
     repo_marker = (repo_root / "pyproject.toml").exists() and (repo_root / "src" / "fastmdxplora").exists()

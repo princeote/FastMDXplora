@@ -9,7 +9,7 @@ This page covers every supported starting point and gives troubleshooting tips. 
 ```bash
 git clone https://github.com/aai-research-lab/FastMDXplora.git   # 1
 cd FastMDXplora                                                  # 2
-python -m fastmdxplora.cli.main install                         # 3
+python fastmdx install                                           # 3
 ```
 
 The third command (`install`) does everything else:
@@ -21,6 +21,8 @@ The third command (`install`) does everything else:
 5. Installs **FastMDXplora** itself into that environment.
 6. Runs `fastmdx info` as a smoke test.
 
+> Why the `python fastmdx …` prefix? The repo includes a tiny `fastmdx` shim at its root that lets the CLI run before any `pip install` step — full details in [Why `python fastmdx`](#why-python-fastmdx) below.
+
 Then activate the environment and run a first simulation:
 
 ```bash
@@ -30,7 +32,7 @@ fastmdx explore --system 1L2Y
 
 `1L2Y` is a small trp-cage PDB that exercises every phase on a fast turnaround. Replace it with any 4-character PDB ID or with the path to a local `.pdb` / `.cif` file.
 
-> Need to install for development instead? Use `python -m fastmdxplora.cli.main install-e` — same flow but the local checkout is installed in editable mode.
+> Need to install for development instead? Use `python fastmdx install-e` — same flow but the local checkout is installed in editable mode.
 
 ## Prerequisites
 
@@ -52,9 +54,9 @@ Time: roughly 5–10 minutes for Miniforge + ~5–10 minutes for `mamba`-style e
 
 ### Scenario B — You already have conda or mamba installed
 
-Skip the auto-install. The same `python -m fastmdxplora.cli.main install` command detects your existing conda/mamba, skips the Miniforge download, and creates the `fastmdxplora` environment directly.
+Skip the auto-install. The same `python fastmdx install` command detects your existing conda/mamba, skips the Miniforge download, and creates the `fastmdxplora` environment directly.
 
-If you don't yet have conda/mamba, Miniforge is the easiest source (it's conda + mamba + conda-forge preconfigured). The bootstrap installs it for you, so you don't need to grab it manually.
+If you don't yet have conda/mamba, Miniforge is the easiest source (it's conda + mamba + conda-forge preconfigured). The `install` command installs it for you, so you don't need to grab it manually.
 
 ### Scenario C — You only need analysis + reporting, not MD
 
@@ -80,12 +82,12 @@ The `setup` and `simulation` phases need OpenMM + PDBFixer. If you run them and 
 
 ### Scenario E — Editable install (contributors hacking on FastMDXplora)
 
-This is for users who want to **modify FastMDXplora's source** — adding a new analysis, fixing a bug, or contributing back upstream. The flow mirrors Scenarios A and B (clone the repo, `cd` into it, run the bootstrap), but the bootstrap is `install-e` instead of `install`. The local checkout is then installed in **editable mode** (`pip install -e .`) so any change you make under `src/fastmdxplora/` shows up the next time you run `fastmdx`.
+This is for users who want to **modify FastMDXplora's source** — adding a new analysis, fixing a bug, or contributing back upstream. The flow mirrors Scenarios A and B (clone the repo, `cd` into it, run `install`), but use `install-e` instead of `install` for editable mode. The local checkout is then installed in **editable mode** (`pip install -e .`) so any change you make under `src/fastmdxplora/` shows up the next time you run `fastmdx`.
 
 ```bash
 git clone https://github.com/aai-research-lab/FastMDXplora.git   # 1
 cd FastMDXplora                                                  # 2
-python -m fastmdxplora.cli.main install-e                       # 3
+python fastmdx install-e                                          # 3
 ```
 
 What `install-e` does differently from `install`:
@@ -134,7 +136,7 @@ print("CUDA available" if "CUDA" in plats else "CPU-only: simulations will run o
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `git` not found | `git` is not installed (rare on modern Windows and macOS, but possible on stripped-down Linux installs) | Install Git from https://git-scm.com/downloads, then re-run the first command |
-| `python` isn't recognized | `python` is not on `PATH`, so the bootstrap can't even start | Install Miniforge manually from https://conda-forge.org/miniforge/ — it ships Python and conda together — then re-run the install command |
+| `python` isn't recognized | `python` is not on `PATH`, so the `install` command can't even start | Install Miniforge manually from https://conda-forge.org/miniforge/ — it ships Python and conda together — then re-run the install command |
 | `[FAILED] Python X.Y.Z is too new` from `python health.py` | Python ≥ 3.13 (the OpenMM / PDBFixer chemistry stack caps out at 3.12) | Use Python 3.10 or 3.11 — `install` defaults to 3.10, which is the smoothest supported version |
 | `conda` / `mamba` not on PATH after Miniforge install | New shell didn't pick it up | On Linux/macOS: `source ~/miniforge3/etc/profile.d/conda.sh`. On Windows: open a fresh `cmd` or PowerShell |
 | Simulation phase missing OpenMM | You used `pip install fastmdxplora` without installing the chemistry stack | `conda install -c conda-forge openmm pdbfixer` (recommended) or `pip install "fastmdxplora[md]"` (best-effort) |
@@ -145,17 +147,32 @@ print("CUDA available" if "CUDA" in plats else "CPU-only: simulations will run o
 
 | Command | What it does |
 |---|---|
-| `python -m fastmdxplora.cli.main health` | Runs the repository doctor (verifies repo layout, deps, imports, runs a smoke test). Add `--no-fix` for diagnose-only mode. |
-| `python -m fastmdxplora.cli.main info` | Prints FastMDXplora version + detected backends. |
+| `python fastmdx health` | Runs the repository doctor (verifies repo layout, deps, imports, runs a smoke test). Add `--no-fix` for diagnose-only mode. |
+| `python fastmdx info` | Prints FastMDXplora version + detected backends. |
 | `python fastmdx --version` | Version only. Available before `pip install` (uses the pure-Python shim in the repo root). |
 
 `health` from inside a fresh clone is what's caught the highest-friction install bugs historically, so run it if anything seems off.
 
+## Why `python fastmdx`?
+
+The third step in [Quick install](#quick-install-any-os) is `python fastmdx install`, not bare `fastmdx install`. The reason is order-of-operations:
+
+- When you first clone the repo, FastMDXplora is **not yet installed** on your system, so there's no `fastmdx` console script on `PATH` yet.
+- The repo ships a tiny Python file called **`fastmdx`** at its root. It has no shebang, so it runs identically on Linux, macOS, and Windows. Running it as `python fastmdx <subcommand>` invokes a one-shot script that puts `src/` on `sys.path`, sets `PYTHONPATH`, and forwards to the CLI module — i.e. `python -m fastmdxplora.cli.main <subcommand>`.
+- After you run `python fastmdx install` (or do `pip install fastmdxplora` first), a real `fastmdx` console script from `[project.scripts]` in `pyproject.toml` lands on `PATH`. From that point on, plain `fastmdx install` (and any other subcommand) works directly, with no `python fastmdx` prefix.
+So the right command for your situation is:
+
+| Your situation | Run this |
+|---|---|
+| Fresh clone, haven't run any install yet | `python fastmdx install` |
+| Already ran `install` once (or `pip install fastmdxplora`) | `fastmdx install` (plain) |
+| Want the canonical modulepath form (always works) | `python -m fastmdxplora.cli.main install` |
+
 ## Why Python 3.9–3.12 (and not 3.13)?
 
-The chemistry phases depend on **OpenMM** and **PDBFixer**, which are primarily distributed through **conda-forge**. Their current wheels target Python 3.9–3.12. The `health.py` doctor and the bootstrap both enforce this range from a single source of truth (`fastmdxplora.MIN_PYTHON = (3, 9)` and `MAX_PYTHON = (3, 13)`). Python 3.13 and newer are detected as out-of-range.
+The chemistry phases depend on **OpenMM** and **PDBFixer**, which are primarily distributed through **conda-forge**. Their current wheels target Python 3.9–3.12. The `health.py` doctor and the `install` command both enforce this range from a single source of truth (`fastmdxplora.MIN_PYTHON = (3, 9)` and `MAX_PYTHON = (3, 13)`). Python 3.13 and newer are detected as out-of-range.
 
-If your environment is too new, install Python 3.10 or 3.11 in a dedicated conda env and re-run the bootstrap. The `install` command already defaults to Python 3.10, which is the smoothest supported version.
+If your environment is too new, install Python 3.10 or 3.11 in a dedicated conda env, then re-run `install` (it already defaults to Python 3.10, the smoothest supported version).
 
 ## Where to go next
 

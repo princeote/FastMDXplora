@@ -49,6 +49,10 @@ _C = {
     "green":   "\x1b[38;5;76m",
     "yellow":  "\x1b[38;5;214m",
     "red":     "\x1b[38;5;196m",
+    "orange":  "\x1b[38;5;208m",
+    "purple":  "\x1b[38;5;99m",
+    "white":   "\x1b[38;5;255m",
+    "navy":    "\x1b[38;5;18m",
     "muted":   "\x1b[38;5;244m",
 }
 
@@ -150,52 +154,316 @@ class SessionPresenter:
     # Public API
     # ------------------------------------------------------------------
     def banner(self, **fields: str) -> None:
-        """Print the opening banner box.
+        import os as _os
+        import sys as _sys
+        import time as _time
 
-        Parameters
-        ----------
-        **fields
-            ``key=value`` pairs displayed inside the box. Common keys are
-            ``System``, ``Output``, ``Version``. Empty values are skipped.
-        """
         if self.quiet:
             return
-        self._session_start = time.monotonic()
 
-        title = "FastMDXplora"
-        rows = [(k, v) for k, v in fields.items() if v]
-        if not rows:
-            self._write(self._top_rule(title))
-            self._write(self._bottom_rule())
-            self._write("")
-            return
+        self._session_start = _time.monotonic()
 
-        label_w = max(len(k) for k, _ in rows)
-        # Inner content width is bounded by terminal width: 4 chars overhead
-        # for the box frame (│ <content> │).
-        max_inner_w = max(20, self.width - 4)
+        argv = list(_sys.argv[1:])
 
-        # Compute the wrapped lines first to determine the inner width.
-        body_lines: list[str] = []
-        for key, val in rows:
-            label = self._color_text(f"{key+':':<{label_w + 1}}", "dim")
-            full = f"{label} {val}"
-            # Truncate body line if it exceeds the terminal-derived inner width.
-            if _visual_width(full) > max_inner_w:
-                # Strip ANSI for truncation math, then re-truncate the visible part.
-                visible = _strip_ansi(full)
-                truncated = visible[: max_inner_w - 1] + "…"
-                full = truncated  # color is lost when we truncate, but readability wins
-            body_lines.append(full)
+        def arg_value(*names: str, default: str = "") -> str:
+            for i, token in enumerate(argv):
+                for name in names:
+                    if token == name and i + 1 < len(argv):
+                        return str(argv[i + 1])
+                    prefix = name + "="
+                    if token.startswith(prefix):
+                        return token[len(prefix):]
+            return default
 
-        inner_w = min(max(_visual_width(b) for b in body_lines), max_inner_w)
+        def arg_list(name: str, default: str = "") -> str:
+            values = []
+            i = 0
+            while i < len(argv):
+                if argv[i] == name:
+                    j = i + 1
+                    while j < len(argv) and not argv[j].startswith("--"):
+                        values.append(argv[j])
+                        j += 1
+                    break
+                i += 1
+            return ", ".join(values) if values else default
 
-        # Top rule, content, bottom rule
-        self._write(self._top_rule(title, inner_w))
-        for line in body_lines:
-            pad = inner_w - _visual_width(line)
-            self._write(f"{self._c('│', 'dim')} {line}{' ' * max(0, pad)} {self._c('│', 'dim')}")
-        self._write(self._bottom_rule(inner_w))
+        system = (
+            str(fields.get("System") or fields.get("system") or "")
+            or arg_value("-s", "-system", "--system", default="ANY_PDB_ID")
+        )
+        output = (
+            str(fields.get("Output") or fields.get("output") or "")
+            or arg_value("--output", default="output_folder")
+        )
+
+        version = str(fields.get("Version") or fields.get("version") or "")
+        if not version:
+            try:
+                from fastmdxplora import __version__ as _fmdx_version
+                version = str(_fmdx_version)
+            except Exception:
+                version = "unknown"
+
+        def field_value(*keys: str, default: object = "") -> str:
+            """Return a banner value from explicit fields, falling back to a default."""
+            for key in keys:
+                value = fields.get(key)
+                if value not in (None, ""):
+                    return str(value)
+            return str(default)
+
+        try:
+            from fastmdxplora.setup.pipeline import DEFAULTS as _SETUP_DEFAULTS
+        except Exception:
+            _SETUP_DEFAULTS = {}
+
+        try:
+            from fastmdxplora.simulation.pipeline import DEFAULTS as _SIM_DEFAULTS
+        except Exception:
+            _SIM_DEFAULTS = {}
+
+        platform = arg_value(
+            "--simulate-platform",
+            default=field_value("Platform", "platform", default=_SIM_DEFAULTS.get("platform", "auto")),
+        )
+        precision = arg_value(
+            "--simulate-precision",
+            default=field_value("Precision", "precision", default=_SIM_DEFAULTS.get("precision", "mixed")),
+        )
+
+        setup_ph = arg_value(
+            "--setup-ph",
+            default=field_value("pH", "ph", "setup_ph", default=_SETUP_DEFAULTS.get("ph", 7.0)),
+        )
+        ion_conc = arg_value(
+            "--setup-ion-concentration-M",
+            default=field_value(
+                "Ion Conc.",
+                "ion_concentration_M",
+                "setup_ion_concentration_M",
+                default=_SETUP_DEFAULTS.get("ion_concentration_M", 0.15),
+            ),
+        )
+        forcefield = arg_value(
+            "--setup-forcefield",
+            default=field_value("Force Field", "forcefield", "setup_forcefield", default=_SETUP_DEFAULTS.get("forcefield", "charmm36")),
+        )
+
+        timestep = arg_value(
+            "--simulate-timestep-fs",
+            default=field_value("Timestep", "timestep_fs", "simulate_timestep_fs", default=_SIM_DEFAULTS.get("timestep_fs", 2.0)),
+        )
+        temperature = arg_value(
+            "--simulate-temperature-K",
+            default=field_value("Temperature", "temperature_K", "simulate_temperature_K", default=_SIM_DEFAULTS.get("temperature_K", 300.0)),
+        )
+        friction = arg_value(
+            "--simulate-friction-per-ps",
+            default=field_value("Friction", "friction_per_ps", "simulate_friction_per_ps", default=_SIM_DEFAULTS.get("friction_per_ps", 1.0)),
+        )
+
+        def maybe_int(value: str) -> int | None:
+            if value == "":
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        def maybe_float(value: str) -> float | None:
+            if value == "":
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def format_steps(value: int | None) -> str:
+            if value is None:
+                return "default"
+            return f"{int(value):,}"
+
+        def resolve_stage_display() -> tuple[int | None, int | None, int | None, int | None]:
+            """Resolve displayed stage steps from the same defaults as simulation."""
+            try:
+                from fastmdxplora.simulation.pipeline import DEFAULTS as _SIM_DEFAULTS
+                from fastmdxplora.simulation.pipeline import PRESETS as _SIM_PRESETS
+                from fastmdxplora.simulation.runner import plan_stages as _plan_stages
+            except Exception:
+                nvt = maybe_int(arg_value("--simulate-nvt-steps", default=""))
+                npt = maybe_int(arg_value("--simulate-npt-steps", default=""))
+                prod = maybe_int(arg_value("--simulate-production-steps", default=""))
+                total = None if None in (nvt, npt, prod) else int(nvt) + int(npt) + int(prod)
+                return nvt, npt, prod, total
+
+            params = dict(_SIM_DEFAULTS)
+            preset = arg_value("--simulate-preset", default="")
+            if preset:
+                params.update(_SIM_PRESETS.get(preset.lower(), {}))
+                params["preset"] = preset.lower()
+
+            overrides = {
+                "nvt_steps": maybe_int(arg_value("--simulate-nvt-steps", default="")),
+                "npt_steps": maybe_int(arg_value("--simulate-npt-steps", default="")),
+                "production_steps": maybe_int(arg_value("--simulate-production-steps", default="")),
+                "duration_ns": maybe_float(arg_value("--simulate-duration-ns", default="")),
+                "nvt_duration_ns": maybe_float(arg_value("--simulate-nvt-duration-ns", default="")),
+                "npt_duration_ns": maybe_float(arg_value("--simulate-npt-duration-ns", default="")),
+                "timestep_fs": maybe_float(timestep),
+            }
+            params.update({k: v for k, v in overrides.items() if v is not None})
+            plan = _plan_stages(
+                duration_ns=params.get("duration_ns"),
+                timestep_fs=float(params.get("timestep_fs", 2.0)),
+                nvt_steps=params.get("nvt_steps"),
+                npt_steps=params.get("npt_steps"),
+                production_steps=params.get("production_steps"),
+                nvt_duration_ns=params.get("nvt_duration_ns"),
+                npt_duration_ns=params.get("npt_duration_ns"),
+            )
+            nvt = int(plan["nvt_steps"])
+            npt = int(plan["npt_steps"])
+            prod = int(plan["production_steps"])
+            return nvt, npt, prod, nvt + npt + prod
+
+        nvt_steps, npt_steps, prod_steps, total_steps = resolve_stage_display()
+
+        def resolve_trajectory_display() -> str:
+            raw = arg_value("--simulate-trajectory-interval-steps", default="")
+            explicit = maybe_int(raw)
+            if explicit is not None:
+                return f"save frame every {explicit:,} production steps"
+            try:
+                from fastmdxplora.simulation.runner import trajectory_interval_for as _trajectory_interval_for
+                interval = _trajectory_interval_for(int(prod_steps or 0))
+                return f"save frame every {interval:,} production steps"
+            except Exception:
+                return "adaptive frame saving during production"
+
+        trajectory_display = resolve_trajectory_display()
+
+        report_title = arg_value("--report-title", default="FastMDXplora Run")
+        dashboard_link = _os.environ.get("FASTMDX_DASHBOARD_URL", "")
+        started = _time.strftime("%Y-%m-%d %H:%M:%S")
+
+        H = chr(0x2500)
+        V = chr(0x2502)
+        TL = chr(0x256D)
+        TR = chr(0x256E)
+        BL = chr(0x2570)
+        BR = chr(0x256F)
+        CHECK = chr(0x2713)
+
+        box_width = min(max(40, self.width - 2), 112)
+        content_w = box_width - 4
+
+        ascii_logo = [
+            r" ______        _   __  __ _______   __      _                 ",
+            r"|  ____|      | | |  \/  |  __ \ \ / /     | |                ",
+            r"| |__ __ _ ___| |_| \  / | |  | \ V / _ __ | | ___  _ __ __ _ ",
+            r"|  __/ _` / __| __| |\/| | |  | |> < | '_ \| |/ _ \| '__/ _` |",
+            r"| | | (_| \__ \ |_| |  | | |__| / . \| |_) | | (_) | | | (_| |",
+            r"|_|  \__,_|___/\__|_|  |_|_____/_/ \_\ .__/|_|\___/|_|  \__,_|",
+            r"                                     | |                      ",
+            r"                                     |_|                      ",
+        ]
+
+        def fit(text: str) -> str:
+            text = str(text)
+            if len(text) <= content_w:
+                return text
+            return text[: max(0, content_w - 3)] + "..."
+
+        def top(color: str) -> None:
+            self._write(self._c(TL + H * (box_width - 2) + TR, color))
+
+        def bottom(color: str) -> None:
+            self._write(self._c(BL + H * (box_width - 2) + BR, color))
+
+        def line(text: str = "", border: str = "cyan", text_color: str | None = None) -> None:
+            raw = fit(text)
+            pad = " " * max(0, content_w - len(raw))
+            body = self._c(raw, text_color) if text_color else raw
+            self._write(self._c(V, border) + " " + body + pad + " " + self._c(V, border))
+
+        def title(text: str, border: str) -> None:
+            line(text, border, "white")
+            line(H * len(text), border, border)
+
+        def kv(label: str, value: str, border: str, value_color: str = "white") -> None:
+            line(f"{label:<16} {value}", border, value_color)
+
+        self._write("")
+
+        for logo_line in ascii_logo:
+            self._write(self._c(logo_line, "purple"))
+
+        self._write(self._c("Fully Automated SysTem for Molecular Dynamics eXploration", "cyan"))
+        self._write("")
+
+        top("green")
+        title("CURRENT RUN", "green")
+        kv("System", system, "green")
+        kv("Output", output, "green")
+        kv("Version", version, "green")
+        kv("Started", started, "green")
+        kv("Platform", f"{platform} ({precision} precision)", "green")
+        bottom("green")
+        self._write("")
+
+        top("cyan")
+        title("SETUP", "cyan")
+        kv("pH", setup_ph, "cyan")
+        kv("Ion Conc.", f"{ion_conc} M", "cyan")
+        kv("Force Field", forcefield, "cyan")
+        bottom("cyan")
+        self._write("")
+
+        top("orange")
+        title("SIMULATION", "orange")
+        kv("NVT", f"{format_steps(nvt_steps)} steps", "orange")
+        kv("NPT", f"{format_steps(npt_steps)} steps", "orange")
+        kv("Production", f"{format_steps(prod_steps)} steps", "orange")
+        kv("Total Planned", f"{format_steps(total_steps)} steps", "orange")
+        kv("Timestep", f"{timestep} fs", "orange")
+        kv("Temperature", f"{temperature} K", "orange")
+        kv("Friction", f"{friction} / ps", "orange")
+        kv("DCD Frames", trajectory_display, "orange")
+        bottom("orange")
+        self._write("")
+
+        top("purple")
+        title("ANALYSIS & REPORT", "purple")
+        kv("Dashboard", dashboard_link if dashboard_link else " ", "purple")
+        kv("Report", report_title, "purple")
+        bottom("purple")
+        self._write("")
+
+        top("blue")
+        title("REPORTING & OUTPUTS", "blue")
+        line(f"{CHECK} Markdown report      {CHECK} HTML summary        {CHECK} PDF figures", "blue", "white")
+        line(f"{CHECK} PowerPoint slides    {CHECK} PNG/SVG plots       {CHECK} ZIP result bundle", "blue", "white")
+        bottom("blue")
+        self._write("")
+
+        badges = [
+            "Reproducible",
+            "Config-driven",
+            "OpenMM CPU/GPU",
+            "Energy-aware",
+            "Publication-ready",
+        ]
+
+        def badge_line(items: list[str]) -> str:
+            return "  ".join(self._c(CHECK, "green") + f" {item}" for item in items)
+
+        all_badges = badge_line(badges)
+        if _visual_width(all_badges) <= self.width + 20:
+            self._write(all_badges)
+        else:
+            self._write(badge_line(badges[:3]))
+            self._write(badge_line(badges[3:]))
         self._write("")
 
     def phase_start(self, name: str) -> None:

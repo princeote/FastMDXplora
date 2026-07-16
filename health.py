@@ -14,15 +14,19 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import os
 import platform
 import re
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import textwrap
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -80,16 +84,47 @@ OPTIONAL_SIMULATION_BACKENDS = [
     ("OpenMM", "openmm", "conda install -c conda-forge openmm"),
 ]
 
-MINIFORGE_BASE_URL = "https://github.com/conda-forge/miniforge/releases/latest/download"
+# Pinned Miniforge release with embedded SHA-256s so the doctor can verify
+# what it just downloaded instead of trusting TLS alone. Bump in lockstep
+# with the equivalent constants in ``src/fastmdxplora/install.py`` -- the
+# duplication is deliberate because this doctor script may run before the
+# fastmdxplora package is on the import path.
+MINIFORGE_VERSION = "26.3.2-3"
+MINIFORGE_BASE_URL = (
+    f"https://github.com/conda-forge/miniforge/releases/download/{MINIFORGE_VERSION}"
+)
 MINIFORGE_PREFIX = Path.home() / "miniforge3"
-MINIFORGE_INSTALLERS = {
+MINIFORGE_INSTALLERS: dict[tuple[str, str], str | None] = {
     ("Linux", "x86_64"): "Miniforge3-Linux-x86_64.sh",
     ("Linux", "aarch64"): "Miniforge3-Linux-aarch64.sh",
     ("Darwin", "x86_64"): "Miniforge3-MacOSX-x86_64.sh",
     ("Darwin", "arm64"): "Miniforge3-MacOSX-arm64.sh",
     ("Windows", "x86_64"): "Miniforge3-Windows-x86_64.exe",
-    ("Windows", "aarch64"): "Miniforge3-Windows-aarch64.exe",
+    ("Windows", "aarch64"): None,  # upstream does not publish this asset
 }
+MINIFORGE_SHA256: dict[str, str] = {
+    "Miniforge3-Linux-x86_64.sh": (
+        "848194851a98903134187fbb4ab50efe87b003e0c0f808f97644b7524a62bf2c"
+    ),
+    "Miniforge3-Linux-aarch64.sh": (
+        "2c113a69297e612b01ca0f320c22a3107a11f2ab9b573d79ac868a175945ce29"
+    ),
+    "Miniforge3-MacOSX-x86_64.sh": (
+        "39273e4c89a0a1af4538010615d44ae8f44e1af41007e02def593d20f316b003"
+    ),
+    "Miniforge3-MacOSX-arm64.sh": (
+        "59168f1e24d0a4ad9932021170809fca836cd240e183eeeb331d5bcfc0098168"
+    ),
+    "Miniforge3-Windows-x86_64.exe": (
+        "14a8635465b5190537ddad6286746ffebbc55a1ed2a7bb14a506595fe3191e1e"
+    ),
+}
+MINIFORGE_USER_AGENT = "fastmdxplora-bootstrap/1.0"
+_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+# Generous: a 100 MB Miniforge installer on a 1 Mbps link takes ~800 s.
+# The SHA-256 + private-tmp pattern already cover the stored-bad-bytes
+# case, so we don't lose safety by waiting longer here.
+_DOWNLOAD_TIMEOUT_SECONDS = 600
 
 
 class Status:
@@ -98,6 +133,7 @@ class Status:
     FIXING = "FIXING"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
+    WARN = "WARN"
 
 
 def fmt(message: str, status: str = Status.OK) -> str:
@@ -144,7 +180,20 @@ def _miniforge_installer_name() -> str | None:
 def _miniforge_installer_path() -> Path:
     installer_name = _miniforge_installer_name()
     if installer_name is None:
-        raise RuntimeError(f"No Miniforge installer available for this platform: {platform.system()} {platform.machine()}")
+        sysname = platform.system()
+        machine = platform.machine()
+        if sysname == "Windows" and machine.lower() in ("aarch64", "arm64"):
+            raise RuntimeError(
+                "conda-forge/miniforge does not publish a Windows-aarch64 "
+                f"(Windows-on-ARM) installer for {MINIFORGE_VERSION}. "
+                "Install Miniforge manually from "
+                "https://conda-forge.org/miniforge/ or use Windows "
+                "Subsystem for Linux."
+            )
+        raise RuntimeError(
+            f"No Miniforge installer available for this platform: "
+            f"{sysname} {machine}"
+        )
     return Path(tempfile.gettempdir()) / installer_name
 
 
@@ -167,18 +216,301 @@ def _conda_executable_from_prefix(prefix: Path, tool_name: str) -> Path | None:
     return path if path.exists() else None
 
 
-def _download_miniforge_installer(installer_path: Path) -> bool:
-    url = f"{MINIFORGE_BASE_URL}/{installer_path.name}"
+def _sha256_of_file(
+    path: Path,
+    *,
+    chunk_bytes: int = _DOWNLOAD_CHUNK_BYTES,
+) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(chunk_bytes)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _try_upgrade_certifi() -> bool:
+    """Best-effort: try to upgrade ``certifi`` via pip --user."""
     try:
-        print(fmt(f"Downloading Miniforge installer: {url}", Status.FIXING))
-        urllib.request.urlretrieve(url, installer_path)
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--user", "--upgrade",
+             "certifi"],
+            stdout=sys.stderr,
+            stderr=sys.stderr,
+            text=True,
+            check=False,
+            timeout=180,
+        )
+        return proc.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _build_certifi_ssl_context() -> ssl.SSLContext | None:
+    """Return an ``SSLContext`` pointing at certifi's CA bundle, if
+    importable. ``urllib`` does not consult certifi automatically --
+    this is the explicit hook (also used by ``requests``) that makes a
+    fresh certifi actually take effect on the next ``urlopen``. Returns
+    ``None`` if certifi is not importable.
+    """
+    try:
+        import certifi  # type: ignore[import-not-found]
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return None
+
+
+def _stream_url_to_path(
+    request: urllib.request.Request,
+    tmp_path: Path,
+    *,
+    ssl_context: ssl.SSLContext | None = None,
+) -> None:
+    """Stream ``request`` to ``tmp_path`` with optional SSLContext."""
+    kwargs: dict[str, object] = {"timeout": _DOWNLOAD_TIMEOUT_SECONDS}
+    if ssl_context is not None:
+        kwargs["context"] = ssl_context
+    with urllib.request.urlopen(request, **kwargs) as response, \
+            tmp_path.open("wb") as out:
+        shutil.copyfileobj(response, out, length=_DOWNLOAD_CHUNK_BYTES)
+
+
+def _insecure_ssl_optin_enabled() -> bool:
+    """``True`` iff the user has explicitly opted in to insecure SSL."""
+    return os.environ.get("FASTMDX_INSECURE_SSL", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _classify_http_error(
+    http_exc: urllib.error.HTTPError, url: str,
+) -> RuntimeError:
+    """Categorised RuntimeError for a non-2xx HTTP response.
+
+    Mirror of ``fastmdxplora.install._classify_http_error`` for the
+    doctor's bool-returning wrapper. Returns a single source-of-truth
+    RuntimeError so both the outer first-attempt handler and the
+    certifi-based recovery retries surface the same user-facing
+    message.
+    """
+    if http_exc.code == 404:
+        return RuntimeError(
+            f"Miniforge installer not found on GitHub for version "
+            f"{MINIFORGE_VERSION}: {url}. Upstream may not publish "
+            f"an installer for this platform, or the pinned version "
+            f"has been retired. Install Miniforge manually from "
+            f"https://conda-forge.org/miniforge/."
+        )
+    return RuntimeError(
+        f"HTTP {http_exc.code} downloading Miniforge from {url}: "
+        f"{http_exc.reason}"
+    )
+
+
+def _should_block_insecure_ssl(installer_name: str) -> bool:
+    """Mirror of ``fastmdxplora.install._should_block_insecure_ssl``."""
+    return (
+        MINIFORGE_SHA256.get(installer_name) is None
+        and _insecure_ssl_optin_enabled()
+    )
+
+
+def _download_to_temp_file(url: str, dest: Path) -> Path:
+    """Stream ``url`` into a *private* temp dir; mirror of
+    ``fastmdxplora.install._download_to_temp_file``.
+
+    Kept in sync deliberately: this doctor script may run before
+    ``fastmdxplora`` is on the import path. The temp dir is created via
+    ``tempfile.mkdtemp`` then chmod'd to ``0o700`` (POSIX) to defeat
+    symlink swaps by a local attacker on a shared host. **Windows
+    caveat:** ``mkdtemp`` does not honour ``mode`` there -- the
+    directory inherits user-profile ACLs. The mitigation is
+    best-effort on Windows but still removes the predictable-name
+    symlink-swap vector on the POSIX path. ``BaseException`` cleanup
+    ensures the private temp dir is removed on ``KeyboardInterrupt``
+    too.
+    """
+    request = urllib.request.Request(
+        url, headers={"User-Agent": MINIFORGE_USER_AGENT}
+    )
+    tmp_dir = Path(tempfile.mkdtemp(prefix="fastmdx-download-"))
+    # Belt-and-braces chmod (POSIX only; mkdtemp's mode interacts with
+    # the umask). No-op / skip on Windows.
+    try:
+        os.chmod(tmp_dir, 0o700)
+    except (OSError, NotImplementedError):
+        pass
+    tmp_path = tmp_dir / dest.name
+    try:
+        try:
+            with urllib.request.urlopen(
+                request, timeout=_DOWNLOAD_TIMEOUT_SECONDS
+            ) as response, tmp_path.open("wb") as out:
+                shutil.copyfileobj(response, out, length=_DOWNLOAD_CHUNK_BYTES)
+        except urllib.error.HTTPError as exc:
+            raise _classify_http_error(exc, url) from exc
+        except urllib.error.URLError as primary_exc:
+            reason = getattr(primary_exc, "reason", None) or primary_exc
+            is_ssl = (
+                "CERTIFICATE_VERIFY_FAILED" in str(reason)
+                or isinstance(reason, ssl.SSLError)
+            )
+            if not is_ssl:
+                # DNS / refused / timeout -- don't waste 3 minutes on
+                # a certifi auto-upgrade when the real problem is
+                # connectivity.
+                raise RuntimeError(
+                    f"Network error downloading Miniforge from {url}: {reason}"
+                ) from primary_exc
+            # Self-heal: try the existing certifi bundle first (covers
+            # pure "certifi missing"), THEN upgrade certifi and retry
+            # against the freshest bundle (covers "certifi present but
+            # stale" -- the dominant real-world case).
+            print(fmt(
+                "TLS verification failed; attempting automatic recovery "
+                "via `python -m pip install --user --upgrade certifi` "
+                "and retrying with its CA bundle...",
+                Status.FIXING,
+            ))
+            try:
+                _stream_url_to_path(
+                    request, tmp_path,
+                    ssl_context=_build_certifi_ssl_context(),
+                )
+                return tmp_path
+            except urllib.error.HTTPError as http_exc:
+                raise _classify_http_error(http_exc, url) from http_exc
+            except urllib.error.URLError as stale_exc:
+                primary_exc = stale_exc
+            if _try_upgrade_certifi():
+                upgraded_ctx = _build_certifi_ssl_context()
+                if upgraded_ctx is not None:
+                    try:
+                        _stream_url_to_path(
+                            request, tmp_path,
+                            ssl_context=upgraded_ctx,
+                        )
+                        return tmp_path
+                    except urllib.error.HTTPError as http_exc:
+                        raise _classify_http_error(http_exc, url) from http_exc
+                    except urllib.error.URLError as retry_exc:
+                        primary_exc = retry_exc
+                else:
+                    print(fmt(
+                        "certifi upgrade reported success but the "
+                        "certifi module is still unimportable.",
+                        Status.WARN,
+                    ))
+            else:
+                print(fmt(
+                    "certifi upgrade did not succeed; falling back to "
+                    "fail-closed path.",
+                    Status.WARN,
+                ))
+            # Last-resort: opt-in insecure SSL via env var.
+            if _insecure_ssl_optin_enabled():
+                print(fmt(
+                    "*** SECURITY WARNING *** "
+                    "FASTMDX_INSECURE_SSL is set; TLS verification is "
+                    "BEING DISABLED. The download is STILL SHA-256 "
+                    "verified against a hardcoded value in the source "
+                    "tree; downloads are observable on the wire "
+                    "(privacy, not integrity). ONLY use this on "
+                    "networks you trust completely.",
+                    Status.WARN,
+                ))
+                insecure_ctx = ssl.create_default_context()
+                insecure_ctx.check_hostname = False
+                insecure_ctx.verify_mode = ssl.CERT_NONE
+                _stream_url_to_path(
+                    request, tmp_path, ssl_context=insecure_ctx,
+                )
+                return tmp_path
+            # Fail closed. The outer ``_download_miniforge_installer``
+            # wraps this into ``[FAILED] Failed to download Miniforge: ...``.
+            raise RuntimeError(
+                "TLS certificate verification failed downloading Miniforge "
+                f"({url}). Automatic recovery via `python -m pip install "
+                "--user --upgrade certifi` did not resolve the issue. "
+                "Run that command manually and retry, or download the "
+                "file manually. Set FASTMDX_INSECURE_SSL=1 (with SHA hash "
+                "still recorded) as an opt-in escape hatch."
+            ) from primary_exc
+        except OSError as exc:
+            raise RuntimeError(
+                f"Filesystem error downloading Miniforge: {exc}"
+            ) from exc
+        return tmp_path
+    except BaseException:
+        # BaseException so Ctrl+C / SystemExit also clean up.
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+
+def _download_miniforge_installer(installer_path: Path) -> bool:
+    """Download (and SHA-256 verify) the Miniforge installer for this host.
+
+    Returns ``True`` on success, ``False`` on any failure (with a
+    categorised failure message via the existing ``Status``/``fmt``
+    helpers).
+    """
+    # Gate opt-in insecure-SSL on having anything to verify the bytes
+    # against. The boolean lives in ``_should_block_insecure_ssl`` so
+    # tests can assert on the same source of truth.
+    if _should_block_insecure_ssl(installer_path.name):
+        print(fmt(
+            f"FASTMDX_INSECURE_SSL=1 cannot be used for "
+            f"{installer_path.name}: no SHA-256 hash is recorded in "
+            f"MINIFORGE_SHA256, so the SHA check would not run. SHA "
+            f"verification is the only integrity guarantee when TLS "
+            f"verification is disabled.",
+            Status.FAILED,
+        ))
+        return False
+    url = f"{MINIFORGE_BASE_URL}/{installer_path.name}"
+    expected_sha256 = MINIFORGE_SHA256.get(installer_path.name)
+    print(fmt(f"Downloading Miniforge installer: {url}", Status.FIXING))
+    try:
+        tmp_path = _download_to_temp_file(url, installer_path)
+        try:
+            if expected_sha256 is None:
+                print(fmt(
+                    f"No SHA-256 recorded for {installer_path.name}; "
+                    f"skipping integrity check",
+                    Status.SKIPPED,
+                ))
+            else:
+                # Verify BEFORE the atomic rename so a tampered file can
+                # never be observed at the canonical installer_path.
+                print(fmt("Verifying Miniforge installer checksum...", Status.FIXING))
+                actual = _sha256_of_file(tmp_path)
+                if actual.lower() != expected_sha256.lower():
+                    print(fmt(
+                        f"SHA-256 mismatch for {installer_path.name}: "
+                        f"expected {expected_sha256[:16]}..., "
+                        f"got {actual[:16]}...",
+                        Status.FAILED,
+                    ))
+                    print(help_note(
+                        "This can indicate a corrupted download, a CDN "
+                        "issue, or tampering. Re-run the doctor; if it "
+                        "persists, download the file manually from a "
+                        "known mirror."
+                    ))
+                    return False
+                print(fmt("Checksum verified.", Status.OK))
+            tmp_path.replace(installer_path)
+        finally:
+            shutil.rmtree(tmp_path.parent, ignore_errors=True)
         if platform.system() != "Windows":
             try:
                 installer_path.chmod(0o755)
             except OSError:
                 pass
         return True
-    except Exception as exc:
+    except RuntimeError as exc:
         print(fmt(f"Failed to download Miniforge: {exc}", Status.FAILED))
         return False
 
@@ -190,7 +522,7 @@ def _install_miniforge() -> bool:
             return False
     install_prefix = MINIFORGE_PREFIX
     install_prefix.mkdir(parents=True, exist_ok=True)
-    
+
     system = platform.system()
     if system == "Windows":
         command = [str(installer_path), "/InstallationType=JustMe", "/RegisterPython=0", "/S", f"/D={install_prefix}"]
@@ -198,7 +530,7 @@ def _install_miniforge() -> bool:
         command = ["/bin/bash", str(installer_path), "-b", "-p", str(install_prefix)]
     else:  # Linux and others
         command = ["/bin/bash", str(installer_path), "-b", "-p", str(install_prefix)]
-    
+
     print(fmt(f"Installing Miniforge to {install_prefix}", Status.FIXING))
     result = run_command(command)
     if result.returncode != 0:
@@ -355,7 +687,7 @@ def check_python_version() -> bool:
         return False
     if current >= _MAX_PYTHON:
         print(fmt(f"Python {platform.python_version()} is too new; FastMDXplora supports {_PYTHON_RANGE_STR()} (the OpenMM/PDBFixer chemistry stack caps out at 3.12)", Status.FAILED))
-        print(help_note(f"Install {_PYTHON_RANGE_STR()} (3.10 or 3.11 recommended) into a dedicated environment with conda/Miniforge, then rerun this script."))
+        print(help_note(f"Install {_PYTHON_RANGE_STR()} (3.10 or 3.11 recommended) into a dedicated environment with conda/Miniforge, then re-run this script."))
         return False
     print(fmt(f"Python {platform.python_version()} is present", Status.OK))
     return True

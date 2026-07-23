@@ -344,7 +344,34 @@ class SessionPresenter:
         trajectory_display = resolve_trajectory_display()
 
         report_title = arg_value("--report-title", default="FastMDXplora Run")
-        dashboard_link = _os.environ.get("FASTMDX_DASHBOARD_URL", "")
+        # Resolve the dashboard URL from an explicitly supplied field,
+        # an environment variable, or the dashboard CLI flags.
+        dashboard_link = str(
+            fields.get("Dashboard")
+            or fields.get("dashboard_url")
+            or _os.environ.get("FASTMDX_DASHBOARD_URL", "")
+        )
+
+        dashboard_enabled = "--dashboard" in argv
+
+        if not dashboard_link and dashboard_enabled:
+            dashboard_host = arg_value(
+                "--dashboard-host",
+                default="127.0.0.1",
+            )
+            dashboard_port = arg_value(
+                "--dashboard-port",
+                default="8765",
+            )
+
+            # 0.0.0.0 and :: are server bind addresses, not useful browser URLs.
+            display_host = (
+                "127.0.0.1"
+                if dashboard_host in {"0.0.0.0", "::", "[::]"}
+                else dashboard_host
+            )
+
+            dashboard_link = f"http://{display_host}:{dashboard_port}"
         started = _time.strftime("%Y-%m-%d %H:%M:%S")
 
         H = chr(0x2500)

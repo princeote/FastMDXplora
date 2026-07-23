@@ -1180,6 +1180,35 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def _startup_dashboard_details(argv: Sequence[str]) -> tuple[str, bool]:
+    """Resolve the dashboard address shown by the startup wordmark."""
+    host = "127.0.0.1"
+    port = "8765"
+    enabled = (
+        "--dashboard" in argv
+        or "--live-dashboard" in argv
+        or ("dashboard" in argv and "serve" in argv)
+        or os.getenv("FASTMDX_DASHBOARD_ACTIVE") == "1"
+    )
+
+    for index, token in enumerate(argv):
+        if token in {"--dashboard-host", "--host"} and index + 1 < len(argv):
+            host = str(argv[index + 1])
+        elif token.startswith("--dashboard-host=") or token.startswith("--host="):
+            host = token.split("=", 1)[1]
+
+        if token in {"--dashboard-port", "--port"} and index + 1 < len(argv):
+            port = str(argv[index + 1])
+        elif token.startswith("--dashboard-port=") or token.startswith("--port="):
+            port = token.split("=", 1)[1]
+
+    if host in {"0.0.0.0", "::", "[::]"}:
+        host = "127.0.0.1"
+
+    url = os.getenv("FASTMDX_DASHBOARD_URL") or f"http://{host}:{port}"
+    return url, enabled
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     # Ensure the CLI can emit its Unicode output (box-drawing banner, "→",
     # "—") regardless of the platform's locale. On machines whose default
@@ -1199,8 +1228,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     setup_console()
 
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+
+    # Show the FastMDXplora identity as soon as the CLI starts. Keep version
+    # and citation output machine-friendly; help and an empty invocation are
+    # intentionally branded.
+    if not any(flag in raw_argv for flag in ("--version", "-V", "--cite")):
+        from fastmdxplora.utils.presenter import get_presenter
+
+        dashboard_url, dashboard_enabled = _startup_dashboard_details(raw_argv)
+        get_presenter().welcome(
+            dashboard_url=dashboard_url,
+            dashboard_enabled=dashboard_enabled,
+        )
+
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
 
     # Short-circuit cheap flags first so a missing chemistry backend never
     # *blocks* `--cite`, `--version`, or `--help`. These flags are how
@@ -1210,7 +1253,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(__citation__)
         return 0
     if args.command is None:
-        parser.print_help()
+        # An empty invocation is the minimal dashboard-first startup screen.
+        # Full usage, commands, and examples remain available with --help.
         return 0
 
     # Self-heal before dispatch: if this command needs the chemistry stack

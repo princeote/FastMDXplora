@@ -89,6 +89,7 @@ Changelog = "https://github.com/aai-research-lab/FastMDXplora/blob/main/CHANGELO
 
 [project.scripts]
 fastmdx = "fastmdxplora.cli.main:main"
+fastmdxplora = "fastmdxplora.cli.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

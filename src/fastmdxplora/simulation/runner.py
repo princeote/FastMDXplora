@@ -1107,6 +1107,36 @@ def _append_live_metric(
         current_frame_count=frame_count,
         simulation_time_completed_ns=sim_time_ns,
     )
+    _maybe_write_live_frame(omm, simulation, telemetry, step)
+
+
+def _maybe_write_live_frame(
+    omm: dict,
+    simulation: Any,
+    telemetry: Any,
+    step: int,
+) -> None:
+    """Snapshot the current positions to ``simulation/live_frame.pdb``.
+
+    Best-effort. Called from the telemetry loop so the dashboard's
+    molecular viewer can refresh without disturbing the simulation.
+    All exceptions are swallowed: live frames are a UI affordance and
+    must never terminate the run.
+    """
+    try:
+        from fastmdxplora.live.live_frames import write_openmm_live_frame
+        positions_state = simulation.context.getState(
+            getPositions=True, enforcePeriodicBox=True
+        )
+        write_openmm_live_frame(
+            telemetry.root,
+            pdb_writer=omm["PDBFile"].writeFile,
+            topology=simulation.topology,
+            positions=positions_state.getPositions(),
+            frame_index=step,
+        )
+    except Exception as exc:  # noqa: BLE001 - dashboard failures must not crash sim
+        logger.debug("live frame snapshot skipped: %s", exc)
 
 
 def _quantity_to_float(quantity: Any, unit_value: Any) -> float | None:

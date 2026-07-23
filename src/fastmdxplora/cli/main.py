@@ -345,6 +345,52 @@ def _common_input_args(p: argparse.ArgumentParser) -> None:
         default=False,
         help="Stop the dashboard automatically when the command completes.",
     )
+    dash.add_argument(
+        "--dashboard-refresh-seconds",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Browser-side telemetry polling interval in seconds (default 3).",
+    )
+    dash.add_argument(
+        "--dashboard-frame-interval",
+        type=int,
+        default=None,
+        metavar="STEPS",
+        help="Override simulation telemetry interval used by the live dashboard. "
+             "Honored when the workflow is creating a telemetry writer; existing "
+             "runs keep their stored value.",
+    )
+    dash.add_argument(
+        "--dashboard-ligand-resname",
+        type=str,
+        default=None,
+        metavar="RESNAME",
+        help="Force a ligand residue name for the dashboard ligand tools pane. "
+             "Auto-detection is used when omitted.",
+    )
+    dash.add_argument(
+        "--dashboard-binding-pocket-cutoff-A",
+        type=float,
+        default=None,
+        metavar="ANGSTROM",
+        help="Default binding-pocket cutoff for the molecular viewer (default 5.0).",
+    )
+    dash.add_argument(
+        "--dashboard-max-playback-frames",
+        type=int,
+        default=None,
+        metavar="FRAMES",
+        help="Maximum number of frames the molecular viewer will load for "
+             "trajectory playback (default 200).",
+    )
+    dash.add_argument(
+        "--dashboard-open-browser",
+        action="store_true",
+        default=False,
+        help="Attempt to open the dashboard URL in the local browser. "
+             "Disabled by default for headless / no-display environments.",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -506,6 +552,47 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=8765,
         help="Port to serve on (default: 8765).",
+    )
+    serve.add_argument(
+        "--refresh-seconds",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Browser polling interval hint surfaced to the dashboard.",
+    )
+    serve.add_argument(
+        "--ligand-resname",
+        type=str,
+        default=None,
+        metavar="RESNAME",
+        help="Force a ligand residue name for the dashboard ligand tools.",
+    )
+    serve.add_argument(
+        "--binding-pocket-cutoff-A",
+        type=float,
+        default=None,
+        metavar="ANGSTROM",
+        help="Binding-pocket cutoff in angstrom (default 5.0).",
+    )
+    serve.add_argument(
+        "--frame-interval",
+        type=int,
+        default=None,
+        metavar="STEPS",
+        help="Simulation telemetry interval used by the live dashboard.",
+    )
+    serve.add_argument(
+        "--max-playback-frames",
+        type=int,
+        default=None,
+        metavar="FRAMES",
+        help="Maximum frames the molecular viewer will load for playback.",
+    )
+    serve.add_argument(
+        "--open-browser",
+        action="store_true",
+        default=False,
+        help="Open the dashboard URL in the user's default browser.",
     )
 
     # init-config: write a commented YAML template
@@ -729,12 +816,25 @@ def _resolve_dashboard_output_dir(args: argparse.Namespace, config: dict[str, An
 
 
 def _start_dashboard_for_command(args: argparse.Namespace, output_dir: Path):
-    from fastmdxplora.live.server import start_dashboard_session
+    from fastmdxplora.live.server import (
+        DashboardConfig,
+        start_dashboard_session,
+    )
 
+    config = DashboardConfig(
+        ligand_resname=getattr(args, "dashboard_ligand_resname", None),
+        binding_pocket_cutoff_A=float(
+            getattr(args, "dashboard_binding_pocket_cutoff_A", 5.0) or 5.0
+        ),
+        max_browser_frames=int(
+            getattr(args, "dashboard_max_playback_frames", 200) or 200
+        ),
+    )
     session = start_dashboard_session(
         output=output_dir,
         host=args.dashboard_host,
         port=args.dashboard_port,
+        config=config,
     )
     print(f"Live dashboard running at: {session.url}")
     if session.port_was_changed:
@@ -843,6 +943,16 @@ def _cmd_phase(phase: str, args: argparse.Namespace) -> int:
     kwargs = _harvest_phase_options(args, opts_list)
     if _dashboard_requested(args) and phase == "simulate":
         kwargs["live_telemetry"] = True
+        # Forward dashboard knobs when running live; ignored if the user
+        # did not opt in to live telemetry.
+        if getattr(args, "dashboard_frame_interval", None) is not None:
+            kwargs["telemetry_interval"] = int(args.dashboard_frame_interval)
+        if getattr(args, "dashboard_refresh_seconds", None) is not None:
+            # Hint kept in console output; browser-side cadence is
+            # controlled by dashboard.html / settings.js.
+            print(
+                f"  dashboard polling: every {args.dashboard_refresh_seconds}s"
+            )
 
     method = {
         "setup":    fmdx.setup,
@@ -1028,9 +1138,29 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     if args.dashboard_command != "serve":
         print("fastmdx: dashboard requires a subcommand, e.g. `dashboard serve`.", file=sys.stderr)
         return 2
-    from fastmdxplora.live.server import serve_dashboard
+    from fastmdxplora.live.server import DashboardConfig, serve_dashboard
 
-    serve_dashboard(output=args.output, host=args.host, port=args.port)
+    config = DashboardConfig(
+        ligand_resname=getattr(args, "ligand_resname", None),
+        binding_pocket_cutoff_A=float(
+            getattr(args, "binding_pocket_cutoff_A", 5.0) or 5.0
+        ),
+        max_browser_frames=int(
+            getattr(args, "max_playback_frames", 200) or 200
+        ),
+    )
+    serve_dashboard(
+        output=args.output,
+        host=args.host,
+        port=args.port,
+        config=config,
+    )
+    if getattr(args, "open_browser", False):
+        import webbrowser
+        try:
+            webbrowser.open(f"http://{args.host}:{args.port}", new=2)
+        except Exception:
+            pass
     return 0
 
 

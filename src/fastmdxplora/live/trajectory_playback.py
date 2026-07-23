@@ -1,15 +1,9 @@
-"""Trajectory playback helpers for the live dashboard.
+"""Browser-safe trajectory playback for the live dashboard.
 
-The dashboard's "Molecular Viewer" page can step through a downsampled
-playback of the production trajectory (200 frames max by default) so the
-user can scrub or play it back without the cost (or the file size) of
-loading the full scientific DCD. This module never mutates the DCD — it
-only reads frames and writes a multi-MODEL PDB companion.
-
-OpenMM is the only consumer-strict dependency for DCD reading, so it's
-imported lazily. If OpenMM isn't available, the playback route falls
-back to a clean "not available" message; the rest of the dashboard
-keeps working.
+While a run is active, playback is compiled from the rolling solvent-stripped
+PDB snapshots written by :mod:`fastmdxplora.live.live_frames`.  After the run
+completes, the scientific DCD is read with MDTraj and downsampled to a bounded,
+solvent-stripped multi-model PDB.  Neither source is modified.
 """
 
 from __future__ import annotations
@@ -17,49 +11,42 @@ from __future__ import annotations
 import json
 import os
 import time
-from io import StringIO
 from pathlib import Path
 from typing import Any
+
+from fastmdxplora.live.live_frames import read_live_frame_history
 
 PLAYBACK_FILE = "playback.pdb"
 PLAYBACK_INDEX_FILE = "playback_index.json"
 
-# Lines that record-level PDB writers emit which conflict when reusing
-# between MODEL blocks. CRYST1 may only appear once; HEADER / TITLE /
-# COMPND may only appear before the first MODEL.
 _HEADER_LIKE_RECORDS = frozenset({
-    "CRYST1", "HEADER", "OBSLTE", "TITLE ", "SPLT  ", "CAVEAT",
-    "COMPND", "SOURCE", "KEYWDS", "EXPDTA", "NUMMDL", "MDLTYP",
-    "AUTHOR", "REVDAT", "DBREF", "DBREF1", "DBREF2", "SEQADV",
-    "SEQRES", "MODRES", "HET ", "HETNAM", "HETSYN", "FORMUL",
+    "CRYST1", "HEADER", "OBSLTE", "TITLE", "SPLT", "CAVEAT", "COMPND",
+    "SOURCE", "KEYWDS", "EXPDTA", "NUMMDL", "MDLTYP", "AUTHOR", "REVDAT",
+    "DBREF", "DBREF1", "DBREF2", "SEQADV", "SEQRES", "MODRES", "HET",
+    "HETNAM", "HETSYN", "FORMUL",
 })
 
 
 def PlaybackUnavailable(reason: str) -> dict[str, Any]:
-    """Return a uniform "not available" envelope for the route handler."""
     return {
         "playback_available": False,
         "reason": reason,
+        "source_kind": None,
         "n_frames_total": 0,
         "n_frames_browser": 0,
         "frame_indices": [],
+        "frame_times_ns": [],
         "simulation_time_ns_first": None,
         "simulation_time_ns_last": None,
     }
 
 
-def _import_openmm() -> dict[str, Any] | None:
-    """Return a dict of OpenMM symbols or ``None`` if not importable."""
+def _import_mdtraj():
     try:
-        import openmm
-        from openmm.app import DCDFile, PDBFile
+        import mdtraj as md
     except ImportError:
         return None
-    return {
-        "openmm": openmm,
-        "PDBFile": PDBFile,
-        "DCDFile": DCDFile,
-    }
+    return md
 
 
 def playback_info(
@@ -69,186 +56,296 @@ def playback_info(
     simulation_time_ns_total: float | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Build the playback companion files and return a status dictionary.
-
-    Parameters
-    ----------
-    output_dir : path-like
-        The dashboard's project root (typically the FastMDXplora run dir).
-    max_browser_frames : int
-        Cap on the number of frames the browser will load. The trajectory
-        is downsampled evenly so the browser never sees more than this
-        many frames regardless of how large the production run is.
-    simulation_time_ns_total : float | None
-        If known, used to compute simulation-time labels for each frame.
-    force : bool
-        Re-generate even if the companion files already exist. Useful for
-        the dashboard's refresh control.
-
-    Returns
-    -------
-    dict
-        Status envelope consumed by the ``/api/playback-info`` route.
-    """
+    """Return or build the best available browser playback companion."""
     out = Path(output_dir)
     sim_dir = out / "simulation"
-    topo_path = sim_dir / "topology.pdb"
-    dcd_path = sim_dir / "production.dcd"
     companion_pdb = sim_dir / PLAYBACK_FILE
     companion_idx = sim_dir / PLAYBACK_INDEX_FILE
+    cap = max(2, int(max_browser_frames or 200))
 
-    if not (topo_path.is_file() and dcd_path.is_file()):
-        return PlaybackUnavailable("missing-trajectory")
+    history = read_live_frame_history(sim_dir)
+    history_frames = [item for item in history.get("frames", []) if isinstance(item, dict)]
+    status = _load_json(sim_dir / "live_status.json")
+    workflow_completed = str(status.get("status") or "").lower() in {
+        "completed", "complete", "ok", "success", "succeeded"
+    }
 
-    if not force and companion_pdb.is_file() and companion_idx.is_file():
+    topology_path = sim_dir / "topology.pdb"
+    dcd_path = sim_dir / "production.dcd"
+
+    # During a live run use lightweight snapshots.  This allows play/pause and
+    # scrubbing during minimization/NVT/NPT before a production DCD even exists.
+    if len(history_frames) >= 2 and not workflow_completed:
+        signature = _history_signature(history_frames)
+        cached = _cached_playback(companion_pdb, companion_idx, "live-history", signature, force)
+        if cached is not None:
+            return cached
         try:
-            if companion_pdb.stat().st_mtime >= dcd_path.stat().st_mtime:
-                info = _load_index(companion_idx)
-                if info.get("playback_available"):
-                    return info
-        except OSError:
-            pass
+            return _generate_from_history(
+                sim_dir=sim_dir,
+                records=history_frames,
+                companion_pdb=companion_pdb,
+                companion_idx=companion_idx,
+                max_browser_frames=cap,
+                source_signature=signature,
+            )
+        except Exception as exc:  # noqa: BLE001 - dashboard is best effort
+            cached = _load_index(companion_idx)
+            if cached.get("playback_available"):
+                return cached
+            return PlaybackUnavailable(f"history-generate-error: {exc}")
 
-    omm = _import_openmm()
-    if omm is None:
-        return PlaybackUnavailable("openmm-not-installed")
+    # Completed runs prefer the scientific DCD.  The browser copy is atom-
+    # sliced and downsampled; the original DCD remains unchanged.
+    if topology_path.is_file() and dcd_path.is_file() and dcd_path.stat().st_size > 0:
+        signature = _file_signature(dcd_path)
+        cached = _cached_playback(companion_pdb, companion_idx, "production-dcd", signature, force)
+        if cached is not None:
+            return cached
+        md = _import_mdtraj()
+        if md is not None:
+            try:
+                return _generate_from_dcd(
+                    md=md,
+                    topology_path=topology_path,
+                    dcd_path=dcd_path,
+                    companion_pdb=companion_pdb,
+                    companion_idx=companion_idx,
+                    max_browser_frames=cap,
+                    simulation_time_ns_total=simulation_time_ns_total,
+                    source_signature=signature,
+                )
+            except Exception:
+                # A DCD can be temporarily unreadable while OpenMM is writing
+                # its final frame. Fall through to the already-safe history.
+                pass
 
-    try:
-        return _generate_companion(
-            omm=omm,
-            topology_path=topo_path,
-            dcd_path=dcd_path,
-            companion_pdb=companion_pdb,
-            companion_idx=companion_idx,
-            max_browser_frames=max(1, int(max_browser_frames)),
-            simulation_time_ns_total=simulation_time_ns_total,
-        )
-    except Exception as exc:  # noqa: BLE001 — never crash the dashboard
-        return PlaybackUnavailable(f"generate-error: {exc}")
+    if len(history_frames) >= 2:
+        signature = _history_signature(history_frames)
+        cached = _cached_playback(companion_pdb, companion_idx, "live-history", signature, force)
+        if cached is not None:
+            return cached
+        try:
+            return _generate_from_history(
+                sim_dir=sim_dir,
+                records=history_frames,
+                companion_pdb=companion_pdb,
+                companion_idx=companion_idx,
+                max_browser_frames=cap,
+                source_signature=signature,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return PlaybackUnavailable(f"history-generate-error: {exc}")
+
+    if dcd_path.is_file() and _import_mdtraj() is None:
+        return PlaybackUnavailable("mdtraj-not-installed")
+    return PlaybackUnavailable("not-enough-frames")
 
 
-def _generate_companion(
+def _generate_from_history(
     *,
-    omm: dict[str, Any],
+    sim_dir: Path,
+    records: list[dict[str, Any]],
+    companion_pdb: Path,
+    companion_idx: Path,
+    max_browser_frames: int,
+    source_signature: str,
+) -> dict[str, Any]:
+    selected = _even_sample(records, max_browser_frames)
+    blocks: list[str] = []
+    used: list[dict[str, Any]] = []
+    for record in selected:
+        path = sim_dir / str(record.get("path") or "")
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        atoms = _pdb_atom_lines(text)
+        if not atoms:
+            continue
+        model_number = len(used) + 1
+        blocks.append(f"MODEL     {model_number:>4d}")
+        blocks.extend(atoms)
+        blocks.append("ENDMDL")
+        used.append(record)
+    if len(used) < 2:
+        return PlaybackUnavailable("not-enough-readable-history-frames")
+    blocks.append("END")
+    _atomic_text(companion_pdb, "\n".join(blocks) + "\n")
+
+    times = [record.get("simulation_time_ns") for record in used]
+    indices = [record.get("frame_index") for record in used]
+    payload = _playback_payload(
+        source_kind="live-history",
+        source_signature=source_signature,
+        n_total=len(records),
+        n_browser=len(used),
+        frame_indices=indices,
+        frame_times_ns=times,
+    )
+    _atomic_json(companion_idx, payload)
+    return payload
+
+
+def _generate_from_dcd(
+    *,
+    md: Any,
     topology_path: Path,
     dcd_path: Path,
     companion_pdb: Path,
     companion_idx: Path,
     max_browser_frames: int,
     simulation_time_ns_total: float | None,
+    source_signature: str,
 ) -> dict[str, Any]:
-    PDBFile = omm["PDBFile"]
-    DCDFile = omm["DCDFile"]
-
-    pdb = PDBFile(str(topology_path))
-    topology = pdb.topology
-
-    dcd = DCDFile(str(dcd_path))
-    n_total = int(len(dcd))
-    if n_total <= 0:
-        return PlaybackUnavailable("empty-trajectory")
-
-    if n_total <= max_browser_frames:
-        frame_indices = list(range(n_total))
-    else:
-        # Even downsample so coverage is uniform across the trajectory.
-        stride = max(1, n_total // max_browser_frames)
-        frame_indices = list(range(0, n_total, stride))[:max_browser_frames]
-        if frame_indices[-1] != n_total - 1:
-            frame_indices.append(n_total - 1)
-
-    n_browser = len(frame_indices)
-    frame_set = set(frame_indices)
-
-    out_lines: list[str] = []
-    written = 0
-    frame_times_ns: list[float | None] = []
-    # DCD iteration is partial-write risky: the OpenMM C++ layer may raise
-    # on a torn final frame. Break on the first error so the dashboard
-    # still serves whatever it already had.
+    topology_traj = md.load_pdb(str(topology_path))
     try:
-        for idx, frame in enumerate(dcd):
-            if idx not in frame_set:
-                continue
-            buf = StringIO()
-            try:
-                PDBFile.writeFile(topology, frame, buf, keepIds=True)
-            except TypeError:
-                # Older OpenMM versions don't accept keepIds.
-                PDBFile.writeFile(topology, frame, buf)  # type: ignore[call-arg]
-            text = buf.getvalue()
-            # 3Dmol expects MODEL/ENDMDL wrapping. Strip the per-frame
-            # header-record lines that conflict with the multi-MODEL
-            # contract (CRYST1 may only appear once).
-            if written == 0:
-                out_lines.append(f"MODEL     {idx + 1:>4d}")
-            else:
-                out_lines.append(f"MODEL     {idx + 1:>4d}")
-            for ln in text.splitlines():
-                stripped = ln[:6].rstrip().upper()
-                if not stripped:
-                    continue
-                if (
-                    stripped in _HEADER_LIKE_RECORDS
-                    or stripped.startswith("END")
-                    or stripped == "MODEL"
-                    or stripped == "ENDMDL"
-                ):
-                    continue
-                out_lines.append(ln)
-            out_lines.append("ENDMDL")
-            written += 1
-            if simulation_time_ns_total is not None and n_total > 1:
-                frame_times_ns.append(
-                    simulation_time_ns_total * (idx / (n_total - 1))
-                )
-            else:
-                frame_times_ns.append(None)
-            if written >= n_browser:
-                break
+        display_atoms = topology_traj.topology.select("not water")
     except Exception:
-        # Mid-trajectory read error (e.g. simulation still writing).
-        # Whatever we already wrote is still servable.
-        pass
+        display_atoms = None
+    if display_atoms is not None and len(display_atoms) == 0:
+        display_atoms = None
 
-    if written == 0:
-        return PlaybackUnavailable("no-frames-read")
-    out_lines.append("END")
-
+    trajectory = md.load_dcd(
+        str(dcd_path),
+        top=topology_traj.topology,
+        atom_indices=display_atoms,
+    )
+    n_total = int(trajectory.n_frames)
+    if n_total < 2:
+        return PlaybackUnavailable("not-enough-trajectory-frames")
+    frame_indices = _even_indices(n_total, max_browser_frames)
+    browser_traj = trajectory[frame_indices]
     tmp = companion_pdb.with_suffix(".pdb.tmp")
-    tmp.write_text("\n".join(out_lines), encoding="utf-8")
+    browser_traj.save_pdb(str(tmp))
     os.replace(tmp, companion_pdb)
 
-    payload = {
-        "playback_available": True,
-        "n_frames_total": n_total,
-        "n_frames_browser": written,
-        "frame_indices": [int(i) for i in frame_indices[:written]],
-        "frame_times_ns": frame_times_ns,
-        "simulation_time_ns_first": (
-            frame_times_ns[0] if frame_times_ns and frame_times_ns[0] is not None
-            else None
-        ),
-        "simulation_time_ns_last": (
-            frame_times_ns[-1] if frame_times_ns and frame_times_ns[-1] is not None
-            else None
-        ),
-        "companion_pdb": companion_pdb.name,
-        "compiled_at": time.time(),
-    }
-    tmp_idx = companion_idx.with_suffix(".json.tmp")
-    tmp_idx.write_text(json.dumps(payload), encoding="utf-8")
-    os.replace(tmp_idx, companion_idx)
+    times: list[float | None]
+    try:
+        raw_time = [float(value) / 1000.0 for value in browser_traj.time]
+        if len(raw_time) > 1 and max(raw_time) > min(raw_time):
+            times = raw_time
+        else:
+            raise ValueError
+    except Exception:
+        if simulation_time_ns_total is not None and n_total > 1:
+            times = [
+                float(simulation_time_ns_total) * (index / (n_total - 1))
+                for index in frame_indices
+            ]
+        else:
+            times = [None] * len(frame_indices)
+
+    payload = _playback_payload(
+        source_kind="production-dcd",
+        source_signature=source_signature,
+        n_total=n_total,
+        n_browser=len(frame_indices),
+        frame_indices=frame_indices,
+        frame_times_ns=times,
+    )
+    _atomic_json(companion_idx, payload)
     return payload
 
 
-def _load_index(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return PlaybackUnavailable("missing-companion")
+def _playback_payload(
+    *,
+    source_kind: str,
+    source_signature: str,
+    n_total: int,
+    n_browser: int,
+    frame_indices: list[Any],
+    frame_times_ns: list[Any],
+) -> dict[str, Any]:
+    clean_times = [float(value) if value not in (None, "") else None for value in frame_times_ns]
+    return {
+        "playback_available": True,
+        "reason": None,
+        "source_kind": source_kind,
+        "source_signature": source_signature,
+        "n_frames_total": int(n_total),
+        "n_frames_browser": int(n_browser),
+        "frame_indices": [int(value) if value not in (None, "") else None for value in frame_indices],
+        "frame_times_ns": clean_times,
+        "simulation_time_ns_first": clean_times[0] if clean_times else None,
+        "simulation_time_ns_last": clean_times[-1] if clean_times else None,
+        "companion_pdb": PLAYBACK_FILE,
+        "compiled_at": time.time(),
+    }
+
+
+def _cached_playback(
+    pdb_path: Path,
+    index_path: Path,
+    source_kind: str,
+    source_signature: str,
+    force: bool,
+) -> dict[str, Any] | None:
+    if force or not pdb_path.is_file() or not index_path.is_file():
+        return None
+    payload = _load_index(index_path)
+    if (
+        payload.get("playback_available")
+        and payload.get("source_kind") == source_kind
+        and payload.get("source_signature") == source_signature
+    ):
+        return payload
+    return None
+
+
+def _even_indices(count: int, cap: int) -> list[int]:
+    if count <= cap:
+        return list(range(count))
+    if cap <= 2:
+        return [0, count - 1]
+    return sorted({round(index * (count - 1) / (cap - 1)) for index in range(cap)})
+
+
+def _even_sample(records: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
+    return [records[index] for index in _even_indices(len(records), cap)]
+
+
+def _pdb_atom_lines(text: str) -> list[str]:
+    output: list[str] = []
+    for line in text.splitlines():
+        record = line[:6].strip().upper()
+        if record in {"ATOM", "HETATM", "TER"}:
+            output.append(line)
+    return output
+
+
+def _history_signature(records: list[dict[str, Any]]) -> str:
+    last = records[-1] if records else {}
+    return f"{len(records)}:{last.get('sequence')}:{last.get('mtime_ns')}"
+
+
+def _file_signature(path: Path) -> str:
+    stat = path.stat()
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def _load_json(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
-        return PlaybackUnavailable("invalid-companion")
+        return {}
+
+
+def _load_index(path: Path) -> dict[str, Any]:
+    payload = _load_json(path)
+    return payload if payload else PlaybackUnavailable("invalid-companion")
+
+
+def _atomic_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    _atomic_text(path, json.dumps(payload, indent=2))
 
 
 def neighborhood_residues(
@@ -258,15 +355,7 @@ def neighborhood_residues(
     cutoff_angstrom: float = 5.0,
     coords_path: Path | None = None,
 ) -> list[tuple[str, int]]:
-    """Residue keys within ``cutoff_angstrom`` of any ligand atom.
-
-    Returns a list of ``(chain, resSeq)`` tuples. Distances are measured
-    **per atom** (any ligand atom in contact counts) — not centroid
-    sphere — so elongated or peptide-like ligands aren't underestimated.
-
-    Coordinates are read from ``coords_path`` if provided (e.g. the
-    live-frame PDB) and otherwise from the topology file's atoms.
-    """
+    """Return residues with any atom within ``cutoff_angstrom`` of ligand."""
     if not topology_path.is_file():
         return []
     coords_source = coords_path if coords_path and coords_path.is_file() else topology_path
@@ -286,19 +375,12 @@ def neighborhood_residues(
                 chain_id = line[21:22].strip() or "A"
                 try:
                     res_seq = int(line[22:26])
-                except ValueError:
-                    res_seq = 0
-                try:
                     x = float(line[30:38])
                     y = float(line[38:46])
                     z = float(line[46:54])
                 except (ValueError, IndexError):
                     continue
-                # Per-atom contact check — fast enough for normal pockets
-                # (<200 protein residues × <200 ligand atoms in pure Python).
-                if _any_atom_within_cutoff(
-                    x, y, z, ligand_coords, cutoff_sq
-                ):
+                if _any_atom_within_cutoff(x, y, z, ligand_coords, cutoff_sq):
                     residues.add((chain_id, res_seq))
     except OSError:
         return []
@@ -313,17 +395,10 @@ def _ligand_coord_list(path: Path, ligand_resname: str) -> list[tuple[float, flo
             for line in fh:
                 if not (line.startswith("ATOM") or line.startswith("HETATM")):
                     continue
-                resname = line[17:20].strip().upper()
-                if resname != target:
+                if line[17:20].strip().upper() != target:
                     continue
                 try:
-                    coords.append(
-                        (
-                            float(line[30:38]),
-                            float(line[38:46]),
-                            float(line[46:54]),
-                        )
-                    )
+                    coords.append((float(line[30:38]), float(line[38:46]), float(line[46:54])))
                 except (ValueError, IndexError):
                     continue
     except OSError:
@@ -338,10 +413,7 @@ def _any_atom_within_cutoff(
     ligand_coords: list[tuple[float, float, float]],
     cutoff_sq: float,
 ) -> bool:
-    for lx, ly, lz in ligand_coords:
-        dx = x - lx
-        dy = y - ly
-        dz = z - lz
-        if dx * dx + dy * dy + dz * dz <= cutoff_sq:
-            return True
-    return False
+    return any(
+        (x - lx) ** 2 + (y - ly) ** 2 + (z - lz) ** 2 <= cutoff_sq
+        for lx, ly, lz in ligand_coords
+    )

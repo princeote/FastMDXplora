@@ -1,17 +1,15 @@
 """Structure metadata helpers for the live dashboard.
 
-Counts chains, residues, atoms, water molecules, ions, and likely non-protein
-ligands from a PDB file. Designed to be safe for the dashboard: it never
-raises and returns a JSON-serialisable dictionary with sensible fallbacks.
-
-The water/ion/amino-acid residue sets are the canonical copies in
-:mod:`fastmdxplora.live.ligand_detection`; re-imported here so a
-change to one place updates both modules.
+The dashboard needs lightweight, failure-isolated metadata for whichever PDB
+is being displayed.  The helpers in this module deliberately avoid optional
+scientific dependencies: they parse fixed-width PDB records, cache the result
+by file modification time, and always return JSON-serialisable dictionaries.
 """
 
 from __future__ import annotations
 
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -22,144 +20,159 @@ from fastmdxplora.live.ligand_detection import (
     detect_ligands,
 )
 
-# Maximum PDB size the dashboard will scan inline. Anything larger may
-# be a viral capsid or a poorly-prepared system; rather than stall the
-# polling loop we report "too-large" and let the user pre-render.
-_MAX_PDB_BYTES_FOR_INLINE_SCAN = 8 * 1024 * 1024  # 8 MB
-
-# Wide guard against corrupt numeric columns parsing into absurd values
-# (PDB row chunks occasionally misalign on weird lines).
+# Keep the lightweight metadata scanner bounded. The viewer now prefers the
+# prepared solute PDB, so normal dashboard runs avoid parsing a full solvated
+# topology while retaining the original safety limit for unusually large files.
+_MAX_PDB_BYTES_FOR_INLINE_SCAN = 8 * 1024 * 1024
 _COORD_SANITY_LIMIT = 1_000_000.0  # angstrom
 
 
 def count_structure(path: str | Path) -> dict[str, Any]:
-    """Walk a PDB and return chain / residue / atom / ligand counters.
+    """Return chain/residue/atom/ligand counters for a PDB file.
 
-    The returned dictionary is JSON-friendly: every numeric field is int,
-    every list field is a list of strings. Any IO / parse failure yields
-    a ``{"valid": False}`` envelope so the dashboard can render an honest
-    "structure could not be read" state instead of crashing.
+    Results are cached by absolute path, file size, and nanosecond mtime.  A
+    fresh dictionary is returned to callers so API code may safely enrich the
+    payload without mutating the cached value.
     """
+
     p = Path(path)
     if not p.is_file():
         return {"valid": False, "reason": "missing", "path": p.as_posix()}
     try:
-        file_size = p.stat().st_size
+        stat = p.stat()
     except OSError as exc:
         return {"valid": False, "reason": f"stat-error: {exc}", "path": p.as_posix()}
-    if file_size > _MAX_PDB_BYTES_FOR_INLINE_SCAN:
+    if stat.st_size > _MAX_PDB_BYTES_FOR_INLINE_SCAN:
         return {
             "valid": False,
             "reason": "too-large",
             "path": p.as_posix(),
-            "size": file_size,
+            "size": stat.st_size,
+            "max_inline_bytes": _MAX_PDB_BYTES_FOR_INLINE_SCAN,
         }
+    result = _count_structure_cached(
+        str(p.resolve()),
+        int(stat.st_mtime_ns),
+        int(stat.st_size),
+    )
+    return dict(result)
 
-    chains: set[str] = set()
+
+@lru_cache(maxsize=32)
+def _count_structure_cached(
+    path_string: str,
+    _mtime_ns: int,
+    file_size: int,
+) -> dict[str, Any]:
+    p = Path(path_string)
+    protein_chains: set[str] = set()
+    all_chains: set[str] = set()
     protein_residue_keys: set[tuple[str, str, str]] = set()
     non_protein_residue_keys: set[tuple[str, str, str]] = set()
-    waters = 0
-    ions = 0
+    water_residue_keys: set[tuple[str, str, str]] = set()
+    ion_residue_keys: set[tuple[str, str, str]] = set()
+
     atoms = 0
     protein_atoms = 0
     hetatm_atoms = 0
+    water_atoms = 0
+    ion_atoms = 0
     min_coords = [float("inf"), float("inf"), float("inf")]
     max_coords = [float("-inf"), float("-inf"), float("-inf")]
 
     try:
         with p.open("r", encoding="utf-8", errors="ignore") as fh:
             for line in fh:
-                if not (line.startswith("ATOM") or line.startswith("HETATM")):
+                if not line.startswith(("ATOM", "HETATM")):
                     continue
+
                 atoms += 1
-                is_atom = line.startswith("ATOM")
-                if is_atom:
-                    protein_atoms += 1
-                else:
+                is_hetatm = line.startswith("HETATM")
+                if is_hetatm:
                     hetatm_atoms += 1
+
                 chain_id = line[21:22].strip() or "A"
                 resname = line[17:20].strip().upper()
-                resi = line[22:26].strip()
-                chains.add(chain_id)
-
-                # Many PDBs list crystallographic waters/ions as ATOM.
-                # Decide by residue name first so they aren't double
-                # counted as protein, regardless of the record type.
-                if resname in WATER_RESNAMES:
-                    waters += 1
-                    continue
-                if resname in ION_RESNAMES:
-                    ions += 1
-                    continue
-
+                resi = line[22:27].strip()
                 key = (chain_id, resname, resi)
-                if resname in AMINO_ACID_RESNAMES:
-                    protein_residue_keys.add(key)
-                elif is_atom:
-                    # Genuinely a non-water, non-ion ATOM record — rare,
-                    # but found in some ligand-flavoured PDBs. Treat as
-                    # non-protein residue so ligand detection picks it up.
-                    non_protein_residue_keys.add(key)
-                else:
-                    non_protein_residue_keys.add(key)
+                all_chains.add(chain_id)
 
-                # Coordinate parsing (PDB column widths). _COORD_SANITY_LIMIT
-                # only guards against parsing-broken columns; it does not
-                # silently drop otherwise valid coordinates.
+                # Parse coordinates before classifying so the overall extent
+                # remains meaningful even for solvated structures.
                 try:
                     x = float(line[30:38])
                     y = float(line[38:46])
                     z = float(line[46:54])
-                    if all(-_COORD_SANITY_LIMIT <= v <= _COORD_SANITY_LIMIT
-                           for v in (x, y, z)):
-                        min_coords[0] = min(min_coords[0], x)
-                        min_coords[1] = min(min_coords[1], y)
-                        min_coords[2] = min(min_coords[2], z)
-                        max_coords[0] = max(max_coords[0], x)
-                        max_coords[1] = max(max_coords[1], y)
-                        max_coords[2] = max(max_coords[2], z)
+                    if all(
+                        -_COORD_SANITY_LIMIT <= value <= _COORD_SANITY_LIMIT
+                        for value in (x, y, z)
+                    ):
+                        for idx, value in enumerate((x, y, z)):
+                            min_coords[idx] = min(min_coords[idx], value)
+                            max_coords[idx] = max(max_coords[idx], value)
                 except (ValueError, IndexError):
                     pass
+
+                if resname in WATER_RESNAMES:
+                    water_atoms += 1
+                    water_residue_keys.add(key)
+                    continue
+                if resname in ION_RESNAMES:
+                    ion_atoms += 1
+                    ion_residue_keys.add(key)
+                    continue
+                if resname in AMINO_ACID_RESNAMES:
+                    protein_atoms += 1
+                    protein_chains.add(chain_id)
+                    protein_residue_keys.add(key)
+                    continue
+
+                # Any remaining residue is a ligand/cofactor candidate.  The
+                # detector applies its own cofactor exclusions.
+                non_protein_residue_keys.add(key)
     except OSError as exc:
         return {"valid": False, "reason": f"read-error: {exc}", "path": p.as_posix()}
 
-    # Ligand detection consumes *non-protein* residue keys so amino-acid
-    # counts never get mixed into the ligand panel.
     ligand_info = detect_ligands(non_protein_residue_keys)
-    bounding_extent = (
-        [max_coords[i] - min_coords[i] if min_coords[i] != float("inf") else 0.0
-         for i in range(3)]
-        if min_coords[0] != float("inf")
-        else [0.0, 0.0, 0.0]
-    )
+    if min_coords[0] == float("inf"):
+        bounding_extent = [0.0, 0.0, 0.0]
+        centroid: list[float | None] = [None, None, None]
+    else:
+        bounding_extent = [max_coords[i] - min_coords[i] for i in range(3)]
+        centroid = [(min_coords[i] + max_coords[i]) / 2 for i in range(3)]
+
     return {
         "valid": True,
         "path": p.as_posix(),
+        "size": file_size,
         "atoms": atoms,
         "protein_atoms": protein_atoms,
         "hetatm_atoms": hetatm_atoms,
-        "chains": sorted(chains),
-        "n_chains": len(chains),
+        "water_atoms": water_atoms,
+        "ion_atoms": ion_atoms,
+        "chains": sorted(protein_chains or all_chains),
+        "all_chains": sorted(all_chains),
+        "n_chains": len(protein_chains or all_chains),
         "protein_residues": len(protein_residue_keys),
-        "water_residues": waters,
-        "ions": ions,
+        "water_residues": len(water_residue_keys),
+        "ions": len(ion_residue_keys),
         "ligand_residues_total": len(ligand_info["instances"]),
         "ligand_resnames": ligand_info["resnames"],
         "ligand_instances": ligand_info["instances"],
-        "extents_angstrom": [round(v, 2) for v in bounding_extent],
+        "extents_angstrom": [round(value, 2) for value in bounding_extent],
         "centroid_angstrom": [
-            round((min_coords[i] + max_coords[i]) / 2, 2) if min_coords[i] != float("inf") else None
-            for i in range(3)
+            round(value, 2) if value is not None else None for value in centroid
         ],
     }
 
 
 def ligand_atom_counts(path: str | Path) -> dict[str, int]:
-    """Return a Counter of ligand residue names → atom count.
+    """Return ligand residue-name to atom-count mappings.
 
-    Useful for the ligand tools pane of the molecular viewer. Returns an
-    empty dict if the path doesn't exist or can't be read.
+    Both ``ATOM`` and ``HETATM`` records are considered because some input
+    generators encode small molecules using ``ATOM`` records.
     """
+
     p = Path(path)
     if not p.is_file():
         return {}
@@ -167,10 +180,14 @@ def ligand_atom_counts(path: str | Path) -> dict[str, int]:
     try:
         with p.open("r", encoding="utf-8", errors="ignore") as fh:
             for line in fh:
-                if not line.startswith("HETATM"):
+                if not line.startswith(("ATOM", "HETATM")):
                     continue
                 resname = line[17:20].strip().upper()
-                if resname in WATER_RESNAMES or resname in ION_RESNAMES:
+                if (
+                    resname in WATER_RESNAMES
+                    or resname in ION_RESNAMES
+                    or resname in AMINO_ACID_RESNAMES
+                ):
                     continue
                 counts[resname] += 1
     except OSError:

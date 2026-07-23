@@ -1,22 +1,21 @@
-/* FastMDXplora Live Dashboard — controller
+/* FastMDXplora Live Dashboard — application controller.
  *
- * Vanilla JS — no framework, no CDN. Responsible for:
- *   - Page navigation (Overview / Live / Viewer / Analysis / Files / Settings)
- *   - Polling telemetry & state APIs at a configurable interval
- *   - Updating top bar, hero card, metric cards, stage timeline, events
- *   - Broadcasting state changes to charts.js and molecule-viewer.js
- *   - Honouring "Pause Updates" (browser-side only)
+ * Framework-free and fully offline.  This module owns navigation, API
+ * polling, status/results/file rendering, and the shared event bus used by
+ * charts.js and molecule-viewer.js.  Every API renderer is isolated so one
+ * malformed payload can never prevent the other dashboard sections from
+ * updating.
  */
 
 (function () {
   "use strict";
 
-  const $ = (sel, root) => (root || document).querySelector(sel);
-  const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+  const $ = (selector, root) => (root || document).querySelector(selector);
+  const $$ = (selector, root) => Array.from((root || document).querySelectorAll(selector));
+  const byId = (id) => document.getElementById(id);
 
   const state = {
     outputDir: "",
-    polling: true,
     paused: false,
     pollIntervalMs: 3000,
     lastUpdateMs: 0,
@@ -28,262 +27,325 @@
     playbackAvailable: false,
     playbackFrames: 0,
     playbackTotalFrames: 0,
+    playbackFrameTimes: [],
+    playbackSignature: null,
     metrics: [],
     status: {},
     health: {},
+    results: {},
     structureInfo: null,
+    setupManifest: {},
+    simManifest: {},
     runId: "",
     runTitle: "FastMDXplora Live",
+    apiErrors: {},
   };
 
-  /* ---------------------------------------------- *
-   * Boot                                          *
-   * ---------------------------------------------- */
+  let chartHistorySamples = 600;
+
   document.addEventListener("DOMContentLoaded", boot);
 
   function boot() {
+    const configuredRefresh = Number(document.body?.dataset.refreshSeconds || 3);
+    state.pollIntervalMs = clampInt(configuredRefresh * 1000, 1000, 60000, 3000);
     wireNavigation();
     wireTopBar();
     wireViewerToggle();
     wireInfoTabs();
     wireTrajectoryControls();
     wireSettings();
+    navigate(location.hash.replace(/^#/, "") || "overview", {updateHash: false});
     startLoadingChecklist();
     schedulePoll(0);
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Navigation                                                          */
+  /* ------------------------------------------------------------------ */
   function wireNavigation() {
-    $$("[data-view-link]").forEach((el) => {
-      el.addEventListener("click", (event) => {
+    $$('[data-view-link]').forEach((element) => {
+      element.addEventListener("click", (event) => {
         event.preventDefault();
-        const target = el.getAttribute("data-view-link");
-        navigate(target);
+        navigate(element.getAttribute("data-view-link"));
       });
     });
+    window.addEventListener("hashchange", () => {
+      const page = location.hash.replace(/^#/, "");
+      if (state.pages.includes(page)) navigate(page, {updateHash: false});
+    });
   }
 
-  function navigate(page) {
-    if (!state.pages.includes(page)) return;
+  function navigate(page, options) {
+    const opts = options || {};
+    if (!state.pages.includes(page)) page = "overview";
     state.activePage = page;
-    $$(".page").forEach((el) => {
-      const hidden = el.getAttribute("data-page") !== page;
-      el.hidden = hidden;
+    $$('.page').forEach((element) => {
+      const hidden = element.getAttribute("data-page") !== page;
+      element.hidden = hidden;
     });
-    $$("[data-view-link]").forEach((el) => {
-      const isActive = el.getAttribute("data-view-link") === page;
-      el.classList.toggle("active", isActive);
+    $$('[data-view-link]').forEach((element) => {
+      element.classList.toggle(
+        "active",
+        element.getAttribute("data-view-link") === page
+      );
     });
-    if (page === "viewer") {
-      window.dispatchEvent(new CustomEvent("dashboard:viewer-page-opened"));
+    document.documentElement.setAttribute("data-page", page);
+    if (opts.updateHash !== false && location.hash !== `#${page}`) {
+      history.replaceState(null, "", `#${page}`);
     }
-    if (page === "analysis" || page === "files") {
-      window.dispatchEvent(new CustomEvent("dashboard:results-page-opened"));
-    }
+    requestAnimationFrame(() => {
+      if (page === "live") emit("live-page-opened", {});
+      if (page === "viewer") emit("viewer-page-opened", {});
+      if (page === "analysis" || page === "files") emit("results-page-opened", {});
+    });
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Loading screen                                                      */
+  /* ------------------------------------------------------------------ */
   function startLoadingChecklist() {
-    setLoadingStep("telemetry", "active");
-    fetchJSON("/api/status")
-      .then(() => setLoadingStep("telemetry", "done"))
-      .catch(() => setLoadingStep("telemetry", "error"));
-    setLoadingStep("structure", "active");
-    fetchJSON("/api/structure-info")
-      .then(() => setLoadingStep("structure", "done"))
-      .catch(() => setLoadingStep("structure", "error"));
-    setLoadingStep("metrics", "active");
-    fetchJSON("/api/metrics")
-      .then(() => setLoadingStep("metrics", "done"))
-      .catch(() => setLoadingStep("metrics", "error"));
-    setTimeout(() => {
-      document.body.classList.remove("state-loading");
-      document.body.classList.add("state-ready");
-    }, 1100); /* fade-out tied to successful lookup, not a fixed timeout, but with a brief post-poll settle delay */
+    const checks = [
+      ["telemetry", "/api/status"],
+      ["structure", "/api/structure-info"],
+      ["metrics", "/api/metrics"],
+    ].map(([name, url]) => {
+      setLoadingStep(name, "active");
+      return fetchJSON(url)
+        .then(() => setLoadingStep(name, "done"))
+        .catch(() => setLoadingStep(name, "error"));
+    });
+    Promise.allSettled(checks).finally(() => {
+      window.setTimeout(() => {
+        document.body.classList.remove("state-loading");
+        document.body.classList.add("state-ready");
+        const loading = byId("loading-screen");
+        if (loading) loading.setAttribute("aria-hidden", "true");
+      }, 300);
+    });
   }
 
   function setLoadingStep(name, status) {
-    const el = document.querySelector(`.loading-step[data-step="${name}"]`);
-    if (el) el.setAttribute("data-state", status);
+    const element = $(`.loading-step[data-step="${name}"]`);
+    if (element) element.setAttribute("data-state", status);
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Controls                                                            */
+  /* ------------------------------------------------------------------ */
   function wireTopBar() {
-    $("#pause-toggle").addEventListener("click", () => {
+    byId("pause-toggle")?.addEventListener("click", () => {
       state.paused = !state.paused;
-      $("#pause-toggle").setAttribute("aria-pressed", state.paused);
-      $("#pause-label").textContent = state.paused ? "Resume Updates" : "Pause Updates";
+      byId("pause-toggle")?.setAttribute("aria-pressed", String(state.paused));
+      setText("pause-label", state.paused ? "Resume Updates" : "Pause Updates");
+      showToast(
+        state.paused
+          ? "Browser updates paused. The OpenMM simulation is still running."
+          : "Browser updates resumed."
+      );
+      if (!state.paused) schedulePoll(0);
     });
-    $("#refresh-now").addEventListener("click", () => {
-      schedulePoll(0);
-    });
-    $("#open-output").addEventListener("click", () => {
-      /* Best-effort: the dashboard never opens the OS browser from a
-         page that's already opened in a browser; show the absolute path
-         and copy it. */
-      const text = $("#sidebar-run-name").textContent || "";
-      if (!text || text === "not available") return;
-      const toast = document.createElement("div");
-      toast.className = "sr-only";
-      toast.textContent = `Output folder: ${text}`;
-      document.body.appendChild(toast);
+    byId("refresh-now")?.addEventListener("click", () => schedulePoll(0));
+    byId("open-output")?.addEventListener("click", async () => {
+      try {
+        const payload = await fetchJSON("/api/open-output");
+        if (payload.opened) {
+          showToast(`Opened output folder: ${payload.path}`);
+        } else {
+          await copyText(payload.path || state.outputDir || "");
+          showToast("Could not open the folder automatically; its path was copied.", "warning");
+        }
+      } catch (error) {
+        if (state.outputDir) await copyText(state.outputDir);
+        showToast("Could not open the output folder; its path was copied.", "warning");
+      }
     });
   }
 
   function wireViewerToggle() {
-    $("#mini-preview-frame").addEventListener("click", () => navigate("viewer"));
+    byId("mini-preview-frame")?.addEventListener("click", () => navigate("viewer"));
   }
 
   function wireInfoTabs() {
-    $$(".info-tab").forEach((tab) => {
+    $$('.info-tab').forEach((tab) => {
       tab.addEventListener("click", () => {
         const name = tab.getAttribute("data-tab");
-        $$(".info-tab").forEach((t) => t.classList.toggle("active", t === tab));
-        $$(".info-pane").forEach((p) => {
-          p.hidden = p.getAttribute("data-tab") !== name;
-          p.classList.toggle("active", p.getAttribute("data-tab") === name);
+        $$('.info-tab').forEach((item) => item.classList.toggle("active", item === tab));
+        $$('.info-pane').forEach((pane) => {
+          const active = pane.getAttribute("data-tab") === name;
+          pane.hidden = !active;
+          pane.classList.toggle("active", active);
         });
       });
     });
   }
 
   function wireTrajectoryControls() {
-    const slider = $("#traj-slider");
-    if (!slider) return;
-    slider.addEventListener("input", () => {
-      const frame = parseInt(slider.value, 10);
-      window.dispatchEvent(
-        new CustomEvent("dashboard:trajectory-seek", {detail: {frame}})
-      );
+    byId("traj-slider")?.addEventListener("input", (event) => {
+      emit("trajectory-seek", {frame: parseInt(event.target.value, 10) || 0});
     });
-    $$("[data-traj]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const action = btn.getAttribute("data-traj");
-        window.dispatchEvent(
-          new CustomEvent("dashboard:trajectory-action", {detail: {action}})
-        );
+    $$('[data-traj]').forEach((button) => {
+      button.addEventListener("click", () => {
+        emit("trajectory-action", {action: button.getAttribute("data-traj")});
       });
     });
   }
 
   function wireSettings() {
-    /* Settings page wires its own values via onSettingsChanged */
-    document.getElementById("setting-refresh-seconds")
-      .addEventListener("change", onSettingsChanged);
-    document.getElementById("setting-pocket-cutoff")
-      .addEventListener("change", onSettingsChanged);
-    document.getElementById("setting-reduced-motion")
-      .addEventListener("change", onSettingsChanged);
-    document.getElementById("setting-ligand-resname")
-      .addEventListener("change", onSettingsChanged);
-    document.getElementById("setting-chart-history")
-      .addEventListener("change", onSettingsChanged);
+    const ids = [
+      "setting-protein-rep", "setting-ligand-rep", "setting-background",
+      "setting-show-water", "setting-show-ions", "setting-spin", "setting-fog",
+      "setting-preserve-camera", "setting-refresh-seconds", "setting-chart-history",
+      "setting-compact", "setting-reduced-motion", "setting-advanced-metrics",
+      "setting-time-format", "setting-run-name", "setting-ligand-resname",
+      "setting-pocket-cutoff", "setting-scinote",
+    ];
+    ids.forEach((id) => byId(id)?.addEventListener("change", onSettingsChanged));
+    byId("pocket-cutoff")?.addEventListener("change", (event) => {
+      const value = clampFloat(parseFloat(event.target.value), 3, 15, 5);
+      state.bindingPocketCutoff = value;
+      if (byId("setting-pocket-cutoff")) byId("setting-pocket-cutoff").value = String(value);
+      onSettingsChanged();
+    });
   }
 
   function onSettingsChanged() {
     state.pollIntervalMs = clampInt(
-      parseInt($("#setting-refresh-seconds").value, 10), 1000, 60000, 3000);
+      parseFloat(byId("setting-refresh-seconds")?.value) * 1000,
+      1000,
+      60000,
+      3000
+    );
     state.bindingPocketCutoff = clampFloat(
-      parseFloat($("#setting-pocket-cutoff").value), 3.0, 15.0, 5.0);
-    const lig = ($("#setting-ligand-resname").value || "").trim().toUpperCase();
-    state.ligandResname = lig || null;
+      parseFloat(byId("setting-pocket-cutoff")?.value),
+      3,
+      15,
+      5
+    );
+    const ligand = (byId("setting-ligand-resname")?.value || "").trim().toUpperCase();
+    state.ligandResname = ligand || null;
     chartHistorySamples = clampInt(
-      parseInt($("#setting-chart-history").value, 10), 60, 5000, 600);
-    document.body.classList.toggle("compact-mode",
-      $("#setting-compact").checked);
-    document.body.classList.toggle("reduced-motion",
-      $("#setting-reduced-motion").checked);
-    /* Tell the viewer + chart modules to bind the new settings */
-    window.dispatchEvent(new CustomEvent("dashboard:settings-updated", {
-      detail: {
-        ligand: state.ligandResname,
-        pocketCutoff: state.bindingPocketCutoff,
-        chartHistory: chartHistorySamples,
-      }
-    }));
+      parseInt(byId("setting-chart-history")?.value, 10),
+      60,
+      5000,
+      600
+    );
+    const customRunName = (byId("setting-run-name")?.value || "").trim();
+    if (customRunName) state.runTitle = customRunName;
+
+    document.body.classList.toggle("compact-mode", !!byId("setting-compact")?.checked);
+    document.body.classList.toggle("reduced-motion", !!byId("setting-reduced-motion")?.checked);
+    document.body.classList.toggle(
+      "advanced-metrics",
+      !!byId("setting-advanced-metrics")?.checked
+    );
+
+    renderTopBar(state.status, state.health);
+    emit("settings-updated", {
+      ligand: state.ligandResname,
+      pocketCutoff: state.bindingPocketCutoff,
+      chartHistory: chartHistorySamples,
+      proteinRepresentation: byId("setting-protein-rep")?.value || "cartoon",
+      ligandRepresentation: byId("setting-ligand-rep")?.value || "sticks",
+      background: byId("setting-background")?.value || "matte-black",
+      showWater: !!byId("setting-show-water")?.checked,
+      showIons: !!byId("setting-show-ions")?.checked,
+      spin: !!byId("setting-spin")?.checked,
+      fog: !!byId("setting-fog")?.checked,
+      preserveCamera: byId("setting-preserve-camera")?.checked !== false,
+    });
     schedulePoll(0);
   }
 
-  /* ---------------------------------------------- *
-   * Polling                                       *
-   * ---------------------------------------------- */
-  let chartHistorySamples = 600;
-
+  /* ------------------------------------------------------------------ */
+  /* Polling                                                             */
+  /* ------------------------------------------------------------------ */
   async function fetchJSON(url) {
-    const res = await fetch(url, {cache: "no-store", headers: {"X-FastMDX": "live"}});
-    if (!res.ok) throw new Error(`HTTP ${res.status} on ${url}`);
-    return await res.json();
+    const response = await fetch(url, {
+      cache: "no-store",
+      headers: {"X-FastMDX": "live"},
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status} on ${url}`);
+    return response.json();
   }
 
   function schedulePoll(delayMs) {
-    if (state.refreshTimer) {
-      clearTimeout(state.refreshTimer);
-      state.refreshTimer = null;
-    }
-    if (state.paused) {
-      state.refreshTimer = setTimeout(() => schedulePoll(state.pollIntervalMs), state.pollIntervalMs);
-      return;
-    }
-    state.refreshTimer = setTimeout(() => {
-      pollNow().catch((err) => console.warn("dashboard poll error", err))
-        .finally(() => schedulePoll(state.pollIntervalMs));
+    if (state.refreshTimer) window.clearTimeout(state.refreshTimer);
+    state.refreshTimer = window.setTimeout(async () => {
+      if (!state.paused) {
+        try {
+          await pollNow();
+        } catch (error) {
+          console.warn("dashboard poll error", error);
+        }
+      }
+      schedulePoll(state.pollIntervalMs);
     }, Math.max(0, delayMs));
   }
 
   async function pollNow() {
-    const [statusPayload, metricsPayload, eventsPayload, resultsPayload, structurePayload, playbackPayload] =
-      await Promise.allSettled([
-        fetchJSON("/api/status"),
-        fetchJSON("/api/metrics"),
-        fetchJSON("/api/events"),
-        fetchJSON("/api/results"),
-        fetchJSON("/api/structure-info"),
-        fetchJSON("/api/playback-info"),
-      ]);
+    const names = ["status", "metrics", "events", "results", "structure", "playback"];
+    const urls = [
+      "/api/status", "/api/metrics", "/api/events", "/api/results",
+      "/api/structure-info", "/api/playback-info",
+    ];
+    const settled = await Promise.allSettled(urls.map(fetchJSON));
+    let successes = 0;
 
-    if (statusPayload.status === "fulfilled") {
-      applyStatus(statusPayload.value);
-    }
-    if (metricsPayload.status === "fulfilled") {
-      applyMetrics(metricsPayload.value.metrics || []);
-    }
-    if (eventsPayload.status === "fulfilled") {
-      renderEvents(eventsPayload.value.events || []);
-    }
-    if (resultsPayload.status === "fulfilled") {
-      applyResults(resultsPayload.value);
-    }
-    if (structurePayload.status === "fulfilled") {
-      applyStructure(structurePayload.value);
-    }
-    if (playbackPayload.status === "fulfilled") {
-      applyPlayback(playbackPayload.value);
-    }
+    settled.forEach((result, index) => {
+      const name = names[index];
+      if (result.status === "rejected") {
+        state.apiErrors[name] = String(result.reason || "request failed");
+        console.warn(`dashboard ${name} request failed`, result.reason);
+        return;
+      }
+      delete state.apiErrors[name];
+      successes += 1;
+      const payload = result.value;
+      if (name === "status") safeApply(name, () => applyStatus(payload));
+      if (name === "metrics") safeApply(name, () => applyMetrics(payload.metrics || []));
+      if (name === "events") safeApply(name, () => renderEvents(payload.events || []));
+      if (name === "results") safeApply(name, () => applyResults(payload));
+      if (name === "structure") safeApply(name, () => applyStructure(payload));
+      if (name === "playback") safeApply(name, () => applyPlayback(payload));
+    });
 
-    state.lastUpdateMs = Date.now();
-    updateRefreshedAt();
-    pulseTopbarIfLive();
+    if (successes) {
+      state.lastUpdateMs = Date.now();
+      updateRefreshedAt();
+    }
+    updateConnectionState();
   }
 
-  function pulseTopbarIfLive() {
-    const age = (Date.now() - state.lastUpdateMs) / 1000;
-    const dot = $("#topbar-status-dot");
-    if (age > 30) {
-      dot.classList.remove("status-dot-live");
-      dot.classList.add("status-dot-stale");
-    } else {
-      dot.classList.add("status-dot-live");
-      dot.classList.remove("status-dot-stale");
+  function safeApply(name, callback) {
+    try {
+      callback();
+    } catch (error) {
+      state.apiErrors[`render-${name}`] = String(error);
+      console.error(`dashboard ${name} renderer failed`, error);
+      showToast(`${humanise(name)} data could not be rendered. See the browser console.`, "warning");
+    }
+  }
+
+  function updateConnectionState() {
+    const ageSeconds = state.lastUpdateMs ? (Date.now() - state.lastUpdateMs) / 1000 : Infinity;
+    const requestFailed = Object.keys(state.apiErrors).length > 0;
+    if (ageSeconds > 30 || requestFailed) {
+      byId("topbar-status-dot")?.classList.add("status-dot-stale");
     }
   }
 
   function updateRefreshedAt() {
     const date = new Date(state.lastUpdateMs);
-    const use24 = !$("#setting-time-format") || $("#setting-time-format").value !== "12h";
-    const fmt = use24
+    const use24 = byId("setting-time-format")?.value !== "12h";
+    const text = use24
       ? `${date.toLocaleDateString()} ${date.toLocaleTimeString([], {hour12: false})}`
       : date.toLocaleTimeString();
-    const el = $("#refreshed-at");
-    if (el) el.textContent = fmt;
+    setText("refreshed-at", text);
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Status                                                              */
+  /* ------------------------------------------------------------------ */
   function applyStatus(payload) {
     const status = payload.status || {};
     const health = payload.health || {};
@@ -294,483 +356,731 @@
     renderHealth(health);
     renderStageTimeline(status);
     renderLiveProgress(status);
-    window.dispatchEvent(new CustomEvent("dashboard:status-updated", {detail: {status, health}}));
+    emit("status-updated", {status, health});
   }
 
   function renderTopBar(status, health) {
-    const stateName = (health.state || status.status || "live").toLowerCase();
-    const dot = $("#topbar-status-dot");
-    dot.className = "status-dot " + stateDotClass(stateName);
-    $("#topbar-status-text").textContent = stateName;
-    $("#topbar-stage").textContent = status.stage || "not available";
-    const step = status.current_step;
-    const total = status.total_planned_steps;
-    $("#topbar-step").textContent = step != null ? String(step) : "—";
-    $("#topbar-total").textContent = total != null ? String(total) : "—";
-    $("#topbar-platform").textContent = status.platform || "—";
-    const temp = status.target_temperature_K ||
-      (state.metrics.length
-        ? (state.metrics[state.metrics.length - 1].temperature || "")
-        : "");
-    $("#topbar-temperature").textContent = temp ? `${temp} K` : "—";
+    const statusName = String(health.state || status.status || "waiting").toLowerCase();
+    const dotClass = stateDotClass(statusName);
+    setClassName("topbar-status-dot", `status-dot ${dotClass}`);
+    setClassName("sidebar-status-dot", `status-dot ${dotClass}`);
+    setText("topbar-status-text", statusName);
+    setText("topbar-stage", status.stage || "not available");
+    setText("topbar-step", valueOrDash(status.current_step));
+    setText("topbar-total", valueOrDash(status.total_planned_steps));
+    setText("topbar-platform", status.platform || state.simManifest.platform || "—");
 
-    $("#sidebar-status-dot").className = "status-dot " + stateDotClass(stateName);
-    $("#sidebar-connection-state").textContent = stateName;
-    $("#sidebar-platform").textContent = status.platform || "not available";
-    $("#sidebar-run-name").textContent = state.runTitle;
-    state.runId = status.system_id || state.runId;
-    $("#topbar-run-id").textContent = state.runId || "system";
-    $("#topbar-run-title").textContent = state.runTitle;
+    const latest = state.metrics[state.metrics.length - 1] || {};
+    const temperature = firstPresent(
+      latest.temperature,
+      status.target_temperature_K,
+      state.simManifest.temperature_K
+    );
+    setText("topbar-temperature", temperature != null ? `${formatNumber(temperature, 1)} K` : "—");
+    setText("sidebar-connection-state", statusName);
+    setText("sidebar-platform", status.platform || state.simManifest.platform || "not available");
+    setText("sidebar-run-name", state.runTitle);
+
+    state.runId = status.system_id || state.results?.system?.system || state.runId;
+    setText("topbar-run-id", state.runId || "system");
+    setText("topbar-run-title", state.runTitle);
   }
 
-  function stateDotClass(s) {
-    if (s === "ok" || s === "live" || s === "completed") return "status-dot-live";
-    if (s === "warning" || s === "waiting" || s === "stale") return "status-dot-stale";
-    if (s === "failed" || s === "error") return "status-dot-error";
+  function stateDotClass(value) {
+    if (["ok", "live", "completed"].includes(value)) return "status-dot-live";
+    if (["failed", "error", "critical"].includes(value)) return "status-dot-error";
     return "status-dot-stale";
   }
 
   function renderHero(status) {
-    const card = $("#hero-card");
-    card.setAttribute("data-state", (status.status || "running").toLowerCase());
-    $("#hero-stage").textContent = status.stage || "—";
-    let pct = null;
-    if (typeof status.progress_percent === "number") pct = status.progress_percent;
-    else if (status.current_step && status.total_planned_steps)
-      pct = (status.current_step / status.total_planned_steps) * 100;
-    if (pct !== null) {
-      $("#hero-progress-fill").style.width = `${Math.max(0, Math.min(100, pct))}%`;
-      $("#hero-progress-pct").textContent = pct.toFixed(1);
-    } else {
-      $("#hero-progress-fill").style.width = "0%";
-      $("#hero-progress-pct").textContent = "—";
-    }
-    $("#hero-sim-time").textContent = status.simulation_time_completed_ns
-      ? status.simulation_time_completed_ns.toFixed(3) : "—";
-    $("#hero-elapsed").textContent = status.elapsed_wall_time_s
-      ? fmtDuration(status.elapsed_wall_time_s) : "—";
-    $("#hero-eta").textContent = computeETA(status);
-    $("#hero-step").textContent = status.current_step != null
-      ? `${status.current_step} / ${status.total_planned_steps ?? "—"}` : "—";
-  }
-
-  function fmtDuration(seconds) {
-    const s = Math.max(0, Math.floor(seconds));
-    const hh = Math.floor(s / 3600);
-    const mm = Math.floor((s % 3600) / 60);
-    const ss = s % 60;
-    return hh ? `${hh}h ${mm}m` : `${mm}m ${ss}s`;
-  }
-
-  function computeETA(status) {
-    if (!status.current_step || !status.total_planned_steps
-        || !status.elapsed_wall_time_s) return "—";
-    const total = status.total_planned_steps;
-    const elapsed = status.elapsed_wall_time_s;
-    const ratio = total / Math.max(status.current_step, 1);
-    return fmtDuration(elapsed * (ratio - 1));
+    const card = byId("hero-card");
+    if (card) card.setAttribute("data-state", String(status.status || "running").toLowerCase());
+    setText("hero-status-text", humanise(status.status || status.stage || "waiting"));
+    setText("hero-stage", status.stage || "—");
+    const pct = progressPercent(status);
+    setWidth("hero-progress-fill", pct);
+    setText("hero-progress-pct", pct != null ? pct.toFixed(1) : "—");
+    setText(
+      "hero-sim-time",
+      status.simulation_time_completed_ns != null
+        ? formatNumber(status.simulation_time_completed_ns, 3)
+        : "—"
+    );
+    setText(
+      "hero-elapsed",
+      status.elapsed_wall_time_s != null ? fmtDuration(status.elapsed_wall_time_s) : "—"
+    );
+    setText("hero-eta", computeETA(status));
+    setText(
+      "hero-step",
+      status.current_step != null
+        ? `${status.current_step} / ${status.total_planned_steps ?? "—"}`
+        : "—"
+    );
   }
 
   function renderHealth(health) {
-    const card = $("#hero-health");
-    const stateName = health.state || "unknown";
-    card.setAttribute("data-state", stateName);
-    $("#health-headline").textContent = health.message || stateName;
-    $("#health-explanation").textContent = health.explanation || "";
-    $("#health-pill").textContent = stateName;
-    $("#health-pill").setAttribute("data-state", stateName);
-    const items = (health.items || []).slice(0, 4);
-    const list = $("#health-list");
-    list.innerHTML = items.map((it) =>
-      `<li data-state="${escapeAttr(it.severity || "ok")}">
-        <strong>${escapeHTML(it.title || it.severity || "info")}</strong>
-        <span class="muted small"> — ${escapeHTML(it.detail || "")}</span>
-      </li>`
-    ).join("");
-    const livePill = $("#live-health-pill");
-    if (livePill) {
-      livePill.textContent = stateName;
-      livePill.setAttribute("data-state", stateName);
+    const stateName = String(health.state || "unknown").toLowerCase();
+    byId("hero-health")?.setAttribute("data-state", stateName);
+    setText("health-headline", health.message || humanise(stateName));
+    setText("health-explanation", health.explanation || "");
+    setText("health-pill", stateName);
+    byId("health-pill")?.setAttribute("data-state", stateName);
+
+    const list = byId("health-list");
+    if (list) {
+      const items = Array.isArray(health.items) ? health.items.slice(0, 4) : [];
+      list.innerHTML = items.map((item) => `
+        <li data-state="${escapeAttr(item.severity || "ok")}">
+          <strong>${escapeHTML(item.title || item.severity || "info")}</strong>
+          <span class="muted small"> — ${escapeHTML(item.detail || "")}</span>
+        </li>
+      `).join("");
     }
-    $("#live-health-message").textContent = health.message || "not available";
-    $("#live-health-explanation").textContent = health.explanation || "";
+    setText("live-health-pill", stateName);
+    byId("live-health-pill")?.setAttribute("data-state", stateName);
+    setText("live-health-message", health.message || "not available");
+    setText("live-health-explanation", health.explanation || "");
   }
 
   function renderStageTimeline(status) {
-    const map = {
-      setup: "setup", minimization: "minimization", nvt: "nvt",
-      npt: "npt", production: "production", analysis: "analysis",
-      report: "report", loading: "setup"
-    };
     const order = ["setup", "minimization", "nvt", "npt", "production", "analysis", "report"];
-    const current = (status.stage || "").toLowerCase();
-    const currentIdx = order.indexOf(map[current] || current);
-    $$(".stage-step").forEach((el) => {
-      const stage = el.getAttribute("data-stage");
-      const idx = order.indexOf(stage);
-      el.removeAttribute("data-state");
-      if (idx === -1) return;
-      if (idx < currentIdx) el.setAttribute("data-state", "completed");
-      else if (idx === currentIdx) el.setAttribute("data-state", "current");
-      else el.setAttribute("data-state", "waiting");
+    const phaseMap = {};
+    (state.results.phases || []).forEach((phase) => {
+      phaseMap[String(phase.name || "").toLowerCase()] = String(phase.status || "").toLowerCase();
+    });
+    const liveStates = status?.stage_states && typeof status.stage_states === "object"
+      ? status.stage_states : {};
+    const current = normaliseStage(status.stage);
+    const currentIndex = order.indexOf(current);
+    const simulationDone = isPhaseDone(phaseMap.simulation);
+
+    $$('.stage-step').forEach((element) => {
+      const stage = element.getAttribute("data-stage");
+      let stageState = phaseVisualState(liveStates[stage]);
+
+      // Older/completed runs may not have the new live stage map, so retain
+      // manifest-based fallback without overwriting a real current/failed state.
+      if (stageState === "waiting") {
+        if (stage === "setup") stageState = phaseVisualState(phaseMap.setup);
+        if (["minimization", "nvt", "npt", "production"].includes(stage) && simulationDone) {
+          stageState = "completed";
+        }
+        if (stage === "analysis") stageState = phaseVisualState(phaseMap.analysis);
+        if (stage === "report") stageState = phaseVisualState(phaseMap.report);
+      }
+
+      if (currentIndex >= 0 && stageState === "waiting") {
+        const index = order.indexOf(stage);
+        if (index < currentIndex) stageState = "completed";
+        if (index === currentIndex) stageState = "current";
+      }
+      if (stage === current && phaseVisualState(liveStates[stage]) === "current") {
+        stageState = "current";
+      }
+      element.setAttribute("data-state", stageState);
     });
   }
 
   function renderLiveProgress(status) {
-    let pct = null;
-    if (typeof status.progress_percent === "number") pct = status.progress_percent;
-    else if (status.current_step && status.total_planned_steps)
-      pct = (status.current_step / status.total_planned_steps) * 100;
-    if (pct !== null) {
-      $("#live-progress-fill").style.width = `${Math.max(0, Math.min(100, pct))}%`;
-      $("#live-progress-pct").textContent = pct.toFixed(1);
-    } else {
-      $("#live-progress-fill").style.width = "0%";
-      $("#live-progress-pct").textContent = "—";
-    }
-    $("#live-sim-time").textContent = status.simulation_time_completed_ns
-      ? status.simulation_time_completed_ns.toFixed(3) : "—";
-    $("#live-stage-cell").textContent = status.stage || "not available";
-    $("#live-step-cell").textContent = status.current_step != null ? String(status.current_step) : "not available";
-    $("#live-total-cell").textContent = status.total_planned_steps != null ? String(status.total_planned_steps) : "not available";
-    $("#live-frames-cell").textContent = status.current_frame_count != null
-      ? `${status.current_frame_count}${status.planned_frame_count != null ? ` / ${status.planned_frame_count}` : ""}`
-      : "not available";
-    $("#live-simtime-cell").textContent = status.simulation_time_completed_ns
-      ? `${status.simulation_time_completed_ns} ns` : "not available";
-    $("#live-elapsed-cell").textContent = status.elapsed_wall_time_s
-      ? fmtDuration(status.elapsed_wall_time_s) : "not available";
-    $("#live-eta-cell").textContent = computeETA(status);
-    $("#live-checkpoint-cell").textContent = status.current_checkpoint_path || "not available";
-    $("#live-lastupdate-cell").textContent = status.last_update_timestamp || "not available";
-    $("#live-card-step").textContent = status.current_step != null ? String(status.current_step) : "—";
+    const pct = progressPercent(status);
+    setWidth("live-progress-fill", pct);
+    setText("live-progress-pct", pct != null ? pct.toFixed(1) : "—");
+    setText(
+      "live-sim-time",
+      status.simulation_time_completed_ns != null
+        ? formatNumber(status.simulation_time_completed_ns, 3)
+        : "—"
+    );
+    setText("live-stage-cell", status.stage || "not available");
+    setText("live-step-cell", present(status.current_step));
+    setText("live-total-cell", present(status.total_planned_steps));
+    setText(
+      "live-frames-cell",
+      status.current_frame_count != null
+        ? `${status.current_frame_count}${status.planned_frame_count != null ? ` / ${status.planned_frame_count}` : ""}`
+        : "not available"
+    );
+    setText(
+      "live-simtime-cell",
+      status.simulation_time_completed_ns != null
+        ? `${formatNumber(status.simulation_time_completed_ns, 6)} ns`
+        : "not available"
+    );
+    setText(
+      "live-elapsed-cell",
+      status.elapsed_wall_time_s != null ? fmtDuration(status.elapsed_wall_time_s) : "not available"
+    );
+    setText("live-eta-cell", computeETA(status));
+    setText("live-checkpoint-cell", status.current_checkpoint_path || "not available");
+    setText("live-lastupdate-cell", formatTimestamp(status.last_update_timestamp));
+    setText("live-card-step", valueOrDash(status.current_step));
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Metrics and events                                                  */
+  /* ------------------------------------------------------------------ */
   function applyMetrics(metrics) {
-    state.metrics = metrics.slice(-chartHistorySamples);
+    state.metrics = (Array.isArray(metrics) ? metrics : [])
+      .map(normaliseMetricRow)
+      .slice(-chartHistorySamples);
     renderMetricCards();
-    if (window.FastMDXCharts) {
-      window.FastMDXCharts.update(state.metrics);
-    }
+    if (window.FastMDXCharts) window.FastMDXCharts.update(state.metrics);
+    emit("metrics-updated", {metrics: state.metrics});
+  }
+
+  function normaliseMetricRow(row) {
+    const output = Object.assign({}, row || {});
+    const aliases = {
+      potentialEnergy: "potential_energy",
+      kineticEnergy: "kinetic_energy",
+      totalEnergy: "total_energy",
+      simulationSpeed: "speed",
+      frame: "current_frame_count",
+      frames: "current_frame_count",
+    };
+    Object.keys(aliases).forEach((key) => {
+      if (output[aliases[key]] == null && output[key] != null) output[aliases[key]] = output[key];
+    });
+    return output;
   }
 
   function renderMetricCards() {
-    const latest = state.metrics.length ? state.metrics[state.metrics.length - 1] : {};
-    const map = {
-      potential_energy: {unit: "kJ/mol"},
-      temperature: {unit: "K"},
-      density: {unit: "g/mL"},
-      speed: {unit: "ns/day"},
-      frames: {unit: "frames"},
-      pressure: {unit: "bar"},
+    const latest = state.metrics[state.metrics.length - 1] || {};
+    const units = {
+      potential_energy: "kJ/mol",
+      temperature: "K",
+      density: "g/mL",
+      speed: "ns/day",
+      frames: "frames",
+      pressure: "bar",
     };
-    $$(".metric-card").forEach((card) => {
+    $$('.metric-card').forEach((card) => {
       const key = card.getAttribute("data-metric");
       const derived = deriveMetric(key, latest);
       const value = card.querySelector("[data-value]");
       const unit = card.querySelector(".metric-card-unit");
       if (value) value.textContent = derived != null ? derived : "—";
-      if (unit && map[key]) unit.textContent = map[key].unit;
-      if (derived !== card.getAttribute("data-last-value")) {
-        if (derived != null && card.getAttribute("data-last-value") != null) {
-          card.setAttribute("data-pulse", "");
-          setTimeout(() => card.removeAttribute("data-pulse"), 1200);
-        }
-        card.setAttribute("data-last-value", derived != null ? String(derived) : "");
+      if (unit && units[key]) unit.textContent = units[key];
+      const previous = card.getAttribute("data-last-value");
+      if (derived != null && previous && previous !== String(derived)) {
+        card.setAttribute("data-pulse", "");
+        window.setTimeout(() => card.removeAttribute("data-pulse"), 900);
       }
+      card.setAttribute("data-last-value", derived != null ? String(derived) : "");
     });
   }
 
   function deriveMetric(key, latest) {
     if (key === "frames") {
-      return latest.current_frame_count || latest.frame || null;
+      const value = firstPresent(
+        latest.current_frame_count,
+        state.status.current_frame_count,
+        state.simManifest.n_production_frames
+      );
+      return value != null ? String(value) : null;
     }
-    if (key === "speed") {
-      /* OpenMM reports ns/day via its reporter; flatten to a numeric.
-         If it's missing, we cannot honestly invent it. */
-      return latest.speed != null ? Number(latest.speed).toFixed(2) : null;
-    }
-    if (latest[key] === undefined) return null;
-    const v = Number(latest[key]);
-    return Number.isFinite(v) ? v.toFixed(2) : null;
+    const value = latest[key];
+    const number = Number(value);
+    if (!Number.isFinite(number)) return null;
+    if (key === "speed") return number.toFixed(2);
+    if (key === "density") return number.toFixed(4);
+    return number.toFixed(2);
   }
 
   function renderEvents(events) {
-    const ul = $("#events-list");
-    if (!ul) return;
-    const items = events.slice(-50).reverse();
-    ul.innerHTML = items.map((ev) => {
-      const level = ev.level || "info";
-      const ts = ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString([], {hour12:false}) : "";
-      return `<li data-level="${escapeAttr(level)}">
-        <span class="level-badge">${escapeHTML(level)}</span>
-        <span class="event-message">${escapeHTML(ev.message || "")}</span>
-        <span class="event-time">${escapeHTML(ts)}</span>
+    const list = byId("events-list");
+    if (!list) return;
+    const items = (Array.isArray(events) ? events : []).slice(-50).reverse();
+    list.innerHTML = items.length ? items.map((event) => `
+      <li data-level="${escapeAttr(event.level || "info")}">
+        <span class="level-badge">${escapeHTML(event.level || "info")}</span>
+        <span class="event-message">${escapeHTML(event.message || "")}</span>
+        <span class="event-time">${escapeHTML(formatEventTime(event.timestamp))}</span>
+      </li>
+    `).join("") : `
+      <li data-level="info">
+        <span class="level-badge">info</span>
+        <span class="event-message">No telemetry events were recorded.</span>
+        <span class="event-time"></span>
       </li>`;
-    }).join("") || '<li data-level="info"><span class="level-badge">info</span><span class="event-message">No events yet.</span><span class="event-time"></span></li>';
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Results / analyses / files                                          */
+  /* ------------------------------------------------------------------ */
   function applyResults(payload) {
-    state.results = payload;
+    state.results = payload || {};
+    state.outputDir = payload.output_dir || state.outputDir;
+    state.setupManifest = payload.setup || {};
+    state.simManifest = payload.simulation || {};
+    state.runTitle = (byId("setting-run-name")?.value || "").trim()
+      || payload.run_title
+      || state.runTitle;
+    state.runId = payload.system?.system || state.runId;
+
+    renderTopBar(state.status, state.health);
+    renderStageTimeline(state.status);
     renderAnalysis(payload);
     renderFiles(payload);
     renderRunSummary(payload);
-    window.dispatchEvent(new CustomEvent("dashboard:results-updated", {detail: payload}));
+    renderSimulationTab(state.structureInfo || {});
+    emit("results-updated", payload);
   }
 
   function renderAnalysis(payload) {
-    const grid = $("#analysis-grid");
-    const empty = $("#analysis-empty");
-    if (!grid) return;
-    const plots = payload.plots || [];
-    grid.innerHTML = "";
-    if (!plots.length) {
-      empty.removeAttribute("hidden");
-      return;
-    }
-    empty.setAttribute("hidden", "");
-    plots.forEach((plot) => {
-      const card = document.createElement("article");
-      card.className = "analysis-card";
-      card.setAttribute("data-state", (plot.mode || "artifact fallback").includes("dashboard") ? "complete" : "complete");
-      card.innerHTML = `
-        <div class="ac-header">
-          <div class="ac-title">${escapeHTML(plot.title || plot.name || "Analysis")}</div>
-          <div class="ac-status">${escapeHTML(plot.mode || "complete")}</div>
-        </div>
-        <div class="ac-frame"><img src="${escapeAttr(plot.href)}" alt="${escapeAttr(plot.title || "")}" loading="lazy"></div>
-        <div class="ac-body">${escapeHTML(plot.summary || plot.category || "")}</div>
-        <div class="ac-footer">
-          <a class="file-action" href="${escapeAttr(plot.href)}" download="${escapeAttr(plot.path || "")}">PNG</a>
-          <a class="file-action" href="${escapeAttr(plot.href)}" target="_blank" rel="noopener">Open</a>
-          <a class="file-action" href="/artifacts/${escapeAttr(plot.path || "")}" target="_blank" rel="noopener">Open raw</a>
-          <a class="file-action" href="/structure/topology.pdb" target="_blank" rel="noopener">Topology</a>
-        </div>
-      `;
-      grid.appendChild(card);
+    const grid = byId("analysis-grid");
+    const empty = byId("analysis-empty");
+    if (!grid || !empty) return;
+
+    const analyses = Array.isArray(payload.analyses) ? payload.analyses : [];
+    const plots = Array.isArray(payload.plots) ? payload.plots : [];
+    const cards = [];
+    const usedPlotPaths = new Set();
+
+    analyses.forEach((analysis) => {
+      const plot = analysis.plot || null;
+      if (plot?.path) usedPlotPaths.add(plot.path);
+      cards.push(analysisCardHtml(analysis, plot));
     });
+    plots.forEach((plot) => {
+      if (usedPlotPaths.has(plot.path)) return;
+      cards.push(analysisCardHtml({
+        name: plot.title,
+        title: plot.title,
+        status: "complete",
+        message: plot.category || "",
+        artifacts: [plot],
+      }, plot));
+    });
+
+    grid.innerHTML = cards.join("");
+    const svgBundle = byId("download-all-svg");
+    const svgCount = Number(payload.svg_figure_count || 0);
+    if (svgBundle) {
+      svgBundle.hidden = svgCount < 1;
+      svgBundle.href = payload.svg_bundle_href || "/analysis-figures-svg.zip";
+      svgBundle.textContent = svgCount === 1
+        ? "Download SVG figure"
+        : `Download all ${svgCount} SVG figures`;
+    }
+    const count = analyses.length || plots.length;
+    setText(
+      "analysis-meta",
+      count ? `${count} analysis output${count === 1 ? "" : "s"}` : "no analyses yet"
+    );
+    if (cards.length) empty.setAttribute("hidden", "");
+    else empty.removeAttribute("hidden");
+  }
+
+  function analysisCardHtml(analysis, plot) {
+    const status = String(analysis.status || "unknown").toLowerCase();
+    const title = analysis.title || humanise(analysis.name || "Analysis");
+    const artifacts = Array.isArray(analysis.artifacts) ? analysis.artifacts : [];
+    const imageArtifact = artifacts.find((item) => /\.(png|jpe?g|gif)$/i.test(item?.path || item?.name || ""));
+    const svgArtifact = artifacts.find((item) => /\.svg$/i.test(item?.path || item?.name || ""));
+    const displayPlot = plot?.href ? plot : imageArtifact || svgArtifact || null;
+    const vectorPlot = plot?.svg_href
+      ? {href: plot.svg_href, download_href: plot.svg_download_href}
+      : svgArtifact;
+    const dataArtifact = artifacts.find((item) => !/\.(png|jpe?g|gif|svg)$/i.test(item?.path || item?.name || ""));
+    const primary = dataArtifact || artifacts[0] || displayPlot;
+    const image = displayPlot?.href
+      ? `<div class="ac-frame"><img src="${escapeAttr(displayPlot.href)}" alt="${escapeAttr(title)}" loading="lazy"></div>`
+      : `<div class="ac-frame ac-no-plot"><div class="muted">No saved figure file was found for this analysis. Re-run the analysis with this revised version to generate PNG and SVG figures.</div></div>`;
+    const links = [];
+    if (displayPlot?.href) {
+      links.push(`<a class="file-action" href="${escapeAttr(displayPlot.href)}" target="_blank" rel="noopener">Open figure</a>`);
+      if (!/\.svg(?:$|\?)/i.test(displayPlot.href)) {
+        links.push(`<a class="file-action" href="${escapeAttr(displayPlot.download_href || `${displayPlot.href}${displayPlot.href.includes("?") ? "&" : "?"}download=1`)}" download>Download PNG</a>`);
+      }
+    }
+    if (vectorPlot?.href) {
+      links.push(`<a class="file-action" href="${escapeAttr(vectorPlot.download_href || vectorPlot.href)}" download>Download SVG</a>`);
+    }
+    if (primary?.href && primary?.href !== displayPlot?.href && primary?.href !== vectorPlot?.href) {
+      links.push(`<a class="file-action" href="${escapeAttr(primary.href)}" target="_blank" rel="noopener">Open data</a>`);
+    }
+    return `
+      <article class="analysis-card" data-state="${escapeAttr(status)}">
+        <div class="ac-header">
+          <div class="ac-title">${escapeHTML(title)}</div>
+          <div class="ac-status">${escapeHTML(status)}</div>
+        </div>
+        ${image}
+        <div class="ac-body">${escapeHTML(analysis.message || plot?.category || "")}</div>
+        <div class="ac-footer">${links.join("") || '<span class="muted small">Artifacts will appear when available.</span>'}</div>
+      </article>`;
   }
 
   function renderFiles(payload) {
+    const artifacts = Array.isArray(payload.artifacts) ? payload.artifacts : [];
     const groups = {
-      reports: payload.reports || [],
-      simulation: (payload.artifacts || []).filter((a) =>
-        a.path.startsWith("simulation/")),
-      analysis: (payload.artifacts || []).filter((a) =>
-        a.path.startsWith("analysis/")),
+      "reports-files": Array.isArray(payload.reports) ? payload.reports : artifacts.filter((item) => item.path.startsWith("report/")),
+      "simulation-files": artifacts.filter((item) => item.path.startsWith("simulation/")),
+      "analysis-files": artifacts.filter((item) => item.path.startsWith("analysis/")),
     };
-    Object.keys(groups).forEach((key) => {
-      const root = $(`#${key.replace(/^./, (c) => key === "reports" ? "reports" : key)}-files`);
+    Object.entries(groups).forEach(([id, files]) => {
+      const root = byId(id);
       if (!root) return;
-      const list = groups[key];
-      root.innerHTML = list.length ? list.map(fileRowHtml).join("") :
-        `<div class="muted small">No ${key} files yet.</div>`;
+      root.innerHTML = files.length
+        ? files.map(fileRowHtml).join("")
+        : '<div class="muted small">No files are available in this section yet.</div>';
     });
-    wireFileActions();
+    wireCopyActions();
   }
 
-  function fileRowHtml(a) {
-    const title = humaniseFile(a.path, a.name);
-    const size = a.size ? humanSize(parseInt(a.size, 10)) : "—";
-    const mtime = a.mtime ? new Date(parseInt(a.mtime, 10) * 1000).toLocaleString() : "—";
-    return `<div class="file-row" data-href="${escapeAttr(a.href)}" data-path="${escapeAttr(a.path)}">
-      <div class="file-title" title="${escapeAttr(a.path)}">${escapeHTML(title)}</div>
-      <div class="file-meta">
-        <span>${escapeHTML(size)}</span>
-        <span class="muted">${escapeHTML(mtime)}</span>
-        <div class="file-actions">
-          <button class="file-action" data-action="open">Open</button>
-          <button class="file-action" data-action="download">Download</button>
-          <button class="file-action" data-action="copy">Copy path</button>
+  function fileRowHtml(file) {
+    const title = file.name || file.path || "Artifact";
+    const size = file.size != null ? humanSize(parseInt(file.size, 10)) : "—";
+    const mtime = file.mtime != null
+      ? new Date(parseFloat(file.mtime) * 1000).toLocaleString()
+      : "—";
+    const href = file.href || `/artifacts/${encodeURI(file.path || "")}`;
+    const downloadHref = file.download_href || `${href}${href.includes("?") ? "&" : "?"}download=1`;
+    return `
+      <div class="file-row" data-path="${escapeAttr(file.absolute_path || file.path || "")}">
+        <div class="file-title" title="${escapeAttr(file.path || "")}">${escapeHTML(title)}</div>
+        <div class="file-meta">
+          <span>${escapeHTML(size)}</span>
+          <span class="muted">${escapeHTML(mtime)}</span>
+          <div class="file-actions">
+            <a class="file-action" href="${escapeAttr(href)}" target="_blank" rel="noopener">Open</a>
+            <a class="file-action" href="${escapeAttr(downloadHref)}" download>Download</a>
+            <button class="file-action" type="button" data-copy-path>Copy path</button>
+          </div>
         </div>
-      </div>
-    </div>`;
+      </div>`;
   }
 
-  function humaniseFile(path, name) {
-    if (!name) return path;
-    return name;
-  }
-
-  function humanSize(bytes) {
-    if (!Number.isFinite(bytes)) return "—";
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
-    return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
-  }
-
-  function wireFileActions() {
-    $$(".file-row").forEach((row) => {
-      row.querySelectorAll(".file-action").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          const action = btn.getAttribute("data-action");
-          const href = row.getAttribute("data-href");
-          const path = row.getAttribute("data-path");
-          if (action === "open") window.open(href, "_blank");
-          if (action === "download") {
-            const a = document.createElement("a");
-            a.href = href; a.download = path;
-            document.body.appendChild(a); a.click(); a.remove();
-          }
-          if (action === "copy" && navigator.clipboard) {
-            navigator.clipboard.writeText(path || "").catch(() => {});
-          }
-        });
+  function wireCopyActions() {
+    $$('[data-copy-path]').forEach((button) => {
+      button.addEventListener("click", async () => {
+        const row = button.closest(".file-row");
+        const path = row?.getAttribute("data-path") || "";
+        const copied = await copyText(path);
+        showToast(copied ? "File path copied." : "Could not copy the file path.", copied ? "ok" : "warning");
       });
     });
   }
 
   function renderRunSummary(payload) {
-    const card = $("#summary-card");
+    const card = byId("summary-card");
     if (!card) return;
-    if (!payload.has_report && !payload.has_analysis) {
-      card.setAttribute("hidden", "");
-      return;
-    }
-    card.removeAttribute("hidden");
-    const plots = payload.plots || [];
-    const reports = payload.reports || [];
-    const analyses = (payload.artifacts || []).filter((a) => a.path.startsWith("analysis/"));
+    const analyses = Array.isArray(payload.analyses) ? payload.analyses : [];
+    const plots = Array.isArray(payload.plots) ? payload.plots : [];
+    const reports = Array.isArray(payload.reports) ? payload.reports : [];
+    const hasResults = payload.has_report || payload.has_analysis || reports.length || analyses.length;
+    card.hidden = !hasResults;
+    if (!hasResults) return;
     const stats = [
-      {label: "Analyses", value: analyses.length.toString()},
-      {label: "Figures", value: plots.length.toString()},
-      {label: "Report formats", value: reports.length.toString()},
-      {label: "Result bundle", value: reports.some((r) => r.path.includes("bundle")) ? "ready" : "—"},
+      {label: "Analyses", value: String(analyses.length)},
+      {label: "Figures", value: String(plots.length)},
+      {label: "Report formats", value: String(reports.length)},
+      {label: "Result bundle", value: reports.some((item) => item.path?.endsWith(".zip")) ? "ready" : "—"},
     ];
-    $("#summary-grid").innerHTML = stats.map((s) => `
+    const grid = byId("summary-grid");
+    if (grid) grid.innerHTML = stats.map((item) => `
       <div class="summary-stat">
-        <span class="summary-stat-label">${escapeHTML(s.label)}</span>
-        <span class="summary-stat-value">${escapeHTML(s.value)}</span>
-      </div>
-    `).join("");
+        <span class="summary-stat-label">${escapeHTML(item.label)}</span>
+        <span class="summary-stat-value">${escapeHTML(item.value)}</span>
+      </div>`).join("");
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Structure and playback                                              */
+  /* ------------------------------------------------------------------ */
   function applyStructure(info) {
-    state.structureInfo = info;
-    renderStructureTab(info);
-    if (info.ligand_resnames && info.ligand_resnames.length && !state.ligandResname) {
-      state.ligandResname = info.ligand_resnames[0];
+    state.structureInfo = info || {};
+    renderStructureTab(state.structureInfo);
+    if (state.structureInfo.ligand_resnames?.length && !state.ligandResname) {
+      state.ligandResname = state.structureInfo.ligand_resnames[0];
     }
-    renderLigandTab(info);
-    renderSimulationTab(info);
-    window.dispatchEvent(new CustomEvent("dashboard:structure-updated", {detail: info}));
+    renderLigandTab(state.structureInfo);
+    renderSimulationTab(state.structureInfo);
+    emit("structure-updated", state.structureInfo);
   }
 
   function renderStructureTab(info) {
-    const tbody = $("#structure-tab-tbody");
-    if (!tbody) return;
-    if (!info || !info.valid) {
-      tbody.innerHTML = `<tr><td colspan="2" class="muted">Structure not available yet.</td></tr>`;
+    const body = byId("structure-tab-tbody");
+    if (!body) return;
+    if (!info?.valid) {
+      const reason = info?.reason ? ` (${humanise(info.reason)})` : "";
+      body.innerHTML = `<tr><td colspan="2" class="muted">Structure metadata is not available${escapeHTML(reason)}.</td></tr>`;
       return;
     }
-    tbody.innerHTML = `
-      <tr><th>Protein chains</th><td>${info.n_chains}</td></tr>
-      <tr><th>Protein residues</th><td>${info.protein_residues}</td></tr>
-      <tr><th>Protein atoms</th><td>${info.protein_atoms}</td></tr>
-      <tr><th>Ligands</th><td>${info.ligand_resnames.join(", ") || "none"}</td></tr>
-      <tr><th>Water</th><td>${info.water_residues}</td></tr>
-      <tr><th>Ions</th><td>${info.ions}</td></tr>
-    `;
+    body.innerHTML = `
+      <tr><th>Protein chains</th><td>${escapeHTML(info.n_chains)}</td></tr>
+      <tr><th>Protein residues</th><td>${escapeHTML(info.protein_residues)}</td></tr>
+      <tr><th>Protein atoms</th><td>${escapeHTML(info.protein_atoms)}</td></tr>
+      <tr><th>Ligands</th><td>${escapeHTML((info.ligand_resnames || []).join(", ") || "none")}</td></tr>
+      <tr><th>Water</th><td>${escapeHTML(info.water_residues)}</td></tr>
+      <tr><th>Ions</th><td>${escapeHTML(info.ions)}</td></tr>`;
   }
 
-  function renderSimulationTab(info) {
-    const tbody = $("#simulation-tab-tbody");
-    if (!tbody) return;
-    const s = state.status || {};
-    const sim = state.simManifest || {};
-    tbody.innerHTML = `
-      <tr><th>Force field</th><td>${s.force_field || sim.force_field || "—"}</td></tr>
-      <tr><th>Water model</th><td>${s.water_model || sim.water_model || "—"}</td></tr>
-      <tr><th>pH</th><td>${s.ph || sim.ph || "—"}</td></tr>
-      <tr><th>Ion concentration</th><td>${sim.ion_concentration_M != null ? sim.ion_concentration_M + " M" : "—"}</td></tr>
-      <tr><th>Temperature</th><td>${s.target_temperature_K != null ? s.target_temperature_K + " K" : "—"}</td></tr>
-      <tr><th>Timestep</th><td>${s.timestep_fs != null ? s.timestep_fs + " fs" : "—"}</td></tr>
-      <tr><th>Precision</th><td>${s.precision || "—"}</td></tr>
-      <tr><th>Platform</th><td>${s.platform || "—"}</td></tr>
-    `;
+  function renderSimulationTab() {
+    const body = byId("simulation-tab-tbody");
+    if (!body) return;
+    const setup = state.setupManifest || {};
+    const simulation = state.simManifest || {};
+    const status = state.status || {};
+    body.innerHTML = `
+      <tr><th>Force field</th><td>${escapeHTML(setup.force_field || status.force_field || "—")}</td></tr>
+      <tr><th>Water model</th><td>${escapeHTML(setup.water_model || status.water_model || "—")}</td></tr>
+      <tr><th>pH</th><td>${escapeHTML(setup.ph ?? "—")}</td></tr>
+      <tr><th>Ion concentration</th><td>${escapeHTML(setup.ion_concentration_M != null ? `${setup.ion_concentration_M} M` : "—")}</td></tr>
+      <tr><th>Temperature</th><td>${escapeHTML(firstPresent(status.target_temperature_K, simulation.temperature_K) != null ? `${firstPresent(status.target_temperature_K, simulation.temperature_K)} K` : "—")}</td></tr>
+      <tr><th>Timestep</th><td>${escapeHTML(firstPresent(status.timestep_fs, simulation.timestep_fs) != null ? `${firstPresent(status.timestep_fs, simulation.timestep_fs)} fs` : "—")}</td></tr>
+      <tr><th>Precision</th><td>${escapeHTML(simulation.precision || status.precision || "—")}</td></tr>
+      <tr><th>Platform</th><td>${escapeHTML(status.platform || simulation.platform || "—")}</td></tr>`;
   }
 
   function renderLigandTab(info) {
-    const tools = $("#ligand-tools");
-    const meta = $("#ligand-meta");
-    if (!tools || !meta) return;
-    if (!state.ligandResname || (info && !info.valid)) {
-      tools.setAttribute("hidden", "");
+    const tools = byId("ligand-tools");
+    const meta = byId("ligand-meta");
+    const body = byId("ligand-tab-tbody");
+    if (!tools || !meta || !body) return;
+    const instances = Array.isArray(info?.ligand_instances) ? info.ligand_instances : [];
+    const instance = instances.find((item) => item.resname === state.ligandResname) || instances[0];
+    if (!instance) {
+      tools.hidden = true;
       meta.textContent = "not available";
+      body.innerHTML = '<tr><td colspan="2" class="muted">No ligand was detected.</td></tr>';
       return;
     }
-    tools.removeAttribute("hidden");
-    const ins = (info && info.ligand_instances || []).find(
-      (i) => i.resname === state.ligandResname) || (info && info.ligand_instances || [])[0];
-    if (!ins) {
-      meta.textContent = "—";
-      return;
-    }
-    const atoms = (info && info.atoms_by_resname && info.atoms_by_resname[state.ligandResname]) || "—";
-    meta.textContent =
-      `${state.ligandResname} · chain ${ins.chain} · resi ${ins.resi} · ${atoms} atoms`;
-    const tbody = $("#ligand-tab-tbody");
-    if (!tbody) return;
-    tbody.innerHTML = `
-      <tr><th>Ligand</th><td>${escapeHTML(state.ligandResname)}</td></tr>
-      <tr><th>Chain</th><td>${escapeHTML(ins.chain || "—")}</td></tr>
-      <tr><th>Residue ID</th><td>${escapeHTML(ins.resi || "—")}</td></tr>
-      <tr><th>Atom count</th><td>${escapeHTML(String(atoms))}</td></tr>
-      <tr><th>Nearby residues</th><td>—</td></tr>
-      <tr><th>Pocket distance</th><td>—</td></tr>
-      <tr><th>H-bonds</th><td>—</td></tr>
-      <tr><th>Hydrophobic contacts</th><td>—</td></tr>
-      <tr><th>Salt bridges</th><td>—</td></tr>
-    `;
+    tools.hidden = false;
+    const residueName = instance.resname || state.ligandResname;
+    const atoms = info?.atoms_by_resname?.[residueName] ?? "—";
+    state.ligandResname = residueName;
+    meta.textContent = `${residueName} · chain ${instance.chain || "—"} · resi ${instance.resi || "—"} · ${atoms} atoms`;
+    body.innerHTML = `
+      <tr><th>Ligand</th><td>${escapeHTML(residueName)}</td></tr>
+      <tr><th>Chain</th><td>${escapeHTML(instance.chain || "—")}</td></tr>
+      <tr><th>Residue ID</th><td>${escapeHTML(instance.resi || "—")}</td></tr>
+      <tr><th>Atom count</th><td>${escapeHTML(atoms)}</td></tr>
+      <tr><th>Nearby residues</th><td>Use “Show pocket residues”</td></tr>
+      <tr><th>Pocket distance</th><td>${escapeHTML(state.bindingPocketCutoff)} Å cutoff</td></tr>
+      <tr><th>H-bonds</th><td>Requires analysis output</td></tr>
+      <tr><th>Hydrophobic contacts</th><td>Requires analysis output</td></tr>
+      <tr><th>Salt bridges</th><td>Requires analysis output</td></tr>`;
   }
 
   function applyPlayback(payload) {
-    state.playbackAvailable = !!payload.playback_available;
-    state.playbackFrames = payload.n_frames_browser || 0;
-    state.playbackTotalFrames = payload.n_frames_total || 0;
-    const slider = $("#traj-slider");
-    if (state.playbackAvailable) {
-      slider.max = String(Math.max(0, state.playbackFrames - 1));
-      $("#traj-total").textContent = String(state.playbackFrames);
-      $("#traj-current").textContent = slider.value;
-      const simNs = payload.frame_times_ns && payload.frame_times_ns[0];
-      $("#traj-simtime").textContent = simNs != null ? simNs.toFixed(3) : "—";
-      $("#trajectory-row").removeAttribute("hidden");
-      window.dispatchEvent(new CustomEvent("dashboard:playback-ready", {detail: payload}));
-    } else {
-      $("#trajectory-row").setAttribute("hidden", "");
-      if (payload.reason) {
-        const reason = $("#analysis-empty .empty-detail");
-        if (reason) reason.textContent = `Trajectory playback is unavailable (${payload.reason}).`;
+    const previousSignature = state.playbackSignature;
+    const signature = payload?.source_signature || payload?.compiled_at || null;
+    const previousFrame = parseInt(byId("traj-slider")?.value || "0", 10) || 0;
+
+    state.playbackAvailable = !!payload?.playback_available;
+    state.playbackFrames = Number(payload?.n_frames_browser || 0);
+    state.playbackTotalFrames = Number(payload?.n_frames_total || 0);
+    state.playbackFrameTimes = Array.isArray(payload?.frame_times_ns) ? payload.frame_times_ns : [];
+    state.playbackSignature = signature;
+
+    const slider = byId("traj-slider");
+    const row = byId("trajectory-row");
+    if (!slider || !row) return;
+    if (!state.playbackAvailable) {
+      row.hidden = true;
+      emit("playback-ready", payload || {});
+      return;
+    }
+
+    const maxFrame = Math.max(0, state.playbackFrames - 1);
+    const frame = Math.min(previousFrame, maxFrame);
+    slider.min = "0";
+    slider.max = String(maxFrame);
+    // Do not reset the user's scrubber on every three-second API poll.
+    slider.value = String(frame);
+    setText("traj-current", String(frame));
+    setText("traj-total", String(state.playbackFrames));
+    setText(
+      "traj-simtime",
+      state.playbackFrameTimes[frame] != null
+        ? formatNumber(state.playbackFrameTimes[frame], 3) : "—"
+    );
+    row.hidden = false;
+    emit("playback-ready", Object.assign({}, payload, {
+      source_changed: previousSignature !== null && previousSignature !== signature,
+    }));
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Helpers                                                             */
+  /* ------------------------------------------------------------------ */
+  function progressPercent(status) {
+    if (Number.isFinite(Number(status.progress_percent))) {
+      return clampFloat(Number(status.progress_percent), 0, 100, null);
+    }
+    if (status.current_step != null && status.total_planned_steps != null && Number(status.total_planned_steps) > 0) {
+      return clampFloat(Number(status.current_step) / Number(status.total_planned_steps) * 100, 0, 100, null);
+    }
+    return null;
+  }
+
+  function fmtDuration(seconds) {
+    const total = Math.max(0, Math.floor(Number(seconds) || 0));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const secs = total % 60;
+    return hours ? `${hours}h ${minutes}m` : `${minutes}m ${secs}s`;
+  }
+
+  function computeETA(status) {
+    const step = Number(status.current_step);
+    const total = Number(status.total_planned_steps);
+    const elapsed = Number(status.elapsed_wall_time_s);
+    if (!(step > 0) || !(total > 0) || !(elapsed >= 0) || step >= total) return step >= total ? "0m 0s" : "—";
+    return fmtDuration(elapsed * (total / step - 1));
+  }
+
+  function normaliseStage(value) {
+    const stage = String(value || "").toLowerCase();
+    if (stage.includes("minim")) return "minimization";
+    if (stage.includes("nvt")) return "nvt";
+    if (stage.includes("npt")) return "npt";
+    if (stage.includes("production")) return "production";
+    if (stage.includes("analysis")) return "analysis";
+    if (stage.includes("report")) return "report";
+    if (stage.includes("setup") || stage.includes("loading")) return "setup";
+    return stage;
+  }
+
+  function phaseVisualState(value) {
+    const status = String(value || "").toLowerCase();
+    if (["ok", "complete", "completed", "success", "succeeded"].includes(status)) return "completed";
+    if (["error", "failed"].includes(status)) return "failed";
+    if (["skipped", "not run"].includes(status)) return "skipped";
+    if (["running", "active", "current"].includes(status)) return "current";
+    return "waiting";
+  }
+
+  function isPhaseDone(value) {
+    return ["ok", "complete", "completed", "success"].includes(String(value || "").toLowerCase());
+  }
+
+  function formatTimestamp(value) {
+    if (!value) return "not available";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+  }
+
+  function formatEventTime(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime())
+      ? String(value)
+      : date.toLocaleTimeString([], {hour12: false});
+  }
+
+  function formatNumber(value, digits) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toFixed(digits) : String(value ?? "—");
+  }
+
+  function firstPresent(...values) {
+    return values.find((value) => value !== null && value !== undefined && value !== "");
+  }
+
+  function present(value) {
+    return value !== null && value !== undefined && value !== "" ? String(value) : "not available";
+  }
+
+  function valueOrDash(value) {
+    return value !== null && value !== undefined && value !== "" ? String(value) : "—";
+  }
+
+  function setText(id, value) {
+    const element = byId(id);
+    if (element) element.textContent = value == null ? "" : String(value);
+  }
+
+  function setClassName(id, value) {
+    const element = byId(id);
+    if (element) element.className = value;
+  }
+
+  function setWidth(id, value) {
+    const element = byId(id);
+    if (element) element.style.width = value == null ? "0%" : `${Math.max(0, Math.min(100, value))}%`;
+  }
+
+  function humanSize(bytes) {
+    if (!Number.isFinite(bytes)) return "—";
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(2)} MB`;
+    return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  }
+
+  function humanise(value) {
+    return String(value || "")
+      .replace(/[_-]+/g, " ")
+      .replace(/\b\w/g, (character) => character.toUpperCase());
+  }
+
+  async function copyText(text) {
+    if (!text) return false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
       }
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      const ok = document.execCommand("copy");
+      textarea.remove();
+      return ok;
+    } catch (error) {
+      return false;
     }
   }
 
-  /* ---------------------------------------------- *
-   * Tiny utility helpers                          *
-   * ---------------------------------------------- */
-  function escapeHTML(s) {
-    return String(s).replace(/[&<>"']/g,
-      (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+  function showToast(message, kind) {
+    let toast = byId("dashboard-toast");
+    if (!toast) {
+      toast = document.createElement("div");
+      toast.id = "dashboard-toast";
+      toast.className = "dashboard-toast";
+      toast.setAttribute("role", "status");
+      document.body.appendChild(toast);
+    }
+    toast.textContent = message;
+    toast.setAttribute("data-kind", kind || "ok");
+    toast.classList.add("show");
+    window.clearTimeout(showToast.timer);
+    showToast.timer = window.setTimeout(() => toast.classList.remove("show"), 3500);
   }
 
-  function escapeAttr(s) {
-    return escapeHTML(s);
+  function escapeHTML(value) {
+    return String(value == null ? "" : value).replace(/[&<>"']/g, (character) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    })[character]);
   }
 
-  function clampInt(v, lo, hi, fallback) {
-    v = parseInt(v, 10);
-    if (!Number.isFinite(v)) return fallback;
-    return Math.max(lo, Math.min(hi, v));
-  }
-  function clampFloat(v, lo, hi, fallback) {
-    v = parseFloat(v);
-    if (!Number.isFinite(v)) return fallback;
-    return Math.max(lo, Math.min(hi, v));
+  function escapeAttr(value) {
+    return escapeHTML(value);
   }
 
-  /* Expose state read-only for sibling JS modules */
+  function clampInt(value, low, high, fallback) {
+    const number = parseInt(value, 10);
+    if (!Number.isFinite(number)) return fallback;
+    return Math.max(low, Math.min(high, number));
+  }
+
+  function clampFloat(value, low, high, fallback) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return fallback;
+    return Math.max(low, Math.min(high, number));
+  }
+
+  function emit(name, detail) {
+    window.dispatchEvent(new CustomEvent(`dashboard:${name}`, {detail}));
+  }
+
   window.FastMDXDashboard = {
     get state() { return JSON.parse(JSON.stringify(state)); },
     navigate,
@@ -780,8 +1090,7 @@
     applyPlayback,
     applyResults,
     on(eventName, handler) {
-      window.addEventListener("dashboard:" + eventName, (ev) => handler(ev.detail));
+      window.addEventListener(`dashboard:${eventName}`, (event) => handler(event.detail));
     },
   };
-
-})();
+}());

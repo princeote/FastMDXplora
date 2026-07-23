@@ -8,11 +8,16 @@ and caches the result.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import mimetypes
+import os
+import subprocess
+import sys
 import threading
 import time
+import zipfile
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -120,6 +125,7 @@ class DashboardConfig:
     include_cofactors: bool = False
     binding_pocket_cutoff_A: float = 5.0
     max_browser_frames: int = 200
+    refresh_seconds: float = 3.0
 
     @property
     def binding_pocket_cutoff_m(self) -> float:
@@ -165,6 +171,8 @@ def make_handler(
     root = Path(project_root).resolve()
     cfg = config or DashboardConfig()
     html = template_html if template_html is not None else _load_template()
+    refresh_seconds = min(60.0, max(1.0, float(cfg.refresh_seconds or 3.0)))
+    html = html.replace("__FASTMDX_REFRESH_SECONDS__", f"{refresh_seconds:g}")
 
     class LiveDashboardHandler(BaseHTTPRequestHandler):
         server_version = "FastMDXLive/1.0"
@@ -228,16 +236,25 @@ def make_handler(
                     except ValueError:
                         pass
                 force = "force=1" in parsed.query
-                manifest = _load_json(root / "manifest.json")
-                duration_ns = (manifest.get("simulation") or {}).get(
-                    "duration_ns_actual"
-                )
+                sim_manifest = _load_json(root / "simulation" / "simulation_parameters.json")
+                duration_ns = sim_manifest.get("duration_ns_actual")
                 self._send_json(playback_info(
                     root,
                     max_browser_frames=max_frames,
                     simulation_time_ns_total=duration_ns,
                     force=force,
                 ))
+                return
+            if path == "/api/open-output":
+                opened, detail = _open_local_path(root)
+                self._send_json({
+                    "opened": opened,
+                    "path": str(root),
+                    "detail": detail,
+                })
+                return
+            if path == "/analysis-figures-svg.zip":
+                self._send_svg_bundle(root)
                 return
             if path == "/structure/topology.pdb":
                 self._send_structure(root)
@@ -252,7 +269,11 @@ def make_handler(
                 self._send_static_asset(path.removeprefix("/static/"))
                 return
             if path.startswith("/artifacts/"):
-                self._send_artifact(root, path.removeprefix("/artifacts/"))
+                self._send_artifact(
+                    root,
+                    path.removeprefix("/artifacts/"),
+                    download="download=1" in parsed.query,
+                )
                 return
             self.send_error(404, "Not found")
 
@@ -278,7 +299,13 @@ def make_handler(
             self.end_headers()
             self.wfile.write(body)
 
-        def _send_artifact(self, root: Path, raw_rel: str) -> None:
+        def _send_artifact(
+            self,
+            root: Path,
+            raw_rel: str,
+            *,
+            download: bool = False,
+        ) -> None:
             try:
                 target = (root / unquote(raw_rel)).resolve()
                 target.relative_to(root)
@@ -293,6 +320,38 @@ def make_handler(
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Cache-Control", "no-store")
+            if download:
+                safe_name = target.name.replace('"', "")
+                self.send_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{safe_name}"',
+                )
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _send_svg_bundle(self, root: Path) -> None:
+            """Download every generated SVG analysis/report figure as one ZIP."""
+            svg_paths = _svg_figure_paths(root)
+            if not svg_paths:
+                self.send_error(404, "No SVG figures are available yet")
+                return
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for source in svg_paths:
+                    try:
+                        relative = source.relative_to(root).as_posix()
+                        archive.write(source, arcname=relative)
+                    except (OSError, ValueError):
+                        continue
+            data = buffer.getvalue()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header(
+                "Content-Disposition",
+                'attachment; filename="fastmdxplora_svg_figures.zip"',
+            )
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -351,13 +410,12 @@ def make_handler(
             self.wfile.write(data)
 
         def _send_static_asset(self, raw_name: str) -> None:
-            name = Path(unquote(raw_name)).name
             static_root = Path(__file__).with_name("static")
-            target = (static_root / name).resolve()
+            target = (static_root / unquote(raw_name)).resolve()
             try:
                 target.relative_to(static_root.resolve())
             except ValueError:
-                self.send_error(403, "Static asset path is outside the asset directory")
+                self.send_error(404, "Static asset not found")
                 return
             if not target.is_file():
                 self.send_error(404, "Static asset not found")
@@ -481,9 +539,13 @@ def _artifact_records(root: Path) -> list[dict[str, str]]:
                 "path": rel,
                 "name": path.name,
                 "href": f"/artifacts/{rel}?v={int(path.stat().st_mtime)}",
+                "download_href": (
+                    f"/artifacts/{rel}?download=1&v={int(path.stat().st_mtime)}"
+                ),
                 "size": str(path.stat().st_size),
                 "mtime": str(path.stat().st_mtime),
                 "display_path": _compact_path(rel),
+                "absolute_path": str(path.resolve()),
             }
         )
     return records
@@ -503,26 +565,36 @@ def _results_payload(root: Path) -> dict[str, Any]:
     analysis_manifest = _load_json(root / "analysis" / "analysis_manifest.json")
     sim_manifest = _load_json(root / "simulation" / "simulation_parameters.json")
     plots = _plot_records(artifacts)
-    report_paths = [
-        "report/report.md",
-        "report/slides.pptx",
-        "report/project_bundle.zip",
-        "report/dashboard.html",
-        "analysis/analysis_manifest.json",
+    report_suffixes = {".md", ".html", ".htm", ".pdf", ".pptx", ".zip"}
+    reports = [
+        record
+        for record in artifacts
+        if record["path"].startswith("report/")
+        and len(Path(record["path"]).parts) == 2
+        and Path(record["path"]).suffix.lower() in report_suffixes
     ]
-    reports = [by_path[path] for path in report_paths if path in by_path]
+    reports.sort(key=lambda record: _report_order(record["path"]))
     dashboard = by_path.get("report/dashboard.html")
     summary = _summary_records(root, manifest, analysis_manifest, sim_manifest)
+    setup_manifest = _load_json(root / "setup" / "setup_parameters.json")
+    system = _system_info(root, manifest, analysis_manifest, sim_manifest)
     return {
         "refreshed_at": _iso_now(),
         "has_analysis": any(record["path"].startswith("analysis/") for record in artifacts),
         "has_report": any(record["path"].startswith("report/") for record in artifacts),
+        "output_dir": str(root),
+        "run_title": _run_title(root, manifest),
         "summary": summary,
-        "system": _system_info(root, manifest, analysis_manifest, sim_manifest),
+        "system": system,
+        "setup": _setup_details(setup_manifest),
+        "simulation": _simulation_details(sim_manifest, read_status(root)),
         "phases": _phase_records(manifest),
+        "analyses": _analysis_records(analysis_manifest, artifacts, plots),
         "dashboard": dashboard,
         "plots": plots,
         "key_plots": [plot for plot in plots if plot["title"] in KEY_PLOT_TITLES][:6],
+        "svg_figure_count": len(_svg_figure_paths(root)),
+        "svg_bundle_href": "/analysis-figures-svg.zip",
         "reports": reports,
         "artifacts": artifacts,
     }
@@ -541,9 +613,23 @@ def _structure_info_payload(
         }
     info = count_structure(structure_path)
     if not info.get("valid"):
-        return dict(info, ligand_resnames=[], ligand_instances=[])
+        return dict(
+            info,
+            structure_available=True,
+            structure_url="/structure/topology.pdb",
+            ligand_resnames=[],
+            ligand_instances=[],
+        )
     info["atoms_by_resname"] = ligand_atom_counts(structure_path)
     info["explicit_ligand"] = config.ligand_resname
+    try:
+        info["structure_path"] = structure_path.relative_to(root).as_posix()
+    except ValueError:
+        info["structure_path"] = structure_path.as_posix()
+    info["structure_url"] = (
+        f"/structure/topology.pdb?v={int(structure_path.stat().st_mtime_ns)}"
+    )
+    info["structure_available"] = True
     return info
 
 
@@ -563,8 +649,9 @@ def _ligands_payload(
             # second PDB walk we accept that callers that want full
             # ligand IDs receive them via /api/structure-info.
             (
-                (ins.chain, ins.resname, ins.resi)
+                (str(ins.get("chain", "A")), str(ins.get("resname", "")), str(ins.get("resi", "")))
                 for ins in info.get("ligand_instances", [])
+                if isinstance(ins, dict)
             ),
             explicit=explicit,
             include_cofactors=config.include_cofactors,
@@ -611,20 +698,44 @@ def _summary_records(
     analysis_manifest: dict[str, Any],
     sim_manifest: dict[str, Any],
 ) -> list[dict[str, str]]:
-    status = str(manifest.get("status") or "not available")
-    frames = analysis_manifest.get("n_frames") or sim_manifest.get("n_production_frames")
+    phase_statuses = [
+        str(item.get("status") or "unknown").lower()
+        for item in manifest.get("phases", [])
+        if isinstance(item, dict)
+    ]
+    if phase_statuses and all(value in {"ok", "completed", "skipped"} for value in phase_statuses):
+        status = "completed"
+    elif any(value in {"error", "failed"} for value in phase_statuses):
+        status = "failed"
+    elif phase_statuses:
+        status = "in progress"
+    else:
+        status = "not available"
+    frames = _first_present(
+        analysis_manifest.get("n_frames"),
+        sim_manifest.get("n_production_frames"),
+    )
     atoms = analysis_manifest.get("n_atoms")
     sim_time = sim_manifest.get("duration_ns_actual")
     live_status = read_status(root)
-    temperature = live_status.get("target_temperature_K") or _last_metric_value(root, "temperature")
-    latest = live_status.get("status") or status
+    temperature = _first_present(
+        live_status.get("target_temperature_K"),
+        _last_metric_value(root, "temperature"),
+    )
+    latest = _first_present(live_status.get("status"), status)
     return [
         {"label": "Project status", "value": status},
         {"label": "Latest status", "value": str(latest or "not available")},
-        {"label": "Frames", "value": str(frames or "not available")},
-        {"label": "Atoms", "value": str(atoms or "not available")},
-        {"label": "Simulation time", "value": f"{sim_time} ns" if sim_time is not None else "not available"},
-        {"label": "Temperature", "value": f"{temperature} K" if temperature not in (None, "") else "not available"},
+        {"label": "Frames", "value": _display_value(frames)},
+        {"label": "Atoms", "value": _display_value(atoms)},
+        {
+            "label": "Simulation time",
+            "value": f"{sim_time} ns" if sim_time is not None else "not available",
+        },
+        {
+            "label": "Temperature",
+            "value": f"{temperature} K" if temperature not in (None, "") else "not available",
+        },
     ]
 
 
@@ -643,15 +754,197 @@ def _system_info(
     sim_manifest: dict[str, Any],
 ) -> dict[str, str]:
     live_status = read_status(root)
+    params = sim_manifest.get("parameters")
+    if not isinstance(params, dict):
+        params = sim_manifest
     return {
-        "system": str(manifest.get("system") or "not available"),
+        "system": _display_value(manifest.get("system")),
         "output_folder": root.as_posix(),
-        "atoms": str(analysis_manifest.get("n_atoms") or "not available"),
-        "frames": str(analysis_manifest.get("n_frames") or "not available"),
-        "platform": str(live_status.get("platform") or sim_manifest.get("platform_used") or "not available"),
-        "timestep_fs": str(live_status.get("timestep_fs") or "not available"),
-        "checkpoint": str(live_status.get("current_checkpoint_path") or "not available"),
+        "atoms": _display_value(analysis_manifest.get("n_atoms")),
+        "frames": _display_value(
+            _first_present(
+                analysis_manifest.get("n_frames"),
+                sim_manifest.get("n_production_frames"),
+            )
+        ),
+        "platform": _display_value(
+            _first_present(
+                live_status.get("platform"),
+                sim_manifest.get("platform_used"),
+                sim_manifest.get("platform"),
+                params.get("platform"),
+            )
+        ),
+        "timestep_fs": _display_value(
+            _first_present(live_status.get("timestep_fs"), params.get("timestep_fs"))
+        ),
+        "checkpoint": _display_value(
+            _first_present(
+                live_status.get("current_checkpoint_path"),
+                live_status.get("checkpoint_path"),
+            )
+        ),
     }
+
+
+def _run_title(root: Path, manifest: dict[str, Any]) -> str:
+    options = manifest.get("options") if isinstance(manifest.get("options"), dict) else {}
+    report_options = options.get("report") if isinstance(options.get("report"), dict) else {}
+    title = (
+        report_options.get("title")
+        or report_options.get("report_title")
+        or manifest.get("title")
+    )
+    if title:
+        return str(title)
+    system = manifest.get("system")
+    if system:
+        return f"{Path(str(system)).stem} · FastMDXplora"
+    return root.name or "FastMDXplora Live"
+
+
+def _setup_details(setup_manifest: dict[str, Any]) -> dict[str, Any]:
+    params = setup_manifest.get("parameters")
+    if not isinstance(params, dict):
+        params = setup_manifest
+    forcefield = setup_manifest.get("resolved_forcefield")
+    if not isinstance(forcefield, dict):
+        forcefield = {}
+    ligand = forcefield.get("ligand") or params.get("ligand")
+    if isinstance(ligand, dict):
+        ligand = ligand.get("name") or ligand.get("files")
+    return {
+        "ph": _first_present(params.get("ph"), params.get("pH")),
+        "ion_concentration_M": _first_present(
+            params.get("ion_concentration_M"),
+            params.get("ion_concentration_m"),
+        ),
+        "force_field": _first_present(
+            forcefield.get("name"),
+            forcefield.get("protein_forcefield"),
+            forcefield.get("forcefield"),
+            params.get("forcefield"),
+            params.get("force_field"),
+        ),
+        "water_model": _first_present(
+            forcefield.get("water_model"),
+            params.get("water_model"),
+        ),
+        "ligand": ligand,
+    }
+
+
+def _simulation_details(
+    sim_manifest: dict[str, Any],
+    live_status: dict[str, Any],
+) -> dict[str, Any]:
+    params = sim_manifest.get("parameters")
+    if not isinstance(params, dict):
+        params = sim_manifest
+    return {
+        "platform": _first_present(
+            live_status.get("platform"),
+            sim_manifest.get("platform_used"),
+            sim_manifest.get("platform"),
+            params.get("platform"),
+        ),
+        "precision": _first_present(
+            live_status.get("precision"),
+            params.get("precision"),
+        ),
+        "temperature_K": _first_present(
+            live_status.get("target_temperature_K"),
+            params.get("temperature_K"),
+        ),
+        "timestep_fs": _first_present(
+            live_status.get("timestep_fs"),
+            params.get("timestep_fs"),
+        ),
+        "friction_per_ps": params.get("friction_per_ps"),
+        "pressure_bar": _first_present(
+            params.get("pressure_bar"),
+            params.get("pressure_atm"),
+        ),
+        "duration_ns_actual": _first_present(
+            sim_manifest.get("duration_ns_actual"),
+            params.get("duration_ns"),
+        ),
+        "n_production_frames": _first_present(
+            sim_manifest.get("n_production_frames"),
+            live_status.get("current_frame_count"),
+        ),
+    }
+
+
+def _analysis_records(
+    analysis_manifest: dict[str, Any],
+    artifacts: list[dict[str, str]],
+    plots: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    results = analysis_manifest.get("results")
+    if not isinstance(results, dict):
+        if analysis_manifest.get("status"):
+            return [
+                {
+                    "name": "analysis",
+                    "title": "Analysis",
+                    "status": str(analysis_manifest.get("status")),
+                    "message": str(analysis_manifest.get("note") or ""),
+                    "artifacts": [],
+                    "plot": None,
+                }
+            ]
+        return []
+
+    records: list[dict[str, Any]] = []
+    for name, raw in results.items():
+        data = raw if isinstance(raw, dict) else {}
+        prefix = f"analysis/{name}/"
+        related = [record for record in artifacts if record["path"].startswith(prefix)]
+        plot = next(
+            (
+                item
+                for item in plots
+                if item["path"].startswith(prefix)
+                or _normalise_analysis_name(item["title"]) == _normalise_analysis_name(str(name))
+            ),
+            None,
+        )
+        records.append(
+            {
+                "name": str(name),
+                "title": PLOT_TITLE_ALIASES.get(str(name).lower(), _humanize_stem(str(name))),
+                "status": str(data.get("status") or "unknown"),
+                "message": str(data.get("message") or ""),
+                "started_at": data.get("started_at"),
+                "finished_at": data.get("finished_at"),
+                "artifacts": related,
+                "plot": plot,
+            }
+        )
+    return records
+
+
+def _normalise_analysis_name(value: str) -> str:
+    return "".join(ch for ch in value.lower() if ch.isalnum())
+
+
+def _report_order(path: str) -> tuple[int, str]:
+    preferred = {
+        "report/dashboard.html": 0,
+        "report/report.md": 1,
+        "report/slides.pptx": 2,
+        "report/project_bundle.zip": 3,
+    }
+    return preferred.get(path, 99), path
+
+
+def _first_present(*values: Any) -> Any:
+    return next((value for value in values if value not in (None, "")), None)
+
+
+def _display_value(value: Any) -> str:
+    return "not available" if value in (None, "") else str(value)
 
 
 def _phase_records(manifest: dict[str, Any]) -> list[dict[str, str]]:
@@ -669,6 +962,12 @@ def _phase_records(manifest: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def _plot_records(artifacts: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Return one display record per scientific figure, paired with SVG.
+
+    PNG is preferred for fast browser previews while a matching true-vector
+    SVG is exposed for publication download.  Pairing by normalized title also
+    handles report/dashboard_assets copies and per-analysis artifact names.
+    """
     image_suffixes = {".png", ".jpg", ".jpeg", ".gif", ".svg"}
     candidates = [
         record for record in artifacts
@@ -678,24 +977,42 @@ def _plot_records(artifacts: list[dict[str, str]]) -> list[dict[str, str]]:
             or record["path"].startswith("analysis/")
         )
     ]
-    chosen: dict[str, dict[str, str]] = {}
+    grouped: dict[str, list[dict[str, str]]] = {}
     for record in candidates:
         title = _plot_title(record["path"])
-        if not title:
-            continue
-        current = chosen.get(title)
-        if current is None or _plot_priority(record["path"]) < _plot_priority(current["path"]):
-            mode = "dashboard view" if record["path"].startswith("report/dashboard_assets/") else "artifact fallback"
-            enriched = dict(record)
+        if title:
+            grouped.setdefault(title, []).append(record)
+
+    results: list[dict[str, str]] = []
+    for title, records in grouped.items():
+        display = min(records, key=lambda item: _plot_record_priority(item["path"]))
+        svg_candidates = [item for item in records if Path(item["path"]).suffix.lower() == ".svg"]
+        svg = min(svg_candidates, key=lambda item: _plot_priority(item["path"])) if svg_candidates else None
+        mode = "dashboard view" if display["path"].startswith("report/dashboard_assets/") else "artifact fallback"
+        enriched = dict(display)
+        enriched.update(
+            {
+                "title": title,
+                "category": PLOT_CATEGORY_BY_TITLE.get(title, _plot_category(display["path"])),
+                "mode": mode,
+            }
+        )
+        if svg is not None:
             enriched.update(
                 {
-                    "title": title,
-                    "category": PLOT_CATEGORY_BY_TITLE.get(title, _plot_category(record["path"])),
-                    "mode": mode,
+                    "svg_path": svg["path"],
+                    "svg_href": svg["href"],
+                    "svg_download_href": svg["download_href"],
                 }
             )
-            chosen[title] = enriched
-    return sorted(chosen.values(), key=lambda item: (_category_order(item["category"]), item["title"]))
+        results.append(enriched)
+    return sorted(results, key=lambda item: (_category_order(item["category"]), item["title"]))
+
+
+def _plot_record_priority(path: str) -> tuple[int, int]:
+    suffix = Path(path).suffix.lower()
+    suffix_priority = {".png": 0, ".jpg": 1, ".jpeg": 1, ".gif": 2, ".svg": 3}
+    return _plot_priority(path), suffix_priority.get(suffix, 9)
 
 
 def _plot_priority(path: str) -> int:
@@ -735,7 +1052,34 @@ def _category_order(category: str) -> int:
     return order.get(category, 99)
 
 
+def _svg_figure_paths(root: Path) -> list[Path]:
+    """Return generated SVG figures, excluding branding/static assets."""
+    paths: list[Path] = []
+    for base in (root / "analysis", root / "report" / "dashboard_assets", root / "report"):
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*.svg"):
+            if path.is_file() and path not in paths:
+                paths.append(path)
+    return sorted(paths)
+
+
 def _iso_now() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).isoformat()
+
+
+def _open_local_path(path: Path) -> tuple[bool, str]:
+    """Open ``path`` in the host file manager on a best-effort basis."""
+
+    try:
+        if os.name == "nt":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception as exc:  # noqa: BLE001 - dashboard helper only
+        return False, str(exc)
+    return True, "opened"

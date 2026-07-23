@@ -9,7 +9,7 @@
   <link rel="stylesheet" href="/static/dashboard.css">
   <meta name="fastmdx-expansion" content="Fully Automated SysTem for Molecular Dynamics eXploration">
 </head>
-<body class="state-loading">
+<body class="state-loading" data-refresh-seconds="__FASTMDX_REFRESH_SECONDS__">
   <!-- Loading screen -->
   <div id="loading-screen" class="loading-screen" aria-hidden="false">
     <div class="loading-shell">
@@ -160,7 +160,7 @@
               <div class="hero-card-top">
                 <div>
                   <div class="hero-label">Run status</div>
-                  <div class="hero-status">not available</div>
+                  <div class="hero-status" id="hero-status-text">not available</div>
                 </div>
                 <span class="stage-pill mono" id="hero-stage">—</span>
               </div>
@@ -289,6 +289,7 @@
                 <a href="#" class="ghost-link" data-view-link="viewer">Open full viewer</a>
               </div>
               <div class="preview-frame" id="mini-preview-frame">
+                <div id="mini-preview-canvas" class="mini-preview-canvas" aria-label="Molecular preview"></div>
                 <div class="preview-empty" id="mini-preview-empty">
                   Waiting for a structure file…
                 </div>
@@ -537,7 +538,16 @@
               <h1 class="page-title">Analysis</h1>
               <div class="page-subtitle">Trajectory analyses and protein-ligand interactions</div>
             </div>
-            <div class="muted small mono" id="analysis-meta">no analyses yet</div>
+            <div class="page-header-actions">
+              <div class="muted small mono" id="analysis-meta">no analyses yet</div>
+              <a
+                class="ghost-btn"
+                id="download-all-svg"
+                href="/analysis-figures-svg.zip"
+                download
+                hidden
+              >Download all SVG figures</a>
+            </div>
           </div>
           <div class="analysis-grid" id="analysis-grid"></div>
           <div class="empty-state" id="analysis-empty">
@@ -623,7 +633,7 @@
             <div class="card-header"><h2 class="card-title">Dashboard</h2></div>
             <div class="kv-form mono">
               <label>Telemetry polling (s)
-                <input type="number" id="setting-refresh-seconds" min="1" max="60" step="1" value="3">
+                <input type="number" id="setting-refresh-seconds" min="1" max="60" step="1" value="__FASTMDX_REFRESH_SECONDS__">
               </label>
               <label>Chart history (samples)
                 <input type="number" id="setting-chart-history" min="60" max="5000" step="60" value="600">

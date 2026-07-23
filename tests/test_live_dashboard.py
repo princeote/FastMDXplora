@@ -15,13 +15,19 @@ import socket
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import urlopen
+from types import SimpleNamespace
 
 import pytest
 
-from fastmdxplora.cli.main import _build_parser
+from fastmdxplora.cli.main import _build_parser, _enable_dashboard_telemetry
 from fastmdxplora.live import protein_preview
 from fastmdxplora.live.ligand_detection import detect_ligands, normalise_ligand_resname
-from fastmdxplora.live.live_frames import write_live_frame, write_openmm_live_frame
+from fastmdxplora.live.live_frames import (
+    dashboard_display_pdb,
+    read_live_frame_history,
+    write_live_frame,
+    write_openmm_live_frame,
+)
 from fastmdxplora.live.protein_preview import protein_preview_payload
 from fastmdxplora.live.server import (
     DashboardConfig,
@@ -30,6 +36,7 @@ from fastmdxplora.live.server import (
     start_test_server,
 )
 from fastmdxplora.live.structure_info import count_structure, ligand_atom_counts
+from fastmdxplora.simulation.runner import _maybe_write_live_frame
 from fastmdxplora.live.telemetry import (
     TelemetryWriter,
     analyze_health,
@@ -365,13 +372,13 @@ def test_playback_returns_unavailable_when_missing(tmp_path: Path) -> None:
 def test_playback_generation_failure_is_safe(tmp_path: Path, monkeypatch) -> None:
     # Force a failure inside the writer.
     import fastmdxplora.live.trajectory_playback as mod
-    monkeypatch.setattr(mod, "_import_openmm", lambda: None)
+    monkeypatch.setattr(mod, "_import_mdtraj", lambda: None)
     (tmp_path / "simulation").mkdir(parents=True)
     (tmp_path / "simulation" / "topology.pdb").write_text(_tiny_pdb(), encoding="utf-8")
     (tmp_path / "simulation" / "production.dcd").write_bytes(b"\x00\x00")
     info = playback_info(tmp_path)
     assert info["playback_available"] is False
-    assert info["reason"] == "openmm-not-installed"
+    assert info["reason"] == "mdtraj-not-installed"
 
 
 def test_neighborhood_residues_per_atom_check(tmp_path: Path) -> None:
@@ -388,6 +395,64 @@ def test_neighborhood_residues_per_atom_check(tmp_path: Path) -> None:
     assert ("A", 1) in residues
     assert ("A", 2) not in residues
 
+
+
+def test_telemetry_stage_states_survive_multiple_writers(tmp_path: Path) -> None:
+    sim = tmp_path / "run" / "simulation"
+    orchestrator_writer = TelemetryWriter(sim)
+    runner_writer = TelemetryWriter(sim)
+    orchestrator_writer.write_status(
+        stage="setup",
+        status="running",
+        stage_states={
+            "setup": "current", "minimization": "waiting", "nvt": "waiting",
+            "npt": "waiting", "production": "waiting", "analysis": "waiting",
+            "report": "waiting",
+        },
+    )
+    runner_writer.mark_stage("minimization", "current", status="running")
+    runner_writer.mark_stage("minimization", "completed", status="running")
+    orchestrator_writer.mark_stage("analysis", "current", status="running")
+    status = read_status(tmp_path / "run")
+    assert status["stage_states"]["setup"] == "current"
+    assert status["stage_states"]["minimization"] == "completed"
+    assert status["stage_states"]["analysis"] == "current"
+
+
+def test_live_frame_history_builds_playback(tmp_path: Path) -> None:
+    sim = tmp_path / "simulation"
+    write_live_frame(
+        sim, pdb_text=_tiny_pdb(), frame_index=10, stage="nvt",
+        simulation_time_ns=0.001, archive=True,
+    )
+    moved = _tiny_pdb().replace("   0.000   0.000   0.000", "   0.200   0.000   0.000")
+    write_live_frame(
+        sim, pdb_text=moved, frame_index=20, stage="nvt",
+        simulation_time_ns=0.002, archive=True,
+    )
+    history = read_live_frame_history(sim)
+    assert history["count"] == 2
+    info = playback_info(tmp_path, max_browser_frames=20)
+    assert info["playback_available"] is True
+    assert info["source_kind"] == "live-history"
+    assert info["n_frames_browser"] == 2
+    text = (sim / "playback.pdb").read_text(encoding="utf-8")
+    assert text.count("MODEL") == 2
+
+
+def test_dashboard_display_pdb_strips_solvent_and_keeps_ligand() -> None:
+    pdb = "\n".join([
+        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 10.00           C",
+        "HETATM    2  O   HOH B   2       2.000   2.000   2.000  1.00 10.00           O",
+        "HETATM    3  NA   NA C   3       3.000   3.000   3.000  1.00 10.00          NA",
+        "HETATM    4  C1  LIG D   4       4.000   4.000   4.000  1.00 10.00           C",
+        "END",
+    ])
+    display = dashboard_display_pdb(pdb)
+    assert "ALA" in display
+    assert "LIG" in display
+    assert "HOH" not in display
+    assert " NA C" not in display
 
 # ---------------------------------------------------------------------------
 # Endpoint contract: the redesigned dashboard's HTML/JS layer
@@ -743,3 +808,308 @@ def test_static_logo_endpoint_serves_svg(tmp_path: Path) -> None:
         server.server_close()
     assert response.headers["Content-Type"].startswith("image/svg+xml") or "svg" in body.lower()
     assert "AAI" in body
+
+# ---------------------------------------------------------------------------
+# Regression coverage for the functional dashboard wiring
+# ---------------------------------------------------------------------------
+def test_find_structure_prefers_prepared_solute_over_solvated_topology(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "run"
+    prepared = run / "setup" / "prepared.pdb"
+    topology = run / "simulation" / "topology.pdb"
+    solvated = run / "setup" / "solvated.pdb"
+    for path, marker in (
+        (prepared, "PREPARED"),
+        (topology, "TOPOLOGY"),
+        (solvated, "SOLVATED"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"REMARK {marker}\n{_tiny_pdb()}\n", encoding="utf-8")
+
+    assert protein_preview.find_structure(run) == prepared
+
+
+def test_read_metrics_falls_back_to_openmm_energy_csv(tmp_path: Path) -> None:
+    sim = tmp_path / "run" / "simulation"
+    sim.mkdir(parents=True)
+    (sim / "energy.csv").write_text(
+        '#"Step","Time (ps)","Potential Energy (kJ/mole)",'
+        '"Kinetic Energy (kJ/mole)","Total Energy (kJ/mole)",'
+        '"Temperature (K)","Box Volume (nm^3)","Density (g/mL)",'
+        '"Speed (ns/day)","Progress (%)"\n'
+        '100,2.0,-1000.5,200.5,-800.0,299.5,12.0,0.997,8.25,50.0\n',
+        encoding="utf-8",
+    )
+
+    metrics = read_metrics(tmp_path / "run")
+
+    assert len(metrics) == 1
+    assert metrics[0]["step"] == "100"
+    assert metrics[0]["simulation_time_ns"] == "0.002"
+    assert metrics[0]["potential_energy"] == "-1000.5"
+    assert metrics[0]["temperature"] == "299.5"
+    assert metrics[0]["density"] == "0.997"
+    assert metrics[0]["speed"] == "8.25"
+
+
+def test_ligands_endpoint_returns_detected_instances(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    prepared = run / "setup" / "prepared.pdb"
+    prepared.parent.mkdir(parents=True)
+    prepared.write_text(
+        "\n".join(
+            [
+                "ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N",
+                "HETATM    2  C1  EPE B 101       4.000   4.000   4.000  1.00 10.00           C",
+                "HETATM    3  O1  EPE B 101       4.300   4.300   4.300  1.00 10.00           O",
+                "END",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    server, base_url = start_test_server(run)
+    try:
+        payload = json.loads(urlopen(f"{base_url}/api/ligands", timeout=5).read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert payload["valid"] is True
+    assert payload["resnames"] == ["EPE"]
+    assert payload["ligands"] == [
+        {"chain": "B", "resname": "EPE", "resi": "101", "explicit": False}
+    ]
+
+
+def test_results_endpoint_discovers_analysis_and_report_outputs(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "run"
+    analysis = run / "analysis" / "rmsd"
+    report = run / "report"
+    analysis.mkdir(parents=True)
+    report.mkdir(parents=True)
+
+    (run / "analysis" / "analysis_manifest.json").write_text(
+        json.dumps(
+            {
+                "n_frames": 10,
+                "results": {
+                    "rmsd": {
+                        "status": "ok",
+                        "message": "RMSD complete",
+                    },
+                    "rg": {
+                        "status": "skipped",
+                        "message": "Not enough frames",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (analysis / "rmsd.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    (analysis / "rmsd.csv").write_text("frame,rmsd\n0,0.0\n", encoding="utf-8")
+    (report / "dashboard.html").write_text("<html></html>", encoding="utf-8")
+    (report / "report.md").write_text("# Report\n", encoding="utf-8")
+    (report / "slides.pptx").write_bytes(b"PK")
+    (report / "project_bundle.zip").write_bytes(b"PK")
+
+    server, base_url = start_test_server(run)
+    try:
+        payload = json.loads(urlopen(f"{base_url}/api/results", timeout=5).read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert payload["has_analysis"] is True
+    assert payload["has_report"] is True
+    assert {item["name"] for item in payload["analyses"]} == {"rmsd", "rg"}
+    rmsd = next(item for item in payload["analyses"] if item["name"] == "rmsd")
+    assert rmsd["plot"]["path"] == "analysis/rmsd/rmsd.png"
+    assert any(item["path"] == "analysis/rmsd/rmsd.csv" for item in rmsd["artifacts"])
+    assert [item["path"] for item in payload["reports"]] == [
+        "report/dashboard.html",
+        "report/report.md",
+        "report/slides.pptx",
+        "report/project_bundle.zip",
+    ]
+
+
+def test_artifact_download_route_sets_attachment_header(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    report = run / "report"
+    report.mkdir(parents=True)
+    (report / "report.md").write_text("# Report\n", encoding="utf-8")
+
+    server, base_url = start_test_server(run)
+    try:
+        response = urlopen(
+            f"{base_url}/artifacts/report/report.md?download=1",
+            timeout=5,
+        )
+        response.read()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert response.headers["Content-Disposition"] == 'attachment; filename="report.md"'
+
+
+def test_frontend_assets_wire_functional_dashboard_sections() -> None:
+    import fastmdxplora.live as live_pkg
+
+    root = Path(live_pkg.__file__).parent
+    html = (root / "templates" / "dashboard.html").read_text(encoding="utf-8")
+    css = (root / "static" / "dashboard.css").read_text(encoding="utf-8")
+    dashboard_js = (root / "static" / "dashboard.js").read_text(encoding="utf-8")
+    charts_js = (root / "static" / "charts.js").read_text(encoding="utf-8")
+    viewer_js = (root / "static" / "molecule-viewer.js").read_text(encoding="utf-8")
+
+    assert 'id="reports-files"' in html
+    assert 'id="simulation-files"' in html
+    assert 'id="analysis-files"' in html
+    assert 'id="mini-preview-canvas"' in html
+    assert "[hidden]" in css and "display: none !important" in css
+    assert "/api/results" in dashboard_js
+    assert "renderFiles" in dashboard_js
+    assert "renderAnalysis" in dashboard_js
+    assert "ResizeObserver" in charts_js
+    assert "mini-preview-canvas" in viewer_js
+    assert "/structure/topology.pdb" in viewer_js
+
+
+def test_dashboard_refresh_seconds_are_injected_into_html(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    server, base_url = start_test_server(
+        run,
+        config=DashboardConfig(refresh_seconds=1.5),
+    )
+    try:
+        html = urlopen(base_url, timeout=5).read().decode("utf-8")
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert 'data-refresh-seconds="1.5"' in html
+    assert 'id="setting-refresh-seconds" min="1" max="60" step="1" value="1.5"' in html
+
+
+def test_runner_live_frame_helper_calls_writer_with_valid_keyword(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls: list[dict] = []
+
+    def fake_write_openmm_live_frame(output_dir, **kwargs):
+        calls.append({"output_dir": output_dir, **kwargs})
+        return {"ok": True}
+
+    import fastmdxplora.live.live_frames as live_frames_module
+
+    monkeypatch.setattr(
+        live_frames_module,
+        "write_openmm_live_frame",
+        fake_write_openmm_live_frame,
+    )
+
+    class FakeState:
+        def getPositions(self):
+            return "positions"
+
+    class FakeContext:
+        def getState(self, **_kwargs):
+            return FakeState()
+
+    simulation = SimpleNamespace(context=FakeContext(), topology="topology")
+    telemetry = SimpleNamespace(root=tmp_path / "simulation")
+    omm = {"PDBFile": SimpleNamespace(writeFile=lambda *_args, **_kwargs: None)}
+
+    _maybe_write_live_frame(
+        omm,
+        simulation,
+        telemetry,
+        250,
+        stage="nvt",
+        simulation_time_ns=0.0005,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["pdbfile_writer"] is omm["PDBFile"].writeFile
+    assert calls[0]["frame_index"] == 250
+    assert calls[0]["stage"] == "nvt"
+    assert calls[0]["archive"] is True
+
+
+def test_dashboard_frame_interval_is_forwarded_to_explore_config() -> None:
+    config = {"simulation": {"temperature_K": 300.0}}
+    args = SimpleNamespace(dashboard_frame_interval=125)
+    _enable_dashboard_telemetry(config, args)
+    assert config["simulation"]["live_telemetry"] is True
+    assert config["simulation"]["telemetry_interval"] == 125
+    assert config["simulation"]["temperature_K"] == 300.0
+
+
+def test_results_endpoint_pairs_png_preview_with_svg_download(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    analysis = run / "analysis" / "rg"
+    analysis.mkdir(parents=True)
+    (run / "analysis" / "analysis_manifest.json").write_text(
+        json.dumps({"results": {"rg": {"status": "ok", "message": "rg: ok"}}}),
+        encoding="utf-8",
+    )
+    (analysis / "rg.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    (analysis / "rg.svg").write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg"></svg>', encoding="utf-8"
+    )
+    (analysis / "rg.dat").write_text("frame,rg_nm\n0,1.0\n", encoding="utf-8")
+
+    server, base_url = start_test_server(run)
+    try:
+        payload = json.loads(urlopen(f"{base_url}/api/results", timeout=5).read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    record = payload["analyses"][0]
+    assert record["plot"]["path"] == "analysis/rg/rg.png"
+    assert record["plot"]["svg_path"] == "analysis/rg/rg.svg"
+    assert record["plot"]["svg_download_href"].startswith("/artifacts/analysis/rg/rg.svg")
+    assert payload["svg_figure_count"] == 1
+
+
+def test_svg_bundle_endpoint_downloads_generated_vector_figures(tmp_path: Path) -> None:
+    import io
+    import zipfile
+
+    run = tmp_path / "run"
+    figure = run / "analysis" / "rmsd" / "rmsd.svg"
+    figure.parent.mkdir(parents=True)
+    figure.write_text('<svg xmlns="http://www.w3.org/2000/svg"></svg>', encoding="utf-8")
+
+    server, base_url = start_test_server(run)
+    try:
+        response = urlopen(f"{base_url}/analysis-figures-svg.zip", timeout=5)
+        data = response.read()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert response.headers["Content-Type"] == "application/zip"
+    assert "fastmdxplora_svg_figures.zip" in response.headers["Content-Disposition"]
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        assert archive.namelist() == ["analysis/rmsd/rmsd.svg"]
+
+
+def test_dashboard_assets_include_svg_download_and_first_model_miniviewer_fix() -> None:
+    root = Path(__file__).resolve().parents[1]
+    html = (root / "src" / "fastmdxplora" / "live" / "templates" / "dashboard.html").read_text(encoding="utf-8")
+    dashboard_js = (root / "src" / "fastmdxplora" / "live" / "static" / "dashboard.js").read_text(encoding="utf-8")
+    viewer_js = (root / "src" / "fastmdxplora" / "live" / "static" / "molecule-viewer.js").read_text(encoding="utf-8")
+
+    assert 'id="download-all-svg"' in html
+    assert "Download SVG" in dashboard_js
+    assert "const hadModel" in viewer_js
+    assert "opts.center !== false || !hadModel" in viewer_js
+    assert "resolveProteinSelection" in viewer_js

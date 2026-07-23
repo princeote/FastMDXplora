@@ -25,6 +25,7 @@ Global flags:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -799,9 +800,13 @@ def _dashboard_requested(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "dashboard", False))
 
 
-def _enable_dashboard_telemetry(config: dict[str, Any]) -> None:
+def _enable_dashboard_telemetry(
+    config: dict[str, Any], args: argparse.Namespace | None = None
+) -> None:
     simulation = dict(config.get("simulation", {}))
     simulation["live_telemetry"] = True
+    if args is not None and getattr(args, "dashboard_frame_interval", None) is not None:
+        simulation["telemetry_interval"] = int(args.dashboard_frame_interval)
     config["simulation"] = simulation
 
 
@@ -816,6 +821,12 @@ def _resolve_dashboard_output_dir(args: argparse.Namespace, config: dict[str, An
 
 
 def _start_dashboard_for_command(args: argparse.Namespace, output_dir: Path):
+    # The orchestrator uses this process-local marker to publish setup,
+    # analysis, and report phase transitions to the same live timeline as
+    # the OpenMM simulation sub-stages.
+    os.environ["FASTMDX_DASHBOARD_ACTIVE"] = "1"
+    os.environ["FASTMDX_DASHBOARD_OUTPUT"] = str(output_dir)
+
     from fastmdxplora.live.server import (
         DashboardConfig,
         start_dashboard_session,
@@ -828,6 +839,9 @@ def _start_dashboard_for_command(args: argparse.Namespace, output_dir: Path):
         ),
         max_browser_frames=int(
             getattr(args, "dashboard_max_playback_frames", 200) or 200
+        ),
+        refresh_seconds=float(
+            getattr(args, "dashboard_refresh_seconds", 3.0) or 3.0
         ),
     )
     session = start_dashboard_session(
@@ -898,7 +912,7 @@ def _cmd_explore(args: argparse.Namespace) -> int:
             config["exclude"] = [*existing, "report"]
 
     if _dashboard_requested(args):
-        _enable_dashboard_telemetry(config)
+        _enable_dashboard_telemetry(config, args)
     dashboard_output_dir: Path | None = None
     if _dashboard_requested(args):
         dashboard_output_dir = _resolve_dashboard_output_dir(args, config)
@@ -948,8 +962,7 @@ def _cmd_phase(phase: str, args: argparse.Namespace) -> int:
         if getattr(args, "dashboard_frame_interval", None) is not None:
             kwargs["telemetry_interval"] = int(args.dashboard_frame_interval)
         if getattr(args, "dashboard_refresh_seconds", None) is not None:
-            # Hint kept in console output; browser-side cadence is
-            # controlled by dashboard.html / settings.js.
+            # The same value is embedded into the served dashboard HTML.
             print(
                 f"  dashboard polling: every {args.dashboard_refresh_seconds}s"
             )

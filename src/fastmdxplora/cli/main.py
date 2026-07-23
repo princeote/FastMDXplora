@@ -448,6 +448,25 @@ def _build_parser() -> argparse.ArgumentParser:
         _common_input_args(pp)
         _attach_phase_options(pp, opts, group_title=f"{phase} options")
 
+    health = sub.add_parser(
+        "health",
+        help="Run repository health checks and environment diagnostics.",
+        description=(
+            "Run the repository doctor checks to validate the local checkout, "
+            "environment, and package readiness."
+        ),
+    )
+    health.add_argument(
+        "--no-fix",
+        action="store_true",
+        help="Only diagnose problems; do not install or modify anything.",
+    )
+    health.add_argument(
+        "--yes",
+        action="store_true",
+        help="Accept all fixes automatically.",
+    )
+
     sub.add_parser(
         "info",
         help="Print FastMDXplora environment information.",
@@ -516,6 +535,61 @@ def _build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Overwrite the output file if it already exists.",
+    )
+
+    def _add_bootstrap_parser(name: str, *, description: str, help_text: str) -> argparse.ArgumentParser:
+        parser_obj = sub.add_parser(
+            name,
+            help=help_text,
+            description=description,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        parser_obj.add_argument(
+            "--env-name",
+            default="fastmdxplora",
+            help="Conda environment name to create (default: fastmdxplora).",
+        )
+        parser_obj.add_argument(
+            "--python-version",
+            default="3.10",
+            help="Python version to install in the environment (3.9-3.12).",
+        )
+        parser_obj.add_argument(
+            "--force",
+            action="store_true",
+            help="Recreate the environment if it already exists.",
+        )
+        parser_obj.add_argument(
+            "--yes",
+            "-y",
+            action="store_true",
+            help="Skip confirmation prompts if any.",
+        )
+        return parser_obj
+
+    _add_bootstrap_parser(
+        "install",
+        description=(
+            "Create a conda environment and install FastMDXplora. If you run it "
+            "inside a repository checkout, the local checkout is installed; "
+            "otherwise the published package is installed."
+        ),
+        help_text="Install FastMDXplora into a conda environment.",
+    )
+    _add_bootstrap_parser(
+        "bootstrap",
+        description=(
+            "Alias for `install`; kept for compatibility with older docs and scripts."
+        ),
+        help_text="Alias for install.",
+    )
+    _add_bootstrap_parser(
+        "install-e",
+        description=(
+            "Create a conda environment and install the current repository checkout "
+            "in editable mode for contributors and editors."
+        ),
+        help_text="Install the current repository checkout in editable mode.",
     )
 
     return parser
@@ -858,6 +932,98 @@ def _cmd_init_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bootstrap(args: argparse.Namespace, *, editable: bool = False, package_name: str = "fastmdxplora") -> int:
+    from fastmdxplora.install import bootstrap_environment, BootstrapError
+
+    repo_root = Path.cwd()
+    repo_marker = (repo_root / "pyproject.toml").exists() and (repo_root / "src" / "fastmdxplora").exists()
+    resolved_package_name = "." if package_name == "." and repo_marker else package_name
+    resolved_editable = editable and repo_marker
+
+    try:
+        bootstrap_environment(
+            env_name=args.env_name,
+            python_version=args.python_version,
+            yes=args.yes,
+            force=args.force,
+            package_name=resolved_package_name,
+            editable=resolved_editable,
+        )
+        return 0
+    except BootstrapError as exc:
+        print(f"fastmdx: bootstrap failed: {exc}", file=sys.stderr)
+        return 1
+
+
+def _cmd_health(args: argparse.Namespace) -> int:
+    from health import main as health_main
+
+    argv: list[str] = []
+    if getattr(args, "no_fix", False):
+        argv.append("--no-fix")
+    if getattr(args, "yes", False):
+        argv.append("--yes")
+    return health_main(argv)
+
+
+# ---------------------------------------------------------------------------
+# Self-healing prologue
+# ---------------------------------------------------------------------------
+# `explore` / `xplore` / `setup` / `simulate` need OpenMM (and PDBFixer
+# for setup). Without the chemistry stack installed, the user would
+# otherwise get a long stack trace. Detect this here and offer a one-stop
+# install hint instead, while still letting `info` / `health` / etc.
+# proceed normally.
+_CHEMISTRY_PHASES = frozenset({"setup", "simulation"})
+
+
+def _needs_chemistry(args: argparse.Namespace) -> bool:
+    """Return True if this command will actually invoke a chemistry phase."""
+    cmd = getattr(args, "command", None)
+    if cmd in ("setup", "simulate"):
+        return True
+    if cmd in ("explore", "xplore"):
+        # Dry runs only print the plan; they must work without chemistry so
+        # users can use them as a teaching tool when explaining the install gap.
+        if getattr(args, "dry_run", False):
+            return False
+        include = getattr(args, "include", None)
+        exclude = set(getattr(args, "exclude", None) or ())
+        if include is not None:
+            return bool(set(include) & _CHEMISTRY_PHASES)
+        if exclude >= _CHEMISTRY_PHASES:
+            return False
+        return True  # default plan runs every phase
+    return False
+
+
+def _missing_chemistry_backends() -> list[str]:
+    """Return the chemistry backend modules that aren't importable here.
+
+    Probes the *actual* import shape used by setup and simulation
+    (e.g. ``from openmm.app import PDBFile``) so a broken partial install
+    fails fast here instead of mid-phase.
+    """
+    probes: tuple[tuple[str, str], ...] = (
+        ("openmm", None),                                # top-level package
+        ("openmm.app", "from openmm.app import PDBFile"),
+        ("openmm", "from openmm import unit"),
+        ("pdbfixer", "from pdbfixer import PDBFixer"),
+    )
+    failing: list[str] = []
+    for name, stmt in probes:
+        try:
+            if stmt is None:
+                __import__(name)
+            else:
+                exec(stmt, {})  # noqa: S102 — string intentional, gated by probes tuple
+        except ImportError:
+            failing.append(name)
+    # Reduce to the *top-level* packages the user has to install, so the
+    # hint stays short and actionable.
+    return sorted({("openmm" if name.startswith("openmm") else name) for name in failing})
+
+
 def _cmd_dashboard(args: argparse.Namespace) -> int:
     if args.dashboard_command != "serve":
         print("fastmdx: dashboard requires a subcommand, e.g. `dashboard serve`.", file=sys.stderr)
@@ -893,18 +1059,53 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
+    # Short-circuit cheap flags first so a missing chemistry backend never
+    # *blocks* `--cite`, `--version`, or `--help`. These flags are how
+    # users diagnose the install gap, so guarding them would defeat their
+    # purpose.
     if args.cite:
         print(__citation__)
         return 0
-
     if args.command is None:
         parser.print_help()
         return 0
+
+    # Self-heal before dispatch: if this command needs the chemistry stack
+    # and it's missing from the current interpreter, surface the install
+    # hint instead of letting a later ImportError crash the run.
+    if _needs_chemistry(args):
+        missing = _missing_chemistry_backends()
+        if missing:
+            joined = " and ".join(missing) if len(missing) == 2 else missing[0]
+            print(
+                f"fastmdx: this command needs the chemistry backend ({joined}), "
+                "which isn't importable from the current Python environment.",
+                file=sys.stderr,
+            )
+            print("", file=sys.stderr)
+            print("Install it with one of:", file=sys.stderr)
+            print("  conda install -c conda-forge openmm pdbfixer  # recommended across platforms", file=sys.stderr)
+            print('  pip install "fastmdxplora[md]"  # best-effort (PDBFixer wheels are unreliable)', file=sys.stderr)
+            print("", file=sys.stderr)
+            print("Or run only the phases that don't need chemistry:", file=sys.stderr)
+            print("  fastmdx explore --system <PDB> --include analyze report", file=sys.stderr)
+            print("Tip: run `fastmdx info` to see which backends are detected.", file=sys.stderr)
+            return 2
 
     if args.command == "init-config":
         return _cmd_init_config(args)
     if args.command == "dashboard":
         return _cmd_dashboard(args)
+
+    if args.command == "health":
+        return _cmd_health(args)
+
+    if args.command == "install":
+        return _cmd_bootstrap(args, editable=False, package_name=".")
+    if args.command == "bootstrap":
+        return _cmd_bootstrap(args, editable=False, package_name=".")
+    if args.command == "install-e":
+        return _cmd_bootstrap(args, editable=True, package_name=".")
 
     # Commands that build an orchestrator can hit config-file errors;
     # surface those cleanly rather than as a traceback.

@@ -32,6 +32,52 @@ fastmdx explore --system 1L2Y
 
 `1L2Y` is a small trp-cage PDB that exercises every phase on a fast turnaround. Replace it with any 4-character PDB ID or with the path to a local `.pdb` / `.cif` file.
 
+### Windows local development install
+
+On Windows PowerShell, the most reliable local development path is to use the
+Python launcher and call pip through Python:
+
+```powershell
+cd C:\Users\User\OneDrive\Documents\GitHub\FastMDXplora
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e ".[test]"
+python -m fastmdxplora.cli.main --version
+python -m fastmdxplora.cli.main info
+```
+
+If activation is blocked by PowerShell's execution policy, allow local scripts
+for your user account:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+Activation is optional. You can also run the virtual environment's Python
+directly:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[test]"
+.\.venv\Scripts\python.exe -m fastmdxplora.cli.main --version
+```
+
+### Optional extras
+
+For ligand parameterization and PLUMED enhanced sampling in an editable
+development checkout:
+
+```bash
+pip install -e ".[ligand]"   # OpenFF small-molecule parameterization
+pip install -e ".[plumed]"   # PLUMED enhanced sampling
+```
+
+The `plumed` extra also requires the `openmm-plumed` conda package:
+
+```bash
+conda install -c conda-forge openmm-plumed
+```
+
 > Need to install for development instead? Use `python fastmdx install-e` — same flow but the local checkout is installed in editable mode.
 
 ## Prerequisites
@@ -120,6 +166,29 @@ fastmdx info         # version, detected phases, OpenMM/PDBFixer status, citatio
 ```
 
 `fastmdx info` reports which backends are present. If `PDBFixer: installed` and `OpenMM: installed` both say yes, all four phases will work end-to-end.
+
+If the package imports but the `fastmdx` command is not recognized, the
+console-script directory is probably not on PATH. This is common on Windows
+with Microsoft Store Python or a mismatched PowerShell environment. Use the
+module entrypoint as a robust fallback:
+
+```powershell
+python -m pip show fastmdxplora
+python -c "import sys; print(sys.executable)"
+python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+python -m fastmdxplora.cli.main --version
+python -m fastmdxplora.cli.main info
+```
+
+Reinstalling with the same Python can recreate the console script:
+
+```powershell
+python -m pip install -e .
+```
+
+Avoid mixing multiple Python installs in one terminal. The Python used for
+`python -m pip install ...` should be the same Python used for
+`python -m fastmdxplora.cli.main ...`.
 
 To check whether a GPU-capable OpenMM platform is available:
 

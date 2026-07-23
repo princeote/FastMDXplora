@@ -22,6 +22,7 @@
 - Explore a protein's full dynamics with a single command, covering setup, simulation, analysis, and reporting
 - Probe protein-ligand binding automatically with analyses for pose stability, contacts, and protein-ligand hydrogen bonds
 - Reach beyond plain MD with built-in PLUMED enhanced sampling (metadynamics, umbrella sampling, steered MD) and a full analysis suite that turns trajectories into slide-ready, publication-quality figures
+- Highlight user-defined residue regions on RMSF report figures for loops, helices, active-site neighborhoods, or other known intervals
 - Scale from a quick single-protein exploration to large-scale parallel campaigns, driven the same way from the CLI or the Python API
 
 ## Phases of FastMDXplora
@@ -99,6 +100,32 @@ fastmdx explore --system 1L2Y                                 # 4 — first full
 
 Miniforge is auto-installed on a fresh machine, OpenMM + PDBFixer drop into the `fastmdxplora` conda env, and `fastmdx info` is used as a smoke test — same flow as the git-clone path.
 
+On Windows PowerShell, use the Python launcher and the virtual environment's
+activation script:
+
+```powershell
+cd C:\Users\User\OneDrive\Documents\GitHub\FastMDXplora
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e ".[test]"
+python -m fastmdxplora.cli.main --version
+python -m fastmdxplora.cli.main info
+```
+
+If PowerShell blocks activation, allow local scripts for your user account:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+You can also skip activation and call the environment's Python directly:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[test]"
+.\.venv\Scripts\python.exe -m fastmdxplora.cli.main --version
+```
+
 ### Verify
 
 ```bash
@@ -106,11 +133,60 @@ fastmdx --version    # reports the installed FastMDXplora version
 fastmdx info         # version + detected backends (OpenMM, PDBFixer, ...)
 ```
 
+If `fastmdx` is not on PATH, these module commands are the safest fallback:
+
+```bash
+python -m fastmdxplora.cli.main --version
+python -m fastmdxplora.cli.main info
+```
+
+Check which OpenMM platforms are available (CPU/CUDA/OpenCL):
+
+```bash
+python - <<'PY'
+import openmm as mm
+plats = [mm.Platform.getPlatform(i).getName() for i in range(mm.Platform.getNumPlatforms())]
+print("Available platforms:", plats)
+print("CUDA available" if "CUDA" in plats else "CPU-only: simulations will run on CPU")
+PY
+```
+
 ### Where to go next
 
 - **Need the full walkthrough, GPU notes, or troubleshooting?** See [`docs/installation.md`](docs/installation.md).
 - **Already installed and ready to run?** Skip to [Examples](#examples).
 - **Want to contribute?** See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### Troubleshooting: `fastmdx` is not recognized
+
+On Windows, especially with Microsoft Store Python or PowerShell, you may see:
+
+```text
+fastmdx : The term 'fastmdx' is not recognized as the name of a cmdlet, function, script file, or operable program.
+```
+
+First check which Python installed FastMDXplora and where console scripts are
+written:
+
+```powershell
+python -m pip show fastmdxplora
+python -c "import sys; print(sys.executable)"
+python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+python -m fastmdxplora.cli.main --version
+```
+
+If `import fastmdxplora` works but `fastmdx` is missing, the console-script
+directory is not on PATH. Use `python -m fastmdxplora.cli.main ...` as the
+portable fallback, or reinstall from the same Python to recreate the script:
+
+```powershell
+python -m pip install -e .
+python -m fastmdxplora.cli.main info
+```
+
+Avoid mixing multiple Python installs in the same terminal. The Python used for
+`python -m pip install ...` should be the same one used for
+`python -m fastmdxplora.cli.main ...`.
 
 ## Examples
 
@@ -128,6 +204,10 @@ fastmdx explore --system 1L2Y
 ```bash
 fastmdx explore -s protein.pdb --setup-ph 7.4 --simulate-duration-ns 100 --simulate-platform CUDA
 ```
+For a short local smoke test before a longer production run, use the gentle preset:
+```bash
+fastmdx explore -s protein.pdb --include setup simulation --simulate-preset gentle --simulate-platform CPU
+```
 **Run only specific phases**:
 ```bash
 fastmdx explore -s protein.pdb --include setup simulation
@@ -135,8 +215,9 @@ fastmdx explore -s protein.pdb --include setup simulation
 **Run a single phase** (bare flags, no phase prefix):
 ```bash
 fastmdx setup -s protein.pdb --ph 6.5
-fastmdx simulate --output run_001 --duration-ns 50 --platform CUDA
+fastmdx simulate -s protein.pdb --output run_001 --duration-ns 50 --platform CUDA
 fastmdx analyze --output run_001 --analyses rmsd rmsf rg
+fastmdx report --output run_001 --no-slides
 ```
 **Drive a whole study from a config file** (`-c` and `-config` also work):
 ```bash
@@ -332,7 +413,7 @@ Each phase writes to a dedicated subdirectory under the project output root, wit
 | `setup` | `prepared.pdb`, `solvated.pdb`, `setup_parameters.json` |
 | `simulation` | `production.dcd`, `topology.pdb`, `simulation_parameters.json` |
 | `analysis` | `<analysis>/*.dat`, `<analysis>/*.png`, `analysis_manifest.json` |
-| `report` | `report.md`, `slides.pptx`, `project_bundle.zip` |
+| `report` | `report.md`, `dashboard.html`, `slides.pptx`, `project_bundle.zip` |
 
 ## Documentation
 

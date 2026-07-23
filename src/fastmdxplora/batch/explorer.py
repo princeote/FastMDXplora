@@ -52,6 +52,27 @@ if TYPE_CHECKING:
 logger = get_logger("batch")
 
 
+def _first_error_phase_message(phases: list[Any]) -> str:
+    for phase in phases:
+        if getattr(phase, "status", None) == "error":
+            return getattr(phase, "message", "") or f"Phase '{phase.name}' failed."
+    return ""
+
+
+def _skipped_run_result(spec: RunSpec, run_out: Path, message: str) -> "RunResult":
+    from fastmdxplora.orchestrator import RunResult
+
+    return RunResult(
+        run_id=spec.run_id,
+        system=spec.system,
+        status="skipped",
+        output_dir=run_out,
+        sweep_values=spec.sweep_values,
+        phases=[],
+        message=message,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Module-level worker (must be top-level so ProcessPoolExecutor can pickle it)
 # ---------------------------------------------------------------------------
@@ -105,6 +126,7 @@ def _execute_run(
         inner = fmdx.explore(include=include, exclude=exclude, report=True)
         phases = inner[0].phases if inner else []
         status = "error" if any(p.status == "error" for p in phases) else "ok"
+        message = _first_error_phase_message(phases) if status == "error" else ""
         return RunResult(
             run_id=spec_dict["run_id"],
             system=spec_dict["system"],
@@ -112,6 +134,8 @@ def _execute_run(
             output_dir=Path(run_out),
             sweep_values=spec_dict["sweep_values"],
             phases=phases,
+            message=message,
+            error_type="PhaseError" if status == "error" else None,
         )
     except Exception as exc:  # noqa: BLE001 -- isolate per-run failures
         return RunResult(
@@ -122,6 +146,7 @@ def _execute_run(
             sweep_values=spec_dict["sweep_values"],
             phases=[],
             message=f"{type(exc).__name__}: {exc}",
+            error_type=type(exc).__name__,
         )
 
 
@@ -353,6 +378,15 @@ class BatchExplorer:
             results.append(result)
             if result.status == "error" and not self.continue_on_error:
                 logger.error("Stopping after failed run '%s'.", spec.run_id)
+                for skipped in self.run_specs[i:]:
+                    results.append(_skipped_run_result(
+                        skipped,
+                        self._run_output_dir(skipped),
+                        (
+                            "Not submitted because continue_on_error=False "
+                            f"stopped after failed run '{spec.run_id}'."
+                        ),
+                    ))
                 break
         return results
 
@@ -366,23 +400,35 @@ class BatchExplorer:
               + (f", devices={self.devices}" if self.devices else ""))
 
         results: list[RunResult] = []
-        # Assign each run a worker slot up front for deterministic device
-        # pinning (slot = submission index modulo worker count).
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {}
-            for idx, spec in enumerate(self.run_specs):
-                run_out = self._run_output_dir(spec)
-                device = self._device_for_worker(idx)
-                fut = pool.submit(
-                    _execute_run,
-                    spec.to_dict(), str(run_out), include, exclude,
-                    self.verbose, device,
-                )
-                futures[fut] = spec
+        futures = {}
+        next_index = 0
+        done = 0
+        stopped_after: str | None = None
 
-            done = 0
-            for fut in as_completed(futures):
-                spec = futures[fut]
+        def submit_next(pool: ProcessPoolExecutor) -> bool:
+            nonlocal next_index
+            if next_index >= n:
+                return False
+            spec = self.run_specs[next_index]
+            run_out = self._run_output_dir(spec)
+            device = self._device_for_worker(next_index)
+            fut = pool.submit(
+                _execute_run,
+                spec.to_dict(), str(run_out), include, exclude,
+                self.verbose, device,
+            )
+            futures[fut] = (next_index, spec)
+            next_index += 1
+            return True
+
+        pool = ProcessPoolExecutor(max_workers=n_workers)
+        try:
+            for _ in range(min(n_workers, n)):
+                submit_next(pool)
+
+            while futures:
+                fut = next(as_completed(futures))
+                _idx, spec = futures.pop(fut)
                 done += 1
                 try:
                     result = fut.result()
@@ -392,10 +438,64 @@ class BatchExplorer:
                         output_dir=self._run_output_dir(spec),
                         sweep_values=spec.sweep_values, phases=[],
                         message=f"{type(exc).__name__}: {exc}",
+                        error_type=type(exc).__name__,
                     )
                 mark = "✓" if result.status == "ok" else "✗"
                 print(f"[{done}/{n}] {mark} {spec.run_id}")
                 results.append(result)
+
+                if result.status == "error" and not self.continue_on_error:
+                    stopped_after = spec.run_id
+                    logger.error("Stopping parallel batch after failed run '%s'.", spec.run_id)
+                    break
+
+                if stopped_after is None:
+                    submit_next(pool)
+
+            if stopped_after is not None:
+                # Do not submit new work. Running tasks cannot always be
+                # cancelled, so collect anything already in flight and mark
+                # never-submitted runs explicitly as skipped.
+                for fut, (_idx, spec) in list(futures.items()):
+                    if fut.cancel():
+                        results.append(_skipped_run_result(
+                            spec,
+                            self._run_output_dir(spec),
+                            (
+                                "Cancelled because continue_on_error=False "
+                                f"stopped after failed run '{stopped_after}'."
+                            ),
+                        ))
+                        futures.pop(fut, None)
+
+                for fut in as_completed(futures):
+                    _idx, spec = futures[fut]
+                    done += 1
+                    try:
+                        result = fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        result = RunResult(
+                            run_id=spec.run_id, system=spec.system, status="error",
+                            output_dir=self._run_output_dir(spec),
+                            sweep_values=spec.sweep_values, phases=[],
+                            message=f"{type(exc).__name__}: {exc}",
+                            error_type=type(exc).__name__,
+                        )
+                    mark = "✓" if result.status == "ok" else "✗"
+                    print(f"[{done}/{n}] {mark} {spec.run_id}")
+                    results.append(result)
+
+                for spec in self.run_specs[next_index:]:
+                    results.append(_skipped_run_result(
+                        spec,
+                        self._run_output_dir(spec),
+                        (
+                            "Not submitted because continue_on_error=False "
+                            f"stopped after failed run '{stopped_after}'."
+                        ),
+                    ))
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
         # Preserve deterministic (submission) order in the manifest.
         order = {spec.run_id: i for i, spec in enumerate(self.run_specs)}
@@ -436,7 +536,11 @@ class BatchExplorer:
     def _print_summary(self) -> None:
         ok = sum(1 for r in self.results if r.status == "ok")
         err = sum(1 for r in self.results if r.status == "error")
+        skipped = sum(1 for r in self.results if r.status == "skipped")
         print(f"\n{'=' * 40}")
-        print(f"Batch complete: {ok} ok, {err} error(s), {len(self.results)} total")
+        print(
+            f"Batch complete: {ok} ok, {err} error(s), "
+            f"{skipped} skipped, {len(self.results)} total"
+        )
         print(f"Batch output:   {self.output_dir}")
         print(f"Manifest:       {self.output_dir / 'batch_manifest.json'}")

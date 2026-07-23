@@ -161,6 +161,14 @@ class TestValidation:
                 "exclude": ["report"],
             })
 
+    def test_top_level_include_rejects_unknown_phase(self):
+        with pytest.raises(ConfigError, match="unknown phase"):
+            validate_config({"systems": SYS, "include": ["setupp"]})
+
+    def test_top_level_exclude_rejects_unknown_phase(self):
+        with pytest.raises(ConfigError, match="unknown phase"):
+            validate_config({"systems": SYS, "exclude": ["reports"]})
+
     def test_analysis_include_exclude_mutually_exclusive(self):
         with pytest.raises(ConfigError, match="mutually exclusive"):
             validate_config({

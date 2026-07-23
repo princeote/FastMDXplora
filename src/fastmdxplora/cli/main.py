@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -133,6 +134,10 @@ _SIMULATION_OPTIONS: list[tuple[str, str, dict[str, Any]]] = [
         "help": "GPU device index for multi-GPU machines (e.g. '0' or '0,1')."}),
     ("checkpoint-interval-steps", "checkpoint_interval_steps", {"type": int,
         "help": "Checkpoint (.chk) interval in steps; 0 disables (default 10000)."}),
+    ("live-telemetry", "live_telemetry", {"action": "store_true", "default": None,
+        "help": "Write lightweight live dashboard telemetry during simulation."}),
+    ("telemetry-interval", "telemetry_interval", {"type": int,
+        "help": "Minimum step interval for live telemetry updates (default 1000)."}),
     ("trajectory-interval-steps", "trajectory_interval_steps", {"type": int,
         "help": "Trajectory (.dcd) frame interval in steps (default: adaptive, ~2000 frames)."}),
     ("random-seed", "random_seed", {"type": int,
@@ -311,6 +316,35 @@ def _common_input_args(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Also stream debug logging to the terminal.",
     )
+    dash = p.add_argument_group("dashboard")
+    dash.add_argument(
+        "--dashboard",
+        "--live-dashboard",
+        dest="dashboard",
+        action="store_true",
+        default=False,
+        help=(
+            "Launch the local live dashboard for this output folder before "
+            "the workflow starts. Implies live telemetry when simulation runs."
+        ),
+    )
+    dash.add_argument(
+        "--dashboard-host",
+        default="127.0.0.1",
+        help="Dashboard bind address (default: 127.0.0.1).",
+    )
+    dash.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=8765,
+        help="Dashboard port (default: 8765; next free port is used if busy).",
+    )
+    dash.add_argument(
+        "--dashboard-stop-on-complete",
+        action="store_true",
+        default=False,
+        help="Stop the dashboard automatically when the command completes.",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -442,6 +476,38 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    dashboard = sub.add_parser(
+        "dashboard",
+        help="Serve local dashboard views for an existing output directory.",
+        description=(
+            "Serve a local-only dashboard for completed outputs and live "
+            "simulation telemetry. Binds to 127.0.0.1 by default."
+        ),
+    )
+    dashboard_sub = dashboard.add_subparsers(dest="dashboard_command", metavar="<dashboard-command>")
+    serve = dashboard_sub.add_parser(
+        "serve",
+        help="Serve the live dashboard for an output directory.",
+        description="Start the local dashboard server for an existing FastMDXplora output.",
+    )
+    serve.add_argument(
+        "--output",
+        required=True,
+        metavar="DIR",
+        help="FastMDXplora output directory to watch.",
+    )
+    serve.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address (default: 127.0.0.1).",
+    )
+    serve.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Port to serve on (default: 8765).",
+    )
+
     # init-config: write a commented YAML template
     ic = sub.add_parser(
         "init-config",
@@ -532,7 +598,30 @@ def _build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # Subcommand handlers
 # ---------------------------------------------------------------------------
-def _make_orchestrator(args: argparse.Namespace) -> FastMDXplora:
+def _infer_system_from_output(output_dir: str | None) -> str | None:
+    """Best-effort system inference for report/analyze reruns on existing output."""
+    if not output_dir:
+        return None
+
+    import json
+
+    root = Path(output_dir)
+    manifest = root / "manifest.json"
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    system = data.get("system")
+    if system:
+        return str(system)
+
+    topology = root / "simulation" / "topology.pdb"
+    if topology.exists():
+        return str(topology)
+    return None
+
+
+def _make_orchestrator(args: argparse.Namespace, *, phase: str | None = None) -> FastMDXplora:
     """Build a single-system orchestrator for the per-phase subcommands.
 
     The per-phase commands (setup/simulate/analyze/report) operate on one
@@ -540,7 +629,11 @@ def _make_orchestrator(args: argparse.Namespace) -> FastMDXplora:
     through BatchExplorer instead.
     """
     config = getattr(args, "config", None)
-    if not args.system and not config:
+    inferred_system = (
+        _infer_system_from_output(args.output_dir)
+        if phase in {"analyze", "report"} else None
+    )
+    if not args.system and not config and not inferred_system:
         raise SystemExit(
             "fastmdx: this command requires a system input "
             "(-s / -system / --system) or a --config file."
@@ -554,7 +647,7 @@ def _make_orchestrator(args: argparse.Namespace) -> FastMDXplora:
         systems = normalize_systems(raw.get("systems") or [])
         system = systems[0]["system"]
     else:
-        system = args.system
+        system = args.system or inferred_system
     return FastMDXplora(
         system=system,
         output_dir=args.output_dir,
@@ -615,6 +708,72 @@ def _build_explore_config(args: argparse.Namespace) -> dict[str, Any]:
     return config
 
 
+def _dashboard_requested(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "dashboard", False))
+
+
+def _enable_dashboard_telemetry(config: dict[str, Any]) -> None:
+    simulation = dict(config.get("simulation", {}))
+    simulation["live_telemetry"] = True
+    config["simulation"] = simulation
+
+
+def _resolve_dashboard_output_dir(args: argparse.Namespace, config: dict[str, Any] | None = None) -> Path:
+    raw_output = getattr(args, "output_dir", None)
+    if not raw_output and config:
+        raw_output = config.get("output")
+    if not raw_output:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        raw_output = f"fastmdxplora_output_{timestamp}"
+    return Path(raw_output).expanduser().resolve()
+
+
+def _start_dashboard_for_command(args: argparse.Namespace, output_dir: Path):
+    from fastmdxplora.live.server import start_dashboard_session
+
+    session = start_dashboard_session(
+        output=output_dir,
+        host=args.dashboard_host,
+        port=args.dashboard_port,
+    )
+    print(f"Live dashboard running at: {session.url}")
+    if session.port_was_changed:
+        print(
+            f"Requested port {session.requested_port} was busy, "
+            f"so FastMDXplora used {session.port}."
+        )
+    if args.dashboard_host == "0.0.0.0":
+        print(
+            "Warning: dashboard is bound to 0.0.0.0 and may be visible on your network."
+        )
+        print("Use --dashboard-host 127.0.0.1 for local-only access.")
+    print(f"Watching output folder: {output_dir}")
+    print("Open this URL in your browser to monitor the run.")
+    if args.dashboard_stop_on_complete:
+        print("Dashboard will stop automatically after the workflow completes.")
+    else:
+        print("Press Ctrl+C to stop the dashboard after the workflow completes.")
+    print()
+    return session
+
+
+def _finish_dashboard_for_command(session, args: argparse.Namespace) -> None:
+    if session is None:
+        return
+    if args.dashboard_stop_on_complete:
+        session.stop()
+        return
+    print()
+    print(f"Workflow complete. Live dashboard is still running at: {session.url}")
+    print("Press Ctrl+C to stop the dashboard.")
+    try:
+        session.wait_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        session.stop()
+
+
 def _cmd_explore(args: argparse.Namespace) -> int:
     from fastmdxplora import FastMDXplora
 
@@ -638,12 +797,31 @@ def _cmd_explore(args: argparse.Namespace) -> int:
         if "report" not in existing:
             config["exclude"] = [*existing, "report"]
 
+    if _dashboard_requested(args):
+        _enable_dashboard_telemetry(config)
+    dashboard_output_dir: Path | None = None
+    if _dashboard_requested(args):
+        dashboard_output_dir = _resolve_dashboard_output_dir(args, config)
+        config["output"] = str(dashboard_output_dir)
+
     fmdx = FastMDXplora(
         config_data=config,
         output_dir=args.output_dir,
         verbose=args.verbose,
     )
-    results = fmdx.explore(dry_run=getattr(args, "dry_run", False))
+    session = None
+    if _dashboard_requested(args) and not getattr(args, "dry_run", False):
+        session = _start_dashboard_for_command(args, dashboard_output_dir)
+    try:
+        results = fmdx.explore(dry_run=getattr(args, "dry_run", False))
+    except KeyboardInterrupt:
+        if session is not None:
+            session.stop()
+        return 130
+    except Exception:
+        if session is not None:
+            session.stop()
+        raise
 
     # Dry run: the plan was printed; nothing executed.
     if getattr(args, "dry_run", False):
@@ -654,13 +832,17 @@ def _cmd_explore(args: argparse.Namespace) -> int:
         print()
         print(f"Project output: {fmdx.output_dir}")
         print(f"Manifest:       {fmdx.output_dir / 'manifest.json'}")
-    return 0 if all(r.status == "ok" for r in results) else 1
+    rc = 0 if all(r.status == "ok" for r in results) else 1
+    _finish_dashboard_for_command(session, args)
+    return rc
 
 
 def _cmd_phase(phase: str, args: argparse.Namespace) -> int:
-    fmdx = _make_orchestrator(args)
+    fmdx = _make_orchestrator(args, phase=phase)
     opts_list, _ = _PHASE_SPEC[phase]
     kwargs = _harvest_phase_options(args, opts_list)
+    if _dashboard_requested(args) and phase == "simulate":
+        kwargs["live_telemetry"] = True
 
     method = {
         "setup":    fmdx.setup,
@@ -671,13 +853,30 @@ def _cmd_phase(phase: str, args: argparse.Namespace) -> int:
 
     # Bracket the single-phase invocation with presenter output so the
     # user sees the same visual structure as during `fastmdx explore`.
-    fmdx._presenter.phase_start(phase)  # noqa: SLF001 -- internal hook
-    result = method(**kwargs)
-    fmdx._presenter.phase_end(phase, status=result.status)
-    fmdx._write_manifest()  # noqa: SLF001 -- single-phase still records
+    session = None
+    if _dashboard_requested(args):
+        output_dir = _resolve_dashboard_output_dir(args)
+        if not getattr(args, "output_dir", None):
+            output_dir = Path(fmdx.output_dir).expanduser().resolve()
+        session = _start_dashboard_for_command(args, output_dir)
+    try:
+        fmdx._presenter.phase_start(phase)  # noqa: SLF001 -- internal hook
+        result = method(**kwargs)
+        fmdx._presenter.phase_end(phase, status=result.status)
+        fmdx._write_manifest()  # noqa: SLF001 -- single-phase still records
+    except KeyboardInterrupt:
+        if session is not None:
+            session.stop()
+        return 130
+    except Exception:
+        if session is not None:
+            session.stop()
+        raise
     print()
     print(f"Project output: {fmdx.output_dir}")
-    return 0 if result.status == "ok" else 1
+    rc = 0 if result.status == "ok" else 1
+    _finish_dashboard_for_command(session, args)
+    return rc
 
 
 def _cmd_info() -> int:
@@ -825,6 +1024,16 @@ def _missing_chemistry_backends() -> list[str]:
     return sorted({("openmm" if name.startswith("openmm") else name) for name in failing})
 
 
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    if args.dashboard_command != "serve":
+        print("fastmdx: dashboard requires a subcommand, e.g. `dashboard serve`.", file=sys.stderr)
+        return 2
+    from fastmdxplora.live.server import serve_dashboard
+
+    serve_dashboard(output=args.output, host=args.host, port=args.port)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -885,6 +1094,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "init-config":
         return _cmd_init_config(args)
+    if args.command == "dashboard":
+        return _cmd_dashboard(args)
 
     if args.command == "health":
         return _cmd_health(args)

@@ -13,6 +13,19 @@ The form is auto-detected, so there is no separate `--pdb-id` flag.
 
 ## Command-line interface
 
+The examples use the installed `fastmdx` console script. If Windows
+PowerShell says `fastmdx` is not recognized, use the module entrypoint with
+the same arguments:
+
+```powershell
+python -m fastmdxplora.cli.main info
+python -m fastmdxplora.cli.main explore --system protein.pdb
+```
+
+That usually means FastMDXplora is importable but the Python console-script
+directory is not on PATH. See the installation troubleshooting section for
+PATH checks.
+
 ### The simplest run
 
 Run the whole pipeline on a structure file:
@@ -81,13 +94,37 @@ Each phase is also its own subcommand. Here the per-phase flags are bare
 
 ```bash
 fastmdx setup    --system protein.pdb --ph 6.5 --box-shape octahedron
-fastmdx simulate --output ./trpcage_study --duration-ns 50.0 --platform CUDA
+fastmdx simulate --system protein.pdb --output ./trpcage_study --duration-ns 50.0 --platform CUDA
 fastmdx analyze  --output ./trpcage_study --analyses rmsd rg --selection "name CA"
 fastmdx report   --output ./trpcage_study --no-slides
 ```
 
 Pointing later phases at the same `--output` lets them pick up the
-artifacts the earlier phases wrote.
+artifacts the earlier phases wrote. `analyze` and `report` can infer the
+system from an existing run manifest; `setup` and `simulate` still need
+`--system` or `--config`.
+
+The report phase writes `report/report.md`, `report/dashboard.html`,
+`report/slides.pptx`, and `report/project_bundle.zip`. Open
+`<output>/report/dashboard.html` directly in a browser for the static
+dashboard view.
+
+For local live monitoring, add `--dashboard` to the workflow command. This
+starts the localhost dashboard before the workflow begins and automatically
+enables live telemetry when simulation runs:
+
+```bash
+fastmdx explore --system protein.pdb --output ./trpcage_study --include setup simulation --dashboard
+```
+
+PowerShell fallback when `fastmdx` is not on PATH:
+
+```powershell
+python -m fastmdxplora.cli.main explore --system protein.pdb --output .\trpcage_study --include setup simulation --dashboard
+```
+
+`fastmdx dashboard serve --output ./trpcage_study` remains available when you
+want to reopen an existing run folder manually.
 
 ### MD engine controls
 
@@ -305,7 +342,9 @@ fmdx = FastMDXplora(system="protein.pdb")
 results = fmdx.explore()
 
 for r in results:
-    print(r.name, r.status)        # e.g. "setup ok", "simulation ok"
+    print(r.run_id, r.status)
+    for phase in r.phases:
+        print("  ", phase.name, phase.status)
 ```
 
 The recommended import alias mirrors the CLI name:
@@ -346,7 +385,7 @@ for phase in run.phases:
 
 `explore()` **always returns a list of `RunResult`** — a single study is a
 list of one, a sweep is a list of many. Each `RunResult` carries
-`run_id`, `system`, `status` (`"ok"`/`"error"`), `output_dir`,
+`run_id`, `system`, `status` (`"ok"`/`"error"`/`"skipped"`), `output_dir`,
 `sweep_values`, and `phases` (the list of `PhaseResult` for that run).
 The iteration idiom is the same no matter how many runs there are:
 

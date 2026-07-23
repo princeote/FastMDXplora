@@ -90,6 +90,8 @@ DEFAULTS: dict[str, Any] = {
     "trajectory_interval_steps": None,   # None = adaptive
     "state_interval_steps": 1000,
     "checkpoint_interval_steps": 10000,  # binary .chk for restart
+    "live_telemetry": False,
+    "telemetry_interval": 1000,
 
     # Enhanced sampling (PLUMED). None/absent = disabled. When set, a dict:
     #   {"enabled": true, "script": "<inline script or path to .dat>"}
@@ -227,6 +229,8 @@ def run(
             trajectory_interval_steps=params["trajectory_interval_steps"],
             state_interval_steps=int(params["state_interval_steps"]),
             checkpoint_interval_steps=int(params["checkpoint_interval_steps"]),
+            live_telemetry=bool(params["live_telemetry"]),
+            telemetry_interval=int(params["telemetry_interval"]),
             on_progress=_progress,
             plumed=params.get("plumed"),
         )

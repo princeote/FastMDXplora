@@ -72,11 +72,12 @@ class RunResult:
 
     run_id: str
     system: str
-    status: str  # "ok" | "error"
+    status: str  # "ok" | "error" | "skipped"
     output_dir: Path | None = None
     sweep_values: dict[str, Any] = field(default_factory=dict)
     phases: list[PhaseResult] = field(default_factory=list)
     message: str = ""
+    error_type: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -87,6 +88,7 @@ class RunResult:
             "sweep_values": self.sweep_values,
             "phases": [p.to_dict() for p in self.phases],
             "message": self.message,
+            "error_type": self.error_type,
         }
 
     # Convenience: treat a RunResult a bit like its phase list, so common

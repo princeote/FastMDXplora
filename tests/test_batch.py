@@ -15,6 +15,7 @@ Covers:
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 import json
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from fastmdxplora.batch import (
 from fastmdxplora.batch.sweep import is_batch_config
 from fastmdxplora.config import ConfigError, validate_config
 from fastmdxplora.cli.main import main as cli_main
+from fastmdxplora.orchestrator import PhaseResult, RunResult
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +52,71 @@ def _write(tmp_path: Path, text: str, name: str = "batch.yml") -> Path:
     p = tmp_path / name
     p.write_text(text)
     return p
+
+
+def _fake_worker_factory(*, fail_values: set[int], write_analysis: bool = False, calls=None):
+    def _fake_execute_run(
+        spec_dict,
+        run_out,
+        include,
+        exclude,
+        verbose,
+        device_override,
+    ):
+        out = Path(run_out)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "worker_marker.txt").write_text(spec_dict["run_id"], encoding="utf-8")
+        if calls is not None:
+            calls.append(spec_dict["run_id"])
+
+        value = spec_dict["sweep_values"].get("setup.ph")
+        phase_dir = out / "setup"
+        phase_dir.mkdir(exist_ok=True)
+        status = "error" if value in fail_values else "ok"
+        message = "RuntimeError: intentional batch failure" if status == "error" else ""
+        phase = PhaseResult(
+            name="setup",
+            status=status,
+            output_dir=phase_dir,
+            message=message,
+            artifacts=["worker_marker.txt"] if status == "ok" else [],
+        )
+
+        if status == "ok" and write_analysis:
+            rmsd_dir = out / "analysis" / "rmsd"
+            rmsd_dir.mkdir(parents=True, exist_ok=True)
+            (rmsd_dir / "rmsd.dat").write_text("0.1\n0.2\n0.3\n", encoding="utf-8")
+
+        return RunResult(
+            run_id=spec_dict["run_id"],
+            system=spec_dict["system"],
+            status=status,
+            output_dir=out,
+            sweep_values=spec_dict["sweep_values"],
+            phases=[phase],
+            message=message,
+            error_type="PhaseError" if status == "error" else None,
+        )
+
+    return _fake_execute_run
+
+
+class _ImmediateProcessPoolExecutor:
+    """Synchronous ProcessPoolExecutor stand-in for deterministic scheduler tests."""
+
+    def __init__(self, max_workers):
+        self.max_workers = max_workers
+
+    def submit(self, fn, *args):
+        fut = Future()
+        try:
+            fut.set_result(fn(*args))
+        except Exception as exc:  # noqa: BLE001
+            fut.set_exception(exc)
+        return fut
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        return None
 
 
 # ===========================================================================
@@ -553,6 +620,159 @@ execution:
         # and must produce a valid record.
         assert record.run_id == "a__t-300"
         assert record.status in ("ok", "error")
+
+
+class TestContinueOnErrorScheduling:
+    def _cfg(self, tmp_path, stub_pdb, *, mode, continue_on_error, values=(6, 7, 8)):
+        vals = ", ".join(str(v) for v in values)
+        return _write(tmp_path, f"""
+output: {tmp_path / f'b_{mode}_{continue_on_error}'}
+include: [setup]
+systems:
+  - {{id: a, system: {stub_pdb}}}
+sweep:
+  setup.ph: [{vals}]
+execution:
+  mode: {mode}
+  workers: 1
+  continue_on_error: {str(continue_on_error).lower()}
+""", name=f"{mode}_{continue_on_error}.yml")
+
+    def test_sequential_continue_true_records_failure_and_keeps_running(
+        self, tmp_path, stub_pdb, monkeypatch
+    ):
+        import fastmdxplora.batch.explorer as batch_explorer
+
+        calls = []
+        monkeypatch.setattr(
+            batch_explorer,
+            "_execute_run",
+            _fake_worker_factory(fail_values={7}, calls=calls),
+        )
+        cfg = self._cfg(tmp_path, stub_pdb, mode="sequential", continue_on_error=True)
+
+        results = BatchExplorer(config=str(cfg)).run()
+
+        assert [r.status for r in results] == ["ok", "error", "ok"]
+        assert calls == ["a__ph-6", "a__ph-7", "a__ph-8"]
+        manifest = json.loads(
+            (tmp_path / "b_sequential_True" / "batch_manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        failed = manifest["runs"][1]
+        assert failed["status"] == "error"
+        assert failed["error_type"] == "PhaseError"
+        assert failed["phases"][0]["name"] == "setup"
+        assert failed["phases"][0]["status"] == "error"
+        assert "intentional batch failure" in failed["message"]
+        for run in manifest["runs"]:
+            assert Path(run["output_dir"], "worker_marker.txt").is_file()
+
+    def test_sequential_continue_false_stops_and_marks_later_runs_skipped(
+        self, tmp_path, stub_pdb, monkeypatch
+    ):
+        import fastmdxplora.batch.explorer as batch_explorer
+
+        calls = []
+        monkeypatch.setattr(
+            batch_explorer,
+            "_execute_run",
+            _fake_worker_factory(fail_values={7}, calls=calls),
+        )
+        cfg = self._cfg(tmp_path, stub_pdb, mode="sequential", continue_on_error=False)
+
+        results = BatchExplorer(config=str(cfg)).run()
+
+        assert [r.status for r in results] == ["ok", "error", "skipped"]
+        assert calls == ["a__ph-6", "a__ph-7"]
+        skipped = results[2]
+        assert "continue_on_error=False" in skipped.message
+        assert not (skipped.output_dir / "worker_marker.txt").exists()
+
+    def test_parallel_continue_true_collects_successes_and_failures(
+        self, tmp_path, stub_pdb, monkeypatch
+    ):
+        import fastmdxplora.batch.explorer as batch_explorer
+
+        calls = []
+        monkeypatch.setattr(batch_explorer, "ProcessPoolExecutor", _ImmediateProcessPoolExecutor)
+        monkeypatch.setattr(
+            batch_explorer,
+            "_execute_run",
+            _fake_worker_factory(fail_values={7}, calls=calls),
+        )
+        cfg = self._cfg(tmp_path, stub_pdb, mode="parallel", continue_on_error=True)
+
+        results = BatchExplorer(config=str(cfg)).run()
+
+        assert [r.status for r in results] == ["ok", "error", "ok"]
+        assert calls == ["a__ph-6", "a__ph-7", "a__ph-8"]
+
+    def test_parallel_continue_false_stops_submitting_and_marks_skipped(
+        self, tmp_path, stub_pdb, monkeypatch
+    ):
+        import fastmdxplora.batch.explorer as batch_explorer
+
+        calls = []
+        monkeypatch.setattr(batch_explorer, "ProcessPoolExecutor", _ImmediateProcessPoolExecutor)
+        monkeypatch.setattr(
+            batch_explorer,
+            "_execute_run",
+            _fake_worker_factory(fail_values={7}, calls=calls),
+        )
+        cfg = self._cfg(
+            tmp_path,
+            stub_pdb,
+            mode="parallel",
+            continue_on_error=False,
+            values=(6, 7, 8, 9),
+        )
+
+        results = BatchExplorer(config=str(cfg)).run()
+
+        assert [r.status for r in results] == ["ok", "error", "skipped", "skipped"]
+        assert calls == ["a__ph-6", "a__ph-7"]
+        assert all("continue_on_error=False" in r.message for r in results[2:])
+        assert not (results[2].output_dir / "worker_marker.txt").exists()
+
+    def test_batch_cli_returns_failure_exit_code_for_failed_run(
+        self, tmp_path, stub_pdb, monkeypatch
+    ):
+        import fastmdxplora.batch.explorer as batch_explorer
+
+        monkeypatch.setattr(
+            batch_explorer,
+            "_execute_run",
+            _fake_worker_factory(fail_values={7}),
+        )
+        cfg = self._cfg(tmp_path, stub_pdb, mode="sequential", continue_on_error=True)
+
+        rc = cli_main(["explore", "--config", str(cfg)])
+
+        assert rc == 1
+
+    def test_failed_run_does_not_break_comparison_from_successful_runs(
+        self, tmp_path, stub_pdb, monkeypatch
+    ):
+        import fastmdxplora.batch.explorer as batch_explorer
+
+        monkeypatch.setattr(
+            batch_explorer,
+            "_execute_run",
+            _fake_worker_factory(fail_values={7}, write_analysis=True),
+        )
+        cfg = self._cfg(tmp_path, stub_pdb, mode="sequential", continue_on_error=True)
+
+        results = BatchExplorer(config=str(cfg)).run()
+
+        assert [r.status for r in results] == ["ok", "error", "ok"]
+        cmp_dir = tmp_path / "b_sequential_True" / "comparison"
+        assert (cmp_dir / "comparison_report.md").is_file()
+        summary = (cmp_dir / "comparison_summary.csv").read_text(encoding="utf-8")
+        assert "a__ph-6" in summary
+        assert "a__ph-8" in summary
+        assert "a__ph-7" not in summary
 
 
 # ===========================================================================

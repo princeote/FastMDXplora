@@ -23,11 +23,38 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import quote
+
+from fastmdxplora.report.context import PhaseContext, load_phase_context
 
 if TYPE_CHECKING:
     from fastmdxplora.orchestrator import FastMDXplora
 
 logger = get_logger("report.document")
+
+
+def _one_line(value: object, *, limit: int = 1000) -> str:
+    text = str(value)
+    text = " ".join(text.replace("\t", " ").splitlines())
+    text = " ".join(text.split())
+    if len(text) > limit:
+        return text[: limit - 1].rstrip() + "..."
+    return text
+
+
+def _md_text(value: object, *, limit: int = 1000) -> str:
+    text = _one_line(value, limit=limit)
+    for char in "\\`*_{}[]()#+-.!|<>":
+        text = text.replace(char, f"\\{char}")
+    return text
+
+
+def _code_text(value: object, *, limit: int = 1000) -> str:
+    return _one_line(value, limit=limit).replace("`", "'")
+
+
+def _link_target(path: str) -> str:
+    return quote(path, safe="/._-")
 
 
 def _load_json_safely(path: Path) -> dict | None:
@@ -41,7 +68,31 @@ def _load_json_safely(path: Path) -> dict | None:
         return None
 
 
-def _methods_section(project_root: Path) -> str:
+def _summary_section(phase_context: PhaseContext) -> str:
+    if phase_context.is_full_pipeline:
+        summary = (
+            "This report was generated automatically by FastMDXplora from the "
+            "outputs of an end-to-end molecular dynamics study."
+        )
+    elif phase_context.is_analysis_from_existing_trajectory:
+        summary = (
+            "This report was generated from an existing trajectory. Setup and "
+            "simulation were not run in this workflow."
+        )
+    elif phase_context.analysis_present:
+        summary = (
+            "This report summarizes the FastMDXplora phases recorded for this "
+            "workflow."
+        )
+    else:
+        summary = (
+            "This report summarizes the available FastMDXplora outputs for "
+            "this workflow."
+        )
+    return f"## Summary\n\n{summary}"
+
+
+def _methods_section(project_root: Path, phase_context: PhaseContext) -> str:
     setup = _load_json_safely(project_root / "setup" / "setup_parameters.json") or {}
     sim = _load_json_safely(project_root / "simulation" / "simulation_parameters.json") or {}
     setup_params = setup.get("parameters", {})
@@ -57,10 +108,13 @@ def _methods_section(project_root: Path) -> str:
         )
         lines.append("")
         for k, v in setup_params.items():
-            lines.append(f"- **{k}**: `{v}`")
+            lines.append(f"- **{_md_text(k)}**: `{_code_text(v)}`")
     else:
         lines.append("")
-        lines.append("Setup parameters were not recorded for this run.")
+        if phase_context.setup_present:
+            lines.append("Setup ran in this workflow, but parameters were not recorded.")
+        else:
+            lines.append("Setup was not run in this workflow.")
 
     lines.append("")
     lines.append("### Molecular dynamics simulation")
@@ -71,10 +125,21 @@ def _methods_section(project_root: Path) -> str:
         )
         lines.append("")
         for k, v in sim_params.items():
-            lines.append(f"- **{k}**: `{v}`")
+            lines.append(f"- **{_md_text(k)}**: `{_code_text(v)}`")
     else:
         lines.append("")
-        lines.append("Simulation parameters were not recorded for this run.")
+        if phase_context.simulation_present:
+            lines.append(
+                "Simulation ran in this workflow, but parameters were not recorded."
+            )
+        elif phase_context.analysis_present:
+            lines.append(
+                "Simulation was not run in this workflow. Analysis was performed "
+                "on externally provided or previously generated trajectory/topology "
+                "files."
+            )
+        else:
+            lines.append("Simulation was not run in this workflow.")
 
     return "\n".join(lines)
 
@@ -98,12 +163,54 @@ def _results_section(project_root: Path) -> str:
             f"Analysis was performed on a trajectory of {n_frames} frames "
             f"and {n_residues} residues."
         )
-    lines.append(f"Analyses performed: {', '.join(plan)}.")
+    lines.append(f"Analyses performed: {', '.join(_md_text(a) for a in plan)}.")
     lines.append("")
+
+    summary_fig = project_root / "report" / "analysis_summary.png"
+    summary_manifest = project_root / "report" / "analysis_summary_manifest.json"
+    if summary_fig.is_file():
+        lines.append("### Analysis Summary Figure")
+        lines.append("")
+        lines.append("![Analysis summary](analysis_summary.png)")
+        lines.append("")
+        if summary_manifest.is_file():
+            lines.append(
+                "_Panel inclusion and skipped optional source figures are recorded "
+                "in `analysis_summary_manifest.json`._"
+            )
+            lines.append("")
+
+    region_fig = project_root / "report" / "region_highlight_summary.png"
+    region_manifest = project_root / "report" / "region_highlight_manifest.json"
+    if region_fig.is_file():
+        lines.append("### Region Highlight Figure")
+        lines.append("")
+        lines.append(
+            "User-configured residue regions are highlighted on the RMSF "
+            "profile. These labels are user-provided annotations."
+        )
+        lines.append("")
+        lines.append("![Region highlights](region_highlight_summary.png)")
+        lines.append("")
+        if region_manifest.is_file():
+            lines.append(
+                "_Generation details and any skipped optional structure panel "
+                "are recorded in `region_highlight_manifest.json`._"
+            )
+            lines.append("")
+            region_meta = _load_json_safely(region_manifest) or {}
+            skipped = region_meta.get("skipped") or []
+            for item in skipped:
+                reason = item.get("reason")
+                if reason:
+                    lines.append(f"_Structure note: {_md_text(reason)}_")
+                    lines.append("")
+                    break
 
     for analysis in plan:
         # Pretty heading: uppercase short names, title-case longer ones
         heading = analysis.upper() if len(analysis) <= 4 else analysis.title()
+        heading = _md_text(heading)
         lines.append(f"### {heading}")
         lines.append("")
 
@@ -116,7 +223,7 @@ def _results_section(project_root: Path) -> str:
                 f"`{status}`)._"
             )
             if result_meta.get("message"):
-                lines.append(f"Reason: {result_meta['message']}")
+                lines.append(f"Reason: {_md_text(result_meta['message'])}")
             lines.append("")
             continue
 
@@ -131,9 +238,9 @@ def _results_section(project_root: Path) -> str:
         if opts or selection:
             lines.append("**Parameters:**")
             if selection:
-                lines.append(f"- `selection`: `{selection}`")
+                lines.append(f"- `selection`: `{_code_text(selection)}`")
             for k, v in opts.items():
-                lines.append(f"- `{k}`: `{v}`")
+                lines.append(f"- `{_code_text(k)}`: `{_code_text(v)}`")
         else:
             lines.append("_Ran with default options._")
         lines.append("")
@@ -148,8 +255,8 @@ def _results_section(project_root: Path) -> str:
                 # Markdown/HTML image links require forward slashes on every
                 # OS; str(WindowsPath) would emit backslashes and break them.
                 rel = fig.relative_to(project_root).as_posix()
-                caption = f"{analysis} — {fig.stem}"
-                lines.append(f"![{caption}]({rel})")
+                caption = _md_text(f"{analysis} — {fig.stem}")
+                lines.append(f"![{caption}]({_link_target(rel)})")
                 lines.append("")
         else:
             lines.append("_No figure was produced for this analysis._")
@@ -188,22 +295,36 @@ def _citation_section() -> str:
     )
 
 
-def _reproducibility_section(orchestrator: "FastMDXplora") -> str:
+def _reproducibility_section(
+    orchestrator: "FastMDXplora",
+    phase_context: PhaseContext,
+) -> str:
     from fastmdxplora import __version__
 
     lines = ["## Reproducibility", ""]
     lines.append(f"- **FastMDXplora version**: `{__version__}`")
     lines.append(f"- **Python**: `{sys.version.split()[0]}`")
     lines.append(f"- **Platform**: `{platform.platform()}`")
-    lines.append(f"- **System input**: `{orchestrator.system}`")
-    lines.append(f"- **Output directory**: `{orchestrator.output_dir}`")
+    lines.append(f"- **System input**: `{_code_text(orchestrator.system)}`")
+    lines.append(f"- **Output directory**: `{_code_text(orchestrator.output_dir)}`")
     lines.append("")
-    lines.append(
-        "Per-phase parameter manifests are preserved at "
-        "`setup/setup_parameters.json`, `simulation/simulation_parameters.json`, "
-        "and `analysis/analysis_manifest.json`. The complete session manifest "
-        "is at `manifest.json` at the project root."
-    )
+    manifests: list[str] = []
+    if phase_context.setup_present:
+        manifests.append("`setup/setup_parameters.json`")
+    if phase_context.simulation_present:
+        manifests.append("`simulation/simulation_parameters.json`")
+    if phase_context.analysis_present:
+        manifests.append("`analysis/analysis_manifest.json`")
+    if manifests:
+        lines.append(
+            "Per-phase parameter manifests for phases in this workflow are "
+            f"preserved at {', '.join(manifests)}. The complete session manifest "
+            "is at `manifest.json` at the project root."
+        )
+    else:
+        lines.append(
+            "The complete session manifest is at `manifest.json` at the project root."
+        )
     return "\n".join(lines)
 
 
@@ -224,23 +345,22 @@ def build_document(
         Artifact paths relative to ``output_dir``.
     """
     project_root = orchestrator.output_dir
+    phase_context = load_phase_context(project_root)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     sections: list[str] = []
-    header = [f"# {title}", ""]
+    header = [f"# {_md_text(title, limit=200)}", ""]
     if author:
-        header.append(f"_Author: {author}_  ")
+        header.append(f"_Author: {_md_text(author, limit=200)}_  ")
     header.append(f"_Generated: {now} (UTC)_  ")
-    header.append(f"_Tool: FastMDXplora_")
+    header.append("_Tool: FastMDXplora_  ")
+    header.append("_Dashboard: [dashboard.html](dashboard.html)_")
     sections.append("\n".join(header))
 
-    sections.append(
-        "## Summary\n\nThis report was generated automatically by FastMDXplora "
-        "from the outputs of an end-to-end molecular dynamics study."
-    )
+    sections.append(_summary_section(phase_context))
 
     if include_methods:
-        sections.append(_methods_section(project_root))
+        sections.append(_methods_section(project_root, phase_context))
 
     sections.append(_results_section(project_root))
 
@@ -253,7 +373,7 @@ def build_document(
     sections.append(_citation_section())
 
     if include_reproducibility:
-        sections.append(_reproducibility_section(orchestrator))
+        sections.append(_reproducibility_section(orchestrator, phase_context))
 
     doc = "\n\n".join(sections) + "\n"
     md_path = output_dir / "report.md"

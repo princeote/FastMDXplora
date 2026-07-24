@@ -305,9 +305,24 @@ def test_server_helpers_cover_changed_display_branches(tmp_path: Path, monkeypat
     assert server._plot_category("analysis/sasa/plot.png") == "Additional Analysis"
     assert server._plot_category("misc/plot.png") == "Other"
 
+    def fail_open(*_args, **_kwargs):
+        raise OSError("no opener")
+
+    # Windows uses os.startfile; POSIX platforms use subprocess.Popen.
+    # Exercise each branch directly so the test is deterministic on every CI OS.
+    monkeypatch.setattr(server.os, "name", "nt")
+    monkeypatch.setattr(server.os, "startfile", lambda *_a, **_k: None, raising=False)
+    assert server._open_local_path(tmp_path) == (True, "opened")
+    monkeypatch.setattr(server.os, "startfile", fail_open)
+    assert server._open_local_path(tmp_path) == (False, "no opener")
+
+    monkeypatch.setattr(server.os, "name", "posix")
+    monkeypatch.setattr(server.sys, "platform", "darwin")
     monkeypatch.setattr(server.subprocess, "Popen", lambda *_a, **_k: object())
-    assert server._open_local_path(tmp_path)[0] is True
-    monkeypatch.setattr(server.subprocess, "Popen", lambda *_a, **_k: (_ for _ in ()).throw(OSError("no opener")))
+    assert server._open_local_path(tmp_path) == (True, "opened")
+
+    monkeypatch.setattr(server.sys, "platform", "linux")
+    monkeypatch.setattr(server.subprocess, "Popen", fail_open)
     assert server._open_local_path(tmp_path) == (False, "no opener")
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,9 +11,11 @@ import pytest
 
 from fastmdxplora.live import launcher as launch
 from fastmdxplora.live import live_frames as frames
+from fastmdxplora.live import telemetry
 from fastmdxplora.live import trajectory_playback as playback
 from fastmdxplora.live.ligand_detection import detect_ligands, filter_pdb_to_ligand
 from fastmdxplora.live.structure_info import _count_structure_cached, count_structure, ligand_atom_counts
+from fastmdxplora.simulation import runner
 
 
 def _atom(record="ATOM", res="ALA", chain="A", seq=1, x=0.0, y=0.0, z=0.0) -> str:
@@ -378,3 +382,367 @@ def test_server_error_and_launcher_routes(tmp_path: Path, monkeypatch) -> None:
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_runner_live_metric_fields_stage_mapping_and_sample_failure(
+    tmp_path: Path,
+) -> None:
+    """Exercise the dashboard-only OpenMM metric calculations without OpenMM."""
+
+    class Quantity:
+        def __init__(self, value):
+            self.value = value
+
+        def value_in_unit(self, _unit):
+            return self.value
+
+    class Unit:
+        kilojoules_per_mole = 1.0
+        nanometer = 1.0
+        dalton = 1.0
+
+    class State:
+        def getPotentialEnergy(self):
+            return Quantity(-90.0)
+
+        def getKineticEnergy(self):
+            return Quantity(30.0)
+
+        def getPeriodicBoxVolume(self):
+            return Quantity(2.0)
+
+    class System:
+        masses = (12.0, 18.0)
+
+        def getNumParticles(self):
+            return len(self.masses)
+
+        def getNumConstraints(self):
+            return 0
+
+        def getNumForces(self):
+            return 1
+
+        def getForce(self, _index):
+            return type("CMMotionRemover", (), {})()
+
+        def getParticleMass(self, index):
+            return self.masses[index]
+
+    state = State()
+    simulation = SimpleNamespace(
+        context=SimpleNamespace(getState=lambda **_kwargs: state),
+        system=System(),
+        topology="topology",
+    )
+
+    class Recorder:
+        def __init__(self):
+            self.root = tmp_path / "simulation"
+            self.start_time = datetime.now(timezone.utc) - timedelta(seconds=60)
+            self.metrics = []
+            self.stages = []
+            self.events = []
+
+        def append_metric(self, **values):
+            self.metrics.append(values)
+
+        def mark_stage(self, *values, **updates):
+            self.stages.append((values, updates))
+
+        def event(self, message, **updates):
+            self.events.append((message, updates))
+
+    recorder = Recorder()
+    stage_cases = (
+        ("Minimizing energy", "minimization"),
+        ("NVT equilibration", "nvt"),
+        ("NPT equilibration", "npt"),
+        ("Production", "production"),
+        ("custom", "custom"),
+    )
+    with patch.object(runner, "_maybe_write_live_frame") as live_frame:
+        for stage, expected_key in stage_cases:
+            runner._append_live_metric(
+                {"unit": Unit()},
+                simulation,
+                recorder,
+                stage=stage,
+                step=50,
+                total_steps=100,
+                timestep_fs=2.0,
+                frame_count=5,
+            )
+            assert recorder.stages[-1][0] == (expected_key, "current")
+
+    metric = recorder.metrics[-1]
+    assert metric["potential_energy"] == -90.0
+    assert metric["kinetic_energy"] == 30.0
+    assert metric["total_energy"] == -60.0
+    assert metric["temperature"] == pytest.approx(
+        60.0 / (3.0 * 0.00831446261815324)
+    )
+    assert metric["volume"] == 2.0
+    assert metric["density"] == pytest.approx(30.0 * 1.66053906660e-3 / 2.0)
+    assert metric["speed"] > 0
+    assert metric["progress_percent"] == 50.0
+    assert live_frame.call_count == len(stage_cases)
+
+    failed_recorder = Recorder()
+    failed_simulation = SimpleNamespace(
+        context=SimpleNamespace(
+            getState=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("busy"))
+        )
+    )
+    runner._append_live_metric(
+        {"unit": Unit()},
+        failed_simulation,
+        failed_recorder,
+        stage="production",
+        step=1,
+        total_steps=10,
+        timestep_fs=2.0,
+    )
+    assert "could not sample live metrics" in failed_recorder.events[-1][0]
+    assert failed_recorder.events[-1][1]["level"] == "warning"
+
+
+def test_runner_metric_helper_edge_cases(tmp_path: Path) -> None:
+    class Unit:
+        nanometer = 1.0
+        dalton = 1.0
+
+    class ZeroDofSystem:
+        def getNumParticles(self):
+            return 1
+
+        def getNumConstraints(self):
+            return 3
+
+        def getNumForces(self):
+            return 0
+
+    assert runner._temperature_from_kinetic_energy(SimpleNamespace(), None) is None
+    assert (
+        runner._temperature_from_kinetic_energy(
+            SimpleNamespace(system=ZeroDofSystem()), 10.0
+        )
+        is None
+    )
+    assert runner._temperature_from_kinetic_energy(SimpleNamespace(), 10.0) is None
+
+    broken_state = SimpleNamespace(
+        getPeriodicBoxVolume=lambda: (_ for _ in ()).throw(RuntimeError("no box"))
+    )
+    assert runner._periodic_volume_nm3(broken_state, Unit()) is None
+    assert runner._system_density_g_ml(SimpleNamespace(), Unit(), None) is None
+    assert runner._system_density_g_ml(SimpleNamespace(), Unit(), 0.0) is None
+    assert runner._system_density_g_ml(SimpleNamespace(), Unit(), 1.0) is None
+
+    assert (
+        runner._telemetry_speed_ns_day(
+            SimpleNamespace(start_time="not a datetime"), 1.0
+        )
+        is None
+    )
+    assert (
+        runner._telemetry_speed_ns_day(
+            SimpleNamespace(start_time=datetime.now(timezone.utc) + timedelta(days=1)),
+            1.0,
+        )
+        is None
+    )
+    assert (
+        runner._telemetry_speed_ns_day(
+            SimpleNamespace(start_time=datetime.now(timezone.utc) - timedelta(days=1)),
+            1.0,
+        )
+        == pytest.approx(1.0, rel=0.01)
+    )
+
+    class BadQuantity:
+        def value_in_unit(self, _unit):
+            raise RuntimeError("bad quantity")
+
+    assert runner._quantity_to_float(BadQuantity(), 1.0) is None
+    assert runner._quantity_to_float("not numeric", 1.0) is None
+    assert runner._quantity_to_float([[3.5, 4.5]], 1.0) == 3.5
+
+    # Live-frame snapshots are best-effort and must not terminate a run.
+    simulation = SimpleNamespace(
+        context=SimpleNamespace(
+            getState=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("busy"))
+        )
+    )
+    runner._maybe_write_live_frame(
+        {"PDBFile": SimpleNamespace(writeFile=lambda *_a, **_k: None)},
+        simulation,
+        SimpleNamespace(root=tmp_path),
+        1,
+        stage="nvt",
+        simulation_time_ns=0.1,
+    )
+
+
+def test_telemetry_merges_live_and_energy_rows_and_normalizes_status(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    simulation_dir = run_root / "simulation"
+    simulation_dir.mkdir(parents=True)
+    status_path = simulation_dir / telemetry.STATUS_FILE
+    status_path.write_text(
+        json.dumps(
+            {
+                "run_started_at": "2026-07-24T12:00:00",
+                "stage_states": ["invalid"],
+                "current_frame_count": 7,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    writer = telemetry.TelemetryWriter(simulation_dir)
+    writer.write_status(stage="production")
+    status = telemetry.read_status(run_root)
+    assert status["run_started_at"].endswith("+00:00")
+    assert status["stage_states"] == {
+        name: "waiting" for name in telemetry.STAGE_ORDER
+    }
+    assert status["current_frame_count"] == 7
+
+    before = dict(status["stage_states"])
+    writer.mark_stage("not-a-stage", "failed")
+    assert telemetry.read_status(run_root)["stage_states"] == before
+    writer.mark_stage("analysis", "CURRENT", status="running")
+    assert telemetry.read_status(run_root)["stage_states"]["analysis"] == "current"
+
+    (simulation_dir / telemetry.METRICS_FILE).write_text(
+        "timestamp,stage,step,temperature,current_frame_count\n"
+        ",production,10,,\n",
+        encoding="utf-8",
+    )
+    (simulation_dir / "energy.csv").write_text(
+        '#"Step","Time (ps)","Temperature (K)","Speed (ns/day)","Ignored"\n'
+        "10,2500,302.0,4.2,value\n"
+        "20,bad,303.0,5.0,value\n",
+        encoding="utf-8",
+    )
+    metrics = telemetry.read_metrics(run_root)
+    assert len(metrics) == 1
+    assert metrics[0]["temperature"] == "302.0"
+    assert metrics[0]["simulation_time_ns"] == "2.5"
+    assert metrics[0]["speed"] == "4.2"
+    assert metrics[0]["current_frame_count"] == "7"
+
+    assert telemetry._normalise_energy_header("unknown") is None
+    assert telemetry._parse_iso_datetime(None) is None
+    assert telemetry._parse_iso_datetime("bad-date") is None
+    assert telemetry._parse_iso_datetime("2026-07-24T12:00:00").tzinfo is not None
+
+    status_path.write_text("[]", encoding="utf-8")
+    assert telemetry._read_status_path(status_path) == {}
+    status_path.write_text("{bad", encoding="utf-8")
+    assert telemetry._read_status_path(status_path) == {}
+
+
+def test_cli_dashboard_remaining_lifecycle_and_startup_branches(
+    tmp_path: Path,
+) -> None:
+    import importlib
+
+    cli = importlib.import_module("fastmdxplora.cli.main")
+
+    url, enabled = cli._startup_dashboard_details(
+        ["dashboard", "serve", "--host=0.0.0.0", "--port", "9001"]
+    )
+    assert (url, enabled) == ("http://127.0.0.1:9001", True)
+
+    url, enabled = cli._startup_dashboard_details(
+        ["explore", "--dashboard-host", "localhost", "--dashboard-port=9002"]
+    )
+    assert (url, enabled) == ("http://localhost:9002", False)
+
+    with patch.dict(
+        os.environ,
+        {
+            "FASTMDX_DASHBOARD_ACTIVE": "1",
+            "FASTMDX_DASHBOARD_URL": "http://example.test:1234",
+        },
+    ):
+        assert cli._startup_dashboard_details([]) == (
+            "http://example.test:1234",
+            True,
+        )
+
+    assert cli._dashboard_requested(SimpleNamespace(dashboard=True))
+    assert not cli._dashboard_requested(SimpleNamespace())
+    config = {}
+    cli._enable_dashboard_telemetry(config)
+    assert config["simulation"] == {"live_telemetry": True}
+
+    explicit = cli._resolve_dashboard_output_dir(
+        SimpleNamespace(output_dir=tmp_path / "explicit")
+    )
+    configured = cli._resolve_dashboard_output_dir(
+        SimpleNamespace(output_dir=None), {"output": tmp_path / "configured"}
+    )
+    generated = cli._resolve_dashboard_output_dir(SimpleNamespace(output_dir=None))
+    assert explicit == (tmp_path / "explicit").resolve()
+    assert configured == (tmp_path / "configured").resolve()
+    assert generated.name.startswith("fastmdxplora_output_")
+
+    assert cli._cmd_dashboard(SimpleNamespace(dashboard_command=None)) == 2
+    dashboard_args = SimpleNamespace(
+        dashboard_command="serve",
+        output=tmp_path,
+        host="127.0.0.1",
+        port=8765,
+        ligand_resname=None,
+        binding_pocket_cutoff_A=None,
+        max_playback_frames=None,
+        open_browser=False,
+    )
+    with patch("fastmdxplora.live.server.serve_dashboard") as serve:
+        assert cli._cmd_dashboard(dashboard_args) == 0
+    assert serve.call_args.kwargs["output"] == tmp_path
+    assert serve.call_args.kwargs["config"].binding_pocket_cutoff_A == 5.0
+
+    dashboard_args.open_browser = True
+    with (
+        patch("fastmdxplora.live.server.serve_dashboard"),
+        patch("webbrowser.open", side_effect=RuntimeError("headless")),
+    ):
+        assert cli._cmd_dashboard(dashboard_args) == 0
+
+    with patch("fastmdxplora.live.server.serve_dashboard") as serve_home:
+        assert cli._cmd_dashboard_home() == 0
+    assert serve_home.call_args.kwargs == {
+        "output": Path.cwd(),
+        "host": "127.0.0.1",
+        "port": 8765,
+    }
+
+    stopped = []
+    cli._finish_dashboard_for_command(None, SimpleNamespace())
+    session = SimpleNamespace(stop=lambda: stopped.append("stopped"))
+    cli._finish_dashboard_for_command(
+        session, SimpleNamespace(dashboard_stop_on_complete=True)
+    )
+    assert stopped == ["stopped"]
+
+    waited = []
+
+    def interrupt_wait():
+        waited.append(True)
+        raise KeyboardInterrupt
+
+    session = SimpleNamespace(
+        url="http://127.0.0.1:8765",
+        wait_forever=interrupt_wait,
+        stop=lambda: stopped.append("after-wait"),
+    )
+    cli._finish_dashboard_for_command(
+        session, SimpleNamespace(dashboard_stop_on_complete=False)
+    )
+    assert waited and stopped[-1] == "after-wait"

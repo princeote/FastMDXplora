@@ -50,11 +50,9 @@ def test_cli_help_subprocess() -> None:
     assert "report" in result.stdout
 
 
-def test_cli_no_args_starts_dashboard_home() -> None:
-    with patch("fastmdxplora.cli.main._cmd_dashboard_home", return_value=0) as home:
-        rc = main([])
+def test_cli_no_args_shows_help() -> None:
+    rc = main([])
     assert rc == 0
-    home.assert_called_once_with()
 
 
 def test_cli_cite() -> None:

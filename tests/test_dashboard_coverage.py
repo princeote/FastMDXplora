@@ -131,6 +131,7 @@ def test_playback_error_branches_and_neighborhood(tmp_path: Path) -> None:
 
 
 def test_launcher_validation_command_and_runtime_branches(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(launch, "launcher_environment_error", lambda _config: None)
     bad = _launch_payload()
     bad.update(system="x" * 4097)
     bad["setup"].update(ph="bad", forcefield="bad", ion_concentration_M="bad", solvent_padding_nm=99)

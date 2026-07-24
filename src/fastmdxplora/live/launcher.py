@@ -10,6 +10,8 @@ science.
 
 from __future__ import annotations
 
+import importlib
+import json
 import os
 import re
 import subprocess
@@ -363,6 +365,75 @@ def build_launcher_command(config: Mapping[str, Any], output_dir: Path) -> list[
     return command
 
 
+def launcher_environment_error(config: Mapping[str, Any]) -> str | None:
+    """Return an actionable error when the dashboard cannot run the workflow.
+
+    The normal CLI deliberately imports the chemistry stack lazily and lets
+    phase pipelines write a warning manifest when optional packages are
+    missing.  That behavior is useful for inspecting configuration on light
+    installations, but it is misleading for the dashboard's *Run Simulation*
+    action: the child exits successfully without producing a simulation.
+    """
+    required = [
+        ("OpenMM", "openmm"),
+        ("OpenMM application layer", "openmm.app"),
+        ("PDBFixer", "pdbfixer"),
+    ]
+    workflow = config.get("workflow")
+    if isinstance(workflow, Mapping) and workflow.get("run_analysis"):
+        required.append(("MDTraj", "mdtraj"))
+
+    missing: list[str] = []
+    for label, module_name in required:
+        try:
+            importlib.import_module(module_name)
+        except Exception:  # noqa: BLE001 - broken partial installs also cannot run
+            if label.startswith("OpenMM"):
+                label = "OpenMM"
+            if label not in missing:
+                missing.append(label)
+
+    if not missing:
+        return None
+
+    packages = " ".join(
+        name for name in ("openmm", "pdbfixer", "mdtraj")
+        if name != "mdtraj" or "MDTraj" in missing
+    )
+    return (
+        "Simulation dependencies are unavailable in the Python environment "
+        f"running this dashboard: {', '.join(missing)}. Install them in that "
+        "same environment, restart the dashboard, and launch again. Recommended: "
+        f"conda install -c conda-forge {packages}"
+    )
+
+
+def _json_mapping(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _manifest_note(manifest: Mapping[str, Any]) -> str | None:
+    notes = manifest.get("notes")
+    if not isinstance(notes, list):
+        return None
+    for note in notes:
+        text = str(note or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _is_nonempty_file(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 @dataclass
 class DashboardRuntime:
     """Mutable state shared by all request-handler threads."""
@@ -374,6 +445,7 @@ class DashboardRuntime:
     process_started_at: str | None = None
     process_finished_at: str | None = None
     process_returncode: int | None = None
+    completion_error: str | None = None
     log_path: Path | None = None
     command: list[str] = field(default_factory=list)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
@@ -399,6 +471,91 @@ class DashboardRuntime:
         self.process_returncode = int(returncode)
         if self.process_finished_at is None:
             self.process_finished_at = _utc_now()
+        if self.process_returncode == 0 and self.completion_error is None:
+            self.completion_error = self._completed_run_error()
+            if self.completion_error:
+                self._record_completion_failure(self.completion_error)
+
+    def _completed_run_error(self) -> str | None:
+        """Reject a false-success child that produced no simulation results."""
+        root = self.active_root
+        if root is None or not self.command or "explore" not in self.command:
+            return None
+
+        setup_dir = root / "setup"
+        required_setup = ("system.xml", "state.xml", "topology.pdb")
+        missing_setup = [name for name in required_setup if not (setup_dir / name).is_file()]
+        if missing_setup:
+            setup_manifest = _json_mapping(setup_dir / "setup_parameters.json")
+            detail = _manifest_note(setup_manifest)
+            suffix = f" Details: {detail}" if detail else ""
+            return (
+                "Setup did not produce the files required for simulation "
+                f"({', '.join(missing_setup)}).{suffix} See "
+                f"{self.log_path or root / 'dashboard_launcher.log'} for the full log."
+            )
+
+        simulation_dir = root / "simulation"
+        simulation_manifest = _json_mapping(
+            simulation_dir / "simulation_parameters.json"
+        )
+        final_state = simulation_dir / "state_final.xml"
+        simulated = (
+            _is_nonempty_file(final_state)
+            and simulation_manifest.get("platform_used") not in (None, "")
+            and simulation_manifest.get("duration_ns_actual") is not None
+        )
+        if not simulated:
+            detail = _manifest_note(simulation_manifest)
+            suffix = f" Details: {detail}" if detail else ""
+            return (
+                "The workflow exited without producing a completed molecular "
+                f"dynamics simulation.{suffix} See "
+                f"{self.log_path or root / 'dashboard_launcher.log'} for the full log."
+            )
+        return None
+
+    def _record_completion_failure(self, detail: str) -> None:
+        """Make the overview and health panels reflect post-run validation."""
+        if self.active_root is None:
+            return
+        try:
+            from fastmdxplora.live.telemetry import TelemetryWriter, read_status
+
+            status = read_status(self.active_root)
+            states = status.get("stage_states")
+            states = dict(states) if isinstance(states, dict) else {}
+            setup_ready = all(
+                (self.active_root / "setup" / name).is_file()
+                for name in ("system.xml", "state.xml", "topology.pdb")
+            )
+            if setup_ready:
+                stage = "production"
+                states["production"] = "failed"
+                states["analysis"] = "skipped"
+                states["report"] = "skipped"
+            else:
+                stage = "setup"
+                states["setup"] = "failed"
+                for name in (
+                    "minimization",
+                    "nvt",
+                    "npt",
+                    "production",
+                    "analysis",
+                    "report",
+                ):
+                    states[name] = "skipped"
+            writer = TelemetryWriter(self.active_root / "simulation", enabled=True)
+            writer.write_status(
+                stage=stage,
+                status="failed",
+                latest_error=detail,
+                stage_states=states,
+            )
+            writer.event(detail, level="error")
+        except Exception:  # noqa: BLE001 - status reporting must not mask the result
+            return
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -407,6 +564,8 @@ class DashboardRuntime:
             status = "idle"
             if running:
                 status = "running"
+            elif self.completion_error:
+                status = "failed"
             elif self.process is not None and self.process_returncode == 0:
                 status = "completed"
             elif self.process is not None and self.process_returncode is not None:
@@ -419,6 +578,7 @@ class DashboardRuntime:
                 "launch_root": str(self.launch_root),
                 "process_running": running,
                 "returncode": self.process_returncode,
+                "error": self.completion_error,
                 "started_at": self.process_started_at,
                 "finished_at": self.process_finished_at,
                 "log_path": str(self.log_path) if self.log_path else None,
@@ -438,6 +598,15 @@ class DashboardRuntime:
                     **result,
                     "valid": False,
                     "errors": {"run": "A FastMDXplora workflow is already running."},
+                }
+
+            environment_error = launcher_environment_error(config)
+            if environment_error:
+                return {
+                    **result,
+                    "valid": False,
+                    "error": environment_error,
+                    "errors": {"run": environment_error},
                 }
 
             run_name = _slug(config["run_name"])
@@ -486,6 +655,7 @@ class DashboardRuntime:
             self.process_started_at = _utc_now()
             self.process_finished_at = None
             self.process_returncode = None
+            self.completion_error = None
             self.log_path = log_path
             self.command = command
             return {

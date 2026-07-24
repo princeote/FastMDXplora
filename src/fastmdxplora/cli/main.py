@@ -871,41 +871,21 @@ def _start_dashboard_for_command(args: argparse.Namespace, output_dir: Path):
     return session
 
 
-def _finish_dashboard_for_command(
-    session,
-    args: argparse.Namespace,
-) -> None:
-    """Keep or stop the dashboard after a CLI workflow and clean up markers."""
-<<<<<<< HEAD
-
-=======
->>>>>>> d5b99ec (Passed Test)
+def _finish_dashboard_for_command(session, args: argparse.Namespace) -> None:
     if session is None:
-        os.environ.pop("FASTMDX_DASHBOARD_ACTIVE", None)
-        os.environ.pop("FASTMDX_DASHBOARD_OUTPUT", None)
         return
-
+    if args.dashboard_stop_on_complete:
+        session.stop()
+        return
+    print()
+    print(f"Workflow complete. Live dashboard is still running at: {session.url}")
+    print("Press Ctrl+C to stop the dashboard.")
     try:
-        if getattr(args, "dashboard_stop_on_complete", False):
-            session.stop()
-            return
-
-        print()
-        print(
-            "Workflow complete. Live dashboard is still running at: "
-            f"{session.url}"
-        )
-        print("Press Ctrl+C to stop the dashboard.")
-
-        try:
-            session.wait_forever()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            session.stop()
+        session.wait_forever()
+    except KeyboardInterrupt:
+        pass
     finally:
-        os.environ.pop("FASTMDX_DASHBOARD_ACTIVE", None)
-        os.environ.pop("FASTMDX_DASHBOARD_OUTPUT", None)
+        session.stop()
 
 
 def _cmd_explore(args: argparse.Namespace) -> int:
@@ -1229,65 +1209,6 @@ def _startup_dashboard_details(argv: Sequence[str]) -> tuple[str, bool]:
     return url, enabled
 
 
-def _cmd_dashboard_home() -> int:
-    """Start the dashboard-first home screen without an existing run."""
-    import webbrowser
-
-    from fastmdxplora.live.server import DashboardConfig, start_dashboard_session
-    from fastmdxplora.utils.presenter import get_presenter
-
-    workspace = Path(
-        os.getenv(
-            "FASTMDX_DASHBOARD_HOME",
-            str(Path.home() / ".fastmdxplora" / "dashboard-home"),
-        )
-    ).expanduser()
-    host = os.getenv("FASTMDX_DASHBOARD_HOST", "127.0.0.1")
-    try:
-        port = int(os.getenv("FASTMDX_DASHBOARD_PORT", "8765"))
-    except ValueError:
-        port = 8765
-
-    session = start_dashboard_session(
-        output=workspace,
-        host=host,
-        port=port,
-        config=DashboardConfig(),
-        home_mode=True,
-        launch_root=Path.cwd(),
-    )
-    os.environ["FASTMDX_DASHBOARD_ACTIVE"] = "1"
-    os.environ["FASTMDX_DASHBOARD_URL"] = session.url
-    get_presenter().welcome(
-        dashboard_url=session.url,
-        dashboard_enabled=True,
-    )
-    print(f"Dashboard home is running at: {session.url}")
-    if session.port_was_changed:
-        print(
-            f"Requested port {session.requested_port} was busy, "
-            f"so FastMDXplora used {session.port}."
-        )
-    print("Configure and launch a simulation from the New Simulation page.")
-    print("Press Ctrl+C to stop the dashboard server.")
-    print()
-
-    if os.getenv("FASTMDX_NO_BROWSER", "").strip().lower() not in {
-        "1", "true", "yes", "on"
-    }:
-        try:
-            webbrowser.open(session.url, new=2)
-        except Exception:
-            pass
-    try:
-        session.wait_forever()
-    except KeyboardInterrupt:
-        return 130
-    finally:
-        session.stop()
-    return 0
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     # Ensure the CLI can emit its Unicode output (box-drawing banner, "→",
     # "—") regardless of the platform's locale. On machines whose default
@@ -1309,12 +1230,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     raw_argv = list(sys.argv[1:] if argv is None else argv)
 
-    # Normal commands keep their branded startup.  An empty invocation binds
-    # the dashboard first so the banner can display the *actual* working URL.
-    if raw_argv and not any(
-        flag in raw_argv
-        for flag in ("--version", "-V", "--cite", "--help", "-h")
-    ):
+    # Show the FastMDXplora identity as soon as the CLI starts. Keep version
+    # and citation output machine-friendly; help and an empty invocation are
+    # intentionally branded.
+    if not any(flag in raw_argv for flag in ("--version", "-V", "--cite")):
         from fastmdxplora.utils.presenter import get_presenter
 
         dashboard_url, dashboard_enabled = _startup_dashboard_details(raw_argv)
@@ -1334,7 +1253,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(__citation__)
         return 0
     if args.command is None:
-        return _cmd_dashboard_home()
+        # An empty invocation is the minimal dashboard-first startup screen.
+        # Full usage, commands, and examples remain available with --help.
+        return 0
 
     # Setup and simulation phases already handle missing optional chemistry
     # dependencies gracefully by recording the skipped work in their manifests.

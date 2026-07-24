@@ -1209,6 +1209,18 @@ def _startup_dashboard_details(argv: Sequence[str]) -> tuple[str, bool]:
     return url, enabled
 
 
+def _cmd_dashboard_home() -> int:
+    """Start the dashboard home screen for an empty CLI invocation."""
+    from fastmdxplora.live.server import serve_dashboard
+
+    serve_dashboard(
+        output=Path.cwd(),
+        host="127.0.0.1",
+        port=8765,
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     # Ensure the CLI can emit its Unicode output (box-drawing banner, "→",
     # "—") regardless of the platform's locale. On machines whose default
@@ -1253,9 +1265,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(__citation__)
         return 0
     if args.command is None:
-        # An empty invocation is the minimal dashboard-first startup screen.
-        # Full usage, commands, and examples remain available with --help.
-        return 0
+        return _cmd_dashboard_home()
 
     # Setup and simulation phases already handle missing optional chemistry
     # dependencies gracefully by recording the skipped work in their manifests.

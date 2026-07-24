@@ -871,21 +871,38 @@ def _start_dashboard_for_command(args: argparse.Namespace, output_dir: Path):
     return session
 
 
-def _finish_dashboard_for_command(session, args: argparse.Namespace) -> None:
+def _finish_dashboard_for_command(
+    session,
+    args: argparse.Namespace,
+) -> None:
+    """Keep or stop the dashboard after a CLI workflow and clean up markers."""
+
     if session is None:
+        os.environ.pop("FASTMDX_DASHBOARD_ACTIVE", None)
+        os.environ.pop("FASTMDX_DASHBOARD_OUTPUT", None)
         return
-    if args.dashboard_stop_on_complete:
-        session.stop()
-        return
-    print()
-    print(f"Workflow complete. Live dashboard is still running at: {session.url}")
-    print("Press Ctrl+C to stop the dashboard.")
+
     try:
-        session.wait_forever()
-    except KeyboardInterrupt:
-        pass
+        if getattr(args, "dashboard_stop_on_complete", False):
+            session.stop()
+            return
+
+        print()
+        print(
+            "Workflow complete. Live dashboard is still running at: "
+            f"{session.url}"
+        )
+        print("Press Ctrl+C to stop the dashboard.")
+
+        try:
+            session.wait_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            session.stop()
     finally:
-        session.stop()
+        os.environ.pop("FASTMDX_DASHBOARD_ACTIVE", None)
+        os.environ.pop("FASTMDX_DASHBOARD_OUTPUT", None)
 
 
 def _cmd_explore(args: argparse.Namespace) -> int:

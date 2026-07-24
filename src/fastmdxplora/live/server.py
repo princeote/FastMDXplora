@@ -24,6 +24,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from fastmdxplora.live.launcher import (
+    DashboardRuntime,
+    build_launcher_command,
+    launcher_defaults,
+    validate_launcher_payload,
+)
 from fastmdxplora.live.ligand_detection import detect_ligands, normalise_ligand_resname
 from fastmdxplora.live.live_frames import live_frame_exists, read_live_frame_index
 from fastmdxplora.live.protein_preview import find_structure, protein_preview_payload
@@ -143,6 +149,7 @@ class DashboardSession:
     port: int
     requested_port: int
     config: DashboardConfig | None = None
+    runtime: DashboardRuntime | None = None
 
     @property
     def url(self) -> str:
@@ -150,7 +157,10 @@ class DashboardSession:
 
     @property
     def port_was_changed(self) -> bool:
-        return self.port != self.requested_port
+        # Port 0 explicitly asks the operating system for any free port; that
+        # is not a fallback caused by a conflict and should not be reported as
+        # one to the user.
+        return self.requested_port != 0 and self.port != self.requested_port
 
     def stop(self) -> None:
         self.server.shutdown()
@@ -167,8 +177,14 @@ def make_handler(
     project_root: str | Path,
     config: DashboardConfig | None = None,
     template_html: str | None = None,
+    runtime: DashboardRuntime | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     root = Path(project_root).resolve()
+    app_runtime = runtime or DashboardRuntime(
+        workspace_root=root,
+        launch_root=root.parent,
+        active_root=root,
+    )
     cfg = config or DashboardConfig()
     html = template_html if template_html is not None else _load_template()
     refresh_seconds = min(60.0, max(1.0, float(cfg.refresh_seconds or 3.0)))
@@ -184,11 +200,28 @@ def make_handler(
                 logger.warning("dashboard route failed: %s", exc)
                 self.send_error(500, "Dashboard internal error")
 
+        def do_POST(self) -> None:  # noqa: N802 - stdlib API
+            try:
+                self._dispatch_post()
+            except Exception as exc:  # noqa: BLE001 — launcher errors stay local
+                logger.warning("dashboard POST route failed: %s", exc)
+                self._send_json(
+                    {"ok": False, "error": "Dashboard request failed."},
+                    status=500,
+                )
+
         def _dispatch(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
+            root = app_runtime.data_root()
             if path in {"/", "/index", "/results", "/live"}:
                 self._send_html(html)
+                return
+            if path == "/api/app-state" or path == "/api/launcher/state":
+                self._send_json(app_runtime.snapshot())
+                return
+            if path == "/api/launcher/defaults":
+                self._send_json(launcher_defaults())
                 return
             if path == "/api/status":
                 status = read_status(root)
@@ -277,13 +310,51 @@ def make_handler(
                 return
             self.send_error(404, "Not found")
 
+        def _dispatch_post(self) -> None:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            payload = self._read_json_body()
+            if path == "/api/launcher/validate":
+                result = validate_launcher_payload(payload)
+                if result.get("valid"):
+                    config_payload = result["config"]
+                    output_dir = app_runtime.launch_root / str(config_payload["run_name"])
+                    result["output"] = str(output_dir)
+                    result["command"] = build_launcher_command(config_payload, output_dir)
+                self._send_json(result, status=200 if result.get("valid") else 422)
+                return
+            if path == "/api/launcher/launch":
+                dashboard_url = self.headers.get("Origin")
+                result = app_runtime.launch(payload, dashboard_url=dashboard_url)
+                self._send_json(result, status=201 if result.get("launched") else 422)
+                return
+            if path == "/api/launcher/stop":
+                self._send_json(app_runtime.stop())
+                return
+            self.send_error(404, "Not found")
+
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             return
 
         # ---- Generic response helpers ----
-        def _send_json(self, payload: dict[str, Any]) -> None:
+        def _read_json_body(self) -> dict[str, Any]:
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = 0
+            if length <= 0:
+                return {}
+            if length > 1_000_000:
+                raise ValueError("Request body is too large")
+            raw = self.rfile.read(length)
+            data = json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("JSON body must be an object")
+            return data
+
+        def _send_json(self, payload: dict[str, Any], *, status: int = 200) -> None:
             body = json.dumps(payload, default=str).encode("utf-8")
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
@@ -452,8 +523,17 @@ def serve_dashboard(
     host: str = "127.0.0.1",
     port: int = 8765,
     config: DashboardConfig | None = None,
+    home_mode: bool = False,
+    launch_root: str | Path | None = None,
 ) -> None:
-    session = start_dashboard_session(output=output, host=host, port=port, config=config)
+    session = start_dashboard_session(
+        output=output,
+        host=host,
+        port=port,
+        config=config,
+        home_mode=home_mode,
+        launch_root=launch_root,
+    )
     print(f"Live dashboard running at {session.url}")
     if session.port_was_changed:
         print(
@@ -477,15 +557,23 @@ def start_dashboard_session(
     port: int = 8765,
     max_port_tries: int = 50,
     config: DashboardConfig | None = None,
+    home_mode: bool = False,
+    launch_root: str | Path | None = None,
 ) -> DashboardSession:
     """Start the local dashboard server in a background thread."""
     root = Path(output).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    runtime = DashboardRuntime(
+        workspace_root=root,
+        launch_root=Path(launch_root).resolve() if launch_root is not None else root.parent,
+        active_root=None if home_mode else root,
+    )
     requested_port = int(port)
     candidates = [0] if requested_port == 0 else range(requested_port, requested_port + max_port_tries)
     last_error: OSError | None = None
     for candidate in candidates:
         try:
-            handler = make_handler(root, config=config)
+            handler = make_handler(root, config=config, runtime=runtime)
             server = ThreadingHTTPServer((host, int(candidate)), handler)
         except OSError as exc:
             last_error = exc
@@ -505,6 +593,7 @@ def start_dashboard_session(
             port=actual_port,
             requested_port=requested_port,
             config=config,
+            runtime=runtime,
         )
     if last_error is not None:
         raise last_error
@@ -515,8 +604,15 @@ def start_test_server(
     project_root: str | Path,
     *,
     config: DashboardConfig | None = None,
+    home_mode: bool = False,
 ) -> tuple[ThreadingHTTPServer, str]:
-    handler = make_handler(project_root, config=config)
+    root = Path(project_root).resolve()
+    runtime = DashboardRuntime(
+        workspace_root=root,
+        launch_root=root.parent,
+        active_root=None if home_mode else root,
+    )
+    handler = make_handler(root, config=config, runtime=runtime)
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

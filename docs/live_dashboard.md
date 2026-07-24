@@ -375,3 +375,29 @@ The redesign was manually validated against:
 - Narrow browser widths (sidebar collapses)
 - A package install at non-checkout locations to confirm templates and
   static assets ship correctly
+
+## Dashboard-first startup and simulation builder
+
+Running FastMDXplora without a subcommand starts the local dashboard before a
+project exists:
+
+```powershell
+fastmdxplora
+```
+
+FastMDXplora binds the first available local port beginning at `8765`, prints
+the actual URL in the terminal banner, and opens the browser when possible.
+Set `FASTMDX_NO_BROWSER=1` to suppress automatic browser opening in headless
+or automated environments.
+
+The **New Simulation** page configures the standard FastMDXplora workflow. It
+does not implement a separate simulation engine: the dashboard validates the
+form and launches the canonical `python -m fastmdxplora.cli.main explore`
+command with the selected setup, simulation, analysis, and report options.
+The child process writes normal project artifacts and live telemetry, while
+the already-running dashboard switches to that output directory.
+
+Only one dashboard-launched workflow is active at a time. Scientific controls
+become read-only once a workflow starts; changing browser fields does not
+modify a running OpenMM context. A completed configuration can be adjusted and
+launched again under a new run name.

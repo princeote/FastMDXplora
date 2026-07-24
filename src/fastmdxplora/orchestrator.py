@@ -474,35 +474,72 @@ class FastMDXplora:
     # Internals
     # ------------------------------------------------------------------
     def _dashboard_writer(
-        self, merged_options: dict[str, dict[str, Any]] | None = None
+        self,
+        merged_options: dict[str, dict[str, Any]] | None = None,
     ):
         """Return the project-level telemetry writer when a dashboard is active."""
-        simulation_options = (merged_options or self.options).get("simulation", {})
+
+        simulation_options = (
+            merged_options or self.options
+        ).get("simulation", {})
+
+        dashboard_active = (
+            os.getenv("FASTMDX_DASHBOARD_ACTIVE") == "1"
+        )
+        dashboard_output = os.getenv("FASTMDX_DASHBOARD_OUTPUT")
+
+        dashboard_matches_run = False
+
+        if dashboard_active and dashboard_output:
+            try:
+                dashboard_matches_run = (
+                    Path(dashboard_output).expanduser().resolve()
+                    == self.output_dir.expanduser().resolve()
+                )
+            except (OSError, RuntimeError):
+                dashboard_matches_run = False
+
         active = bool(
             simulation_options.get("live_telemetry")
-            or os.getenv("FASTMDX_DASHBOARD_ACTIVE")
+            or dashboard_matches_run
         )
+
         if not active:
             return None
+
         try:
             from fastmdxplora.live.telemetry import TelemetryWriter
 
-            return TelemetryWriter(self.output_dir / "simulation", enabled=True)
-        except Exception as exc:  # noqa: BLE001 -- dashboard must not block science
-            logger.debug("Could not initialize dashboard phase telemetry: %s", exc)
+            return TelemetryWriter(
+                self.output_dir / "simulation",
+                enabled=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Could not initialize dashboard phase telemetry: %s",
+                exc,
+            )
             return None
 
     @staticmethod
-    def _initialize_dashboard_timeline(writer: Any, plan: list[str]) -> None:
+    def _initialize_dashboard_timeline(
+        writer: Any,
+        plan: list[str],
+    ) -> None:
         states = {
             "setup": "waiting" if "setup" in plan else "skipped",
-            "minimization": "waiting" if "simulation" in plan else "skipped",
+            "minimization": (
+                "waiting" if "simulation" in plan else "skipped"
+            ),
             "nvt": "waiting" if "simulation" in plan else "skipped",
             "npt": "waiting" if "simulation" in plan else "skipped",
-            "production": "waiting" if "simulation" in plan else "skipped",
+            "production": (
+                "waiting" if "simulation" in plan else "skipped"
+            ),
             "analysis": "waiting" if "analysis" in plan else "skipped",
             "report": "waiting" if "report" in plan else "skipped",
         }
+
         writer.write_status(
             stage=plan[0] if plan else "completed",
             status="running" if plan else "completed",
@@ -512,50 +549,101 @@ class FastMDXplora:
 
     @staticmethod
     def _mark_dashboard_phase_start(
-        writer: Any, phase: str, options: dict[str, Any]
+        writer: Any,
+        phase: str,
+        options: dict[str, Any],
     ) -> None:
         if writer is None:
             return
+
         if phase == "simulation":
-            first_stage = "minimization" if options.get("minimize", True) else "nvt"
-            writer.mark_stage(first_stage, "current", status="running")
+            first_stage = (
+                "minimization"
+                if options.get("minimize", True)
+                else "nvt"
+            )
+            writer.mark_stage(
+                first_stage,
+                "current",
+                status="running",
+            )
         else:
-            writer.mark_stage(phase, "current", status="running")
+            writer.mark_stage(
+                phase,
+                "current",
+                status="running",
+            )
+
         writer.event(f"{phase.title()} phase started")
 
     @staticmethod
     def _mark_dashboard_phase_end(
-        writer: Any, phase: str, result: PhaseResult
+        writer: Any,
+        phase: str,
+        result: PhaseResult,
     ) -> None:
         if writer is None:
             return
-        state = "completed" if result.status == "ok" else (
-            "skipped" if result.status == "skipped" else "failed"
-        )
+
+        if result.status == "ok":
+            state = "completed"
+        elif result.status == "skipped":
+            state = "skipped"
+        else:
+            state = "failed"
+
         if phase == "simulation":
-            # The runner records each internal simulation stage.  Only fill
-            # unresolved entries here so a zero-step NPT stage can remain
-            # explicitly skipped and an error remains visible.
             from fastmdxplora.live.telemetry import read_status
 
             status = read_status(writer.root.parent)
-            stages = status.get("stage_states") if isinstance(status, dict) else {}
+            stages = (
+                status.get("stage_states")
+                if isinstance(status, dict)
+                else {}
+            )
             stages = stages if isinstance(stages, dict) else {}
-            for name in ("minimization", "nvt", "npt", "production"):
-                if str(stages.get(name, "waiting")).lower() in {"waiting", "current"}:
-                    writer.mark_stage(name, state, status="running" if state != "failed" else "failed")
+
+            for name in (
+                "minimization",
+                "nvt",
+                "npt",
+                "production",
+            ):
+                current_state = str(
+                    stages.get(name, "waiting")
+                ).lower()
+
+                if current_state in {"waiting", "current"}:
+                    writer.mark_stage(
+                        name,
+                        state,
+                        status=(
+                            "failed"
+                            if state == "failed"
+                            else "running"
+                        ),
+                    )
         else:
             writer.mark_stage(
                 phase,
                 state,
-                status="running" if state != "failed" else "failed",
-                latest_error=result.message if state == "failed" else None,
+                status=(
+                    "failed"
+                    if state == "failed"
+                    else "running"
+                ),
+                latest_error=(
+                    result.message
+                    if state == "failed"
+                    else None
+                ),
             )
+
         writer.event(
             f"{phase.title()} phase {state}",
             level="error" if state == "failed" else "info",
         )
-
+        
     def _build_plan(
         self,
         *,

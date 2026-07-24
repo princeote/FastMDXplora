@@ -20,8 +20,10 @@
     pollIntervalMs: 3000,
     lastUpdateMs: 0,
     refreshTimer: null,
-    pages: ["overview", "live", "viewer", "analysis", "files", "settings"],
+    pages: ["builder", "overview", "live", "viewer", "analysis", "files", "settings"],
     activePage: "overview",
+    appState: {},
+    initialRouteResolved: false,
     ligandResname: null,
     bindingPocketCutoff: 5,
     playbackAvailable: false,
@@ -283,9 +285,9 @@
   }
 
   async function pollNow() {
-    const names = ["status", "metrics", "events", "results", "structure", "playback"];
+    const names = ["app", "status", "metrics", "events", "results", "structure", "playback"];
     const urls = [
-      "/api/status", "/api/metrics", "/api/events", "/api/results",
+      "/api/app-state", "/api/status", "/api/metrics", "/api/events", "/api/results",
       "/api/structure-info", "/api/playback-info",
     ];
     const settled = await Promise.allSettled(urls.map(fetchJSON));
@@ -301,6 +303,7 @@
       delete state.apiErrors[name];
       successes += 1;
       const payload = result.value;
+      if (name === "app") safeApply(name, () => applyAppState(payload));
       if (name === "status") safeApply(name, () => applyStatus(payload));
       if (name === "metrics") safeApply(name, () => applyMetrics(payload.metrics || []));
       if (name === "events") safeApply(name, () => renderEvents(payload.events || []));
@@ -314,6 +317,27 @@
       updateRefreshedAt();
     }
     updateConnectionState();
+  }
+
+  function applyAppState(payload) {
+    state.appState = payload || {};
+    const activeRun = payload?.active_run || "";
+    if (activeRun) state.outputDir = activeRun;
+
+    if (!state.initialRouteResolved) {
+      state.initialRouteResolved = true;
+      const requested = location.hash.replace(/^#/, "");
+      if (!requested && !activeRun) navigate("builder");
+    }
+
+    if (!activeRun) {
+      setText("topbar-run-id", "workspace");
+      setText("topbar-run-title", "No active run");
+      setText("topbar-stage", "configure a simulation");
+      setText("sidebar-run-name", "No active run");
+      setText("sidebar-platform", "—");
+    }
+    emit("app-state", payload || {});
   }
 
   function safeApply(name, callback) {
@@ -360,6 +384,22 @@
   }
 
   function renderTopBar(status, health) {
+    if (!state.appState?.active_run) {
+      setClassName("topbar-status-dot", "status-dot status-dot-waiting");
+      setClassName("sidebar-status-dot", "status-dot status-dot-waiting");
+      setText("topbar-status-text", "ready");
+      setText("topbar-stage", "configure a simulation");
+      setText("topbar-step", "—");
+      setText("topbar-total", "—");
+      setText("topbar-platform", "—");
+      setText("topbar-temperature", "—");
+      setText("sidebar-connection-state", "ready");
+      setText("sidebar-platform", "—");
+      setText("sidebar-run-name", "No active run");
+      setText("topbar-run-id", "workspace");
+      setText("topbar-run-title", "FastMDXplora Dashboard");
+      return;
+    }
     const statusName = String(health.state || status.status || "waiting").toLowerCase();
     const dotClass = stateDotClass(statusName);
     setClassName("topbar-status-dot", `status-dot ${dotClass}`);
@@ -1085,6 +1125,7 @@
     get state() { return JSON.parse(JSON.stringify(state)); },
     navigate,
     applyStatus,
+    applyAppState,
     applyMetrics,
     applyStructure,
     applyPlayback,

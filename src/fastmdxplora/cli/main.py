@@ -876,7 +876,10 @@ def _finish_dashboard_for_command(
     args: argparse.Namespace,
 ) -> None:
     """Keep or stop the dashboard after a CLI workflow and clean up markers."""
+<<<<<<< HEAD
 
+=======
+>>>>>>> d5b99ec (Passed Test)
     if session is None:
         os.environ.pop("FASTMDX_DASHBOARD_ACTIVE", None)
         os.environ.pop("FASTMDX_DASHBOARD_OUTPUT", None)
@@ -1333,27 +1336,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command is None:
         return _cmd_dashboard_home()
 
-    # Self-heal before dispatch: if this command needs the chemistry stack
-    # and it's missing from the current interpreter, surface the install
-    # hint instead of letting a later ImportError crash the run.
-    if _needs_chemistry(args):
-        missing = _missing_chemistry_backends()
-        if missing:
-            joined = " and ".join(missing) if len(missing) == 2 else missing[0]
-            print(
-                f"fastmdx: this command needs the chemistry backend ({joined}), "
-                "which isn't importable from the current Python environment.",
-                file=sys.stderr,
-            )
-            print("", file=sys.stderr)
-            print("Install it with one of:", file=sys.stderr)
-            print("  conda install -c conda-forge openmm pdbfixer  # recommended across platforms", file=sys.stderr)
-            print('  pip install "fastmdxplora[md]"  # best-effort (PDBFixer wheels are unreliable)', file=sys.stderr)
-            print("", file=sys.stderr)
-            print("Or run only the phases that don't need chemistry:", file=sys.stderr)
-            print("  fastmdx explore --system <PDB> --include analyze report", file=sys.stderr)
-            print("Tip: run `fastmdx info` to see which backends are detected.", file=sys.stderr)
-            return 2
+    # Setup and simulation phases already handle missing optional chemistry
+    # dependencies gracefully by recording the skipped work in their manifests.
+    # Do not abort the CLI here: doing so prevents setup-only/config workflows
+    # and the test matrix from exercising that documented fallback behavior.
 
     if args.command == "init-config":
         return _cmd_init_config(args)

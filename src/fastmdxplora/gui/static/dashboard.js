@@ -1497,6 +1497,12 @@
    * and offer to start one. */
   function liveAbsence(app) {
     app = app || {};
+    // Its live record there but not read (a link out of the study, say):
+    // named, and no reason given for an absence it is not.
+    const health = state.health || {};
+    if (String(health.state || "") === "not read") {
+      return {title: "Live record not read", body: health.message || "", offerToStart: false};
+    }
     if (app.no_study_in) {
       const name = String(app.no_study_in).split(/[\\/]/).filter(Boolean).pop() || app.no_study_in;
       return {
@@ -1871,9 +1877,12 @@
       rows.push(`<dt>${escapeHTML(label)}</dt><dd>${value}</dd>`);
     };
     const code = (value) => `<code>${escapeHTML(value)}</code>`;
+    const notRead = Array.isArray(made.not_read) ? made.not_read : [];
+    // Who made it not read (the run's manifest) is not a release that did
+    // not record itself.
     row("Made by", made.version
       ? `FastMDXplora ${code(made.version)}` + (made.host ? ` on ${escapeHTML(made.host)}` : "")
-      : "a release that did not record itself");
+      : notRead.includes("manifest.json") ? "Not read" : "a release that did not record itself");
     const packages = Object.entries(made.packages || {});
     if (packages.length) {
       row("With", packages.map(([name, version]) => `${escapeHTML(name)} ${code(version)}`).join(", "));
@@ -1912,7 +1921,11 @@
         widths.map(([width]) => `<button type="button" class="file-action" data-width="${escapeAttr(width)}">` +
           `${escapeHTML(WIDTH_SAID[width] || width)}</button>`).join("") + "</div>"
       : "";
-    return `<dl class="figure-provenance-rows">${rows.join("")}</dl>` +
+    // A record not read, named with why; where it held the options, no
+    // command is written, and the panel says so.
+    const said = notRead.length && made.not_read_said
+      ? `<p class="figure-provenance-note">${escapeHTML(made.not_read_said)}</p>` : "";
+    return `<dl class="figure-provenance-rows">${rows.join("")}</dl>` + said +
       (again
         ? `<p class="figure-provenance-how">${escapeHTML(how)}</p>` + choose +
           `<pre class="figure-provenance-command">${escapeHTML(again)}</pre>` +
@@ -2482,6 +2495,11 @@
     const running = ["running", "starting", "paused"].includes(String(status.status || "").toLowerCase());
     const planned = times.production_planned_ns;
     const done = times.production_ns;
+    if (times.production_not_read) {
+      // A record of its pieces not read: the production is not given, and
+      // the live record's total does not stand in for it.
+      return {label: "Production", value: "Not read", note: times.production_not_read};
+    }
     if (done == null && !times.equilibrating) {
       const total = times.simulated_ns ?? status.simulation_time_completed_ns;
       return {label: "Simulated", value: sayLength(total),

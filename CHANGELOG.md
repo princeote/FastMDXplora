@@ -143,9 +143,6 @@ Versioning: [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html)
   failures retain a public note and a private debug traceback. A record
   linked out of the study is named by its place in it.
 
-- `/api/analysis-overview` no longer shows the text of a record linked out
-  of the study, or to a hidden file in it.
-
 - Problems reads the run's own process record, so a running study is read
   (and is not a problem), and a run the Overview calls Interrupted is listed.
   A stop or interruption is listed only while the Overview says so: a study
@@ -288,6 +285,57 @@ Versioning: [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html)
   settings with more than 100,000 entries, whose links cannot be looked
   through, refuses every send until it is smaller. See `docs/remote.md`,
   What travels.
+
+- The Overview, the Analysis page, the Results data and the Files page read
+  the study's own records, on this computer and on a public bind (`--host
+  0.0.0.0`): the analyses' means, series, captions and frame times, and the
+  run's cost, resolved configs, manifests, run records and prepared system,
+  and a carried-on study's record of its join and its pieces' state records. A
+  record linked out of the study (a study downloaded from a deposit can hold
+  such a link), or to a hidden file in it, is not read: its mean is Not read,
+  counted neither determined nor not, with the record named; its series and
+  convergence say it was not read; the Overview and the Analysis page name
+  each record they did not read, and say so when it held the analyses' clock,
+  whose frames are then numbered rather than timed; and the answer lists them
+  in `unavailable`. The run's own process record is still read, so a run whose
+  process is gone reads interrupted, and a run of a study of several still
+  reads its study's `stopping.json` and its runs' records, so a run waiting
+  for the study's next round reads waiting. The run's status, its production
+  and equilibration times and its phases, and the numbers behind the
+  Analysis page's figures, are read the same way: a figure whose record was
+  not read is drawn from the analysis's own table and says the record was not
+  read. The process record is read only by its own name, never as a result
+  linked to it. The Files page says Not read where a value's record was not
+  read. With its analysis manifest not read, an analysis with no result read
+  is Not read rather than done. Each record not read is said with why: a link
+  to a file outside the study, or to a file of the study that is not one of
+  its results (`unavailable_why`); a long list names the first eight and
+  counts the rest, all of them listed under it. A record not read is never
+  taken as missing: a carried-on study whose record of its join, a piece's
+  trajectory, state record or checkpoint record was not read gives no
+  production means (the Thermodynamics card and the Results temperature say
+  Not read, naming it), not its first piece's means called not determined; a
+  run's `energy.csv` not read is not stood in for by its live record; and a
+  live record not read is said so on `/api/status` and the run card, not as a
+  run that kept none. A carried-on study's production is read the same way
+  (each piece's config and checkpoint): with a piece, its config or its
+  trajectory not read, the run card and the Results Production card say Not
+  read, naming it, rather than a length from an outside config or from the
+  pieces read. A run's status in the Results summary, a speed whose cost
+  record was not read, a setup record not read, and a figure whose
+  `options.json` was not read are said not read, with no other record's
+  value in their place; such a figure is given no command to make it again,
+  since one without its options makes another figure, and its panel says
+  which record was not read and why (who made it, with the run's manifest
+  not read, is Not read, not a release that did not record itself). A remedy
+  priced in a read held to the study is not priced from a record it did not
+  read: a stopped run whose config, checkpoint record or piece was not read,
+  or a run again from the top whose config was not read, says its price is
+  not given and names the record, rather than its whole plan read through
+  the link, and a thin umbrella window says how much longer is not given;
+  outside such a read, remedies are as before. `/api/overview`,
+  `/api/results`, `/api/series`, `/api/analysis-overview`, `/api/convergence`,
+  `/api/status` and `/api/figure-data` read through such a link before.
 
 ## [2.6.0] - 2026-10-11
 

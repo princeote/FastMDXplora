@@ -961,7 +961,10 @@ def _pieces_as_they_stand(root: Path) -> tuple[Any, ...]:
 def _production_done(root: Path) -> float | None:
     from fastmdxplora.simulation.resume import production_done_ns
 
-    key = (str(root), _pieces_as_they_stand(root))
+    # Kept apart for a read held to the study (`record_access`), which
+    # refuses what an open read follows: one is never answered from the other.
+    held = not _records.can_read(Path(os.path.abspath(os.sep)))
+    key = (str(root), held, _pieces_as_they_stand(root))
     if key not in _DONE:
         if len(_DONE) > 512:
             _DONE.clear()
@@ -1606,6 +1609,19 @@ def analyze_health(
             "the setting. Either way there is nothing on disk to read, and "
             "the page cannot fill. A new run records it without being asked."
         ),
+    }
+
+
+def not_read_health(said: str) -> dict[str, str]:
+    """The health of a run whose live record a held read refused
+    (`record_access`): not read, ``said`` naming it and why, and no reason
+    given for its absence, since it is not absent."""
+    return {
+        "state": "not read",
+        "headline": "Not read",
+        "message": said,
+        "explanation": ("The run's live record is how this page knows how the run went, "
+                        "so how it went is not shown."),
     }
 
 

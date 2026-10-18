@@ -928,6 +928,11 @@ def make_handler(
                     # A folder that is not yet a study is not named in the
                     # address: it cannot be opened again as one.
                     "study_named": is_study(root),
+                    # The study's own name, so the title and sidebar can say
+                    # it from the first poll: a status answered before the
+                    # (slower) results left the tab titled by the dashboard's
+                    # own name until the results caught up.
+                    "run_title": "" if _no_study(root) else _run_title(root, _load_json(root / "manifest.json")),
                 }
                 self._send_json(payload)
                 return

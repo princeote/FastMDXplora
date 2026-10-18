@@ -843,6 +843,12 @@
     state.times = payload.times || {};
     state.stages = Array.isArray(payload.stages) ? payload.stages : [];
     state.phases = Array.isArray(payload.phases) ? payload.phases : [];
+    // The study's own name, read here too: the results answer can be slower
+    // than the status poll, and the title should not say the dashboard's own
+    // name in the meantime (CI run #705).
+    state.runTitle = (byId("setting-run-name")?.value || "").trim()
+      || payload.run_title
+      || state.runTitle;
     applyPhaseVisibility();
     renderTopBar(status, health);
     renderHero(status);

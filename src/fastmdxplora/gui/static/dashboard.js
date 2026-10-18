@@ -605,12 +605,12 @@
     const first = await responses[0];
     // A successful switch can precede its HTTP answer. Do not paint the
     // new study under the previous study's address while navigation waits.
+    // Asked once, before anything is painted: a switch begun by painting
+    // this poll's own answers must not strand the answers after it.
     if (state.addressAsking) return;
     applyResponse(first, 0);
     await Promise.all(responses.slice(1).map(async (response, index) => {
-      const answer = await response;
-      if (state.addressAsking) return;
-      applyResponse(answer, index + 1);
+      applyResponse(await response, index + 1);
     }));
 
     if (successes) {

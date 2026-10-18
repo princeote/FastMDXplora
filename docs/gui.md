@@ -71,8 +71,9 @@ screen and its pages, where a run stands while it runs, and at its foot the
 person and the settings. The **side panel**:
 a *Log* tab, which is what the command line prints, sorted so a refusal is a
 red-edged block and the explain text a quiet one, with filters and a
-scroll-to-newest toggle; and a *Files* tab, which opens any of the run's
-files in place. And two **seams** between the columns that drag, with a
+scroll-to-newest toggle; a *Files* tab, which opens any of the run's
+files in place; and a *Problems* tab, the study's health in one list
+(below). And two **seams** between the columns that drag, with a
 double-click to reset; the sidebar folds to a strip of its icons under
 FastMDXplora's mark, the side panel to a tab at its edge, and the centre stays
 centred at a reading width whatever is folded. Pointing at the strip's
@@ -104,6 +105,40 @@ header is one band across the centre column, and stays put while the page
 scrolls. The three columns' top bars are one height, their rules on one
 line: the product's name at the top of the sidebar, each page's title,
 centred, and the side panel's tabs.
+
+The **Problems** tab lists, from the open study's own records, each refusal
+(its code, its words and the registry's remedy), those of its phases in
+`manifest.json` and each report format not produced in
+`report/not_produced.json`; a run interrupted or stopped, as the Overview
+says it now (one whose record says it is going, but whose process is gone or
+which has written nothing for a day, is interrupted; a stop being carried on,
+or carried on to the end, is no longer a problem, and neither are the stop's
+own warnings); the report's verdict that an observable has not equilibrated,
+read from its convergence checks in `report/report.md` with the observables
+still moving; each warning recorded in `simulation/live_events.log`, in a
+piece's own narration, or in the study's log (`fastmdxplora.log`), each
+once, but not one the log keeps from a phase a later run did again (each run
+appends to the log; a phase run again replaces it and the phases after it);
+and each mean not determined, with the quantity and why. Under **What
+would fix it** is the remedy the records hold: for a mean withheld for want
+of samples, its record's own words for the more production it asks for;
+where the records hold none, it says no remedy is recorded. A quantity the
+same in every frame is named as the Overview names it. The file icon opens a
+problem's record in Files, at its first line; for a run that ended in the
+piece carrying it on, that piece's own record. With no problems it says so
+and names the records it read; a record missing or unreadable is named as
+unavailable, and the headline then never says the study has no problems. A
+running study's `manifest.json`, written when the run ends, is said as that,
+not as unavailable; a folder with no records yet says so; a study whose
+folder has gone is said to be gone. The tab only reads: it writes no file,
+starts no run, and reads nothing outside the open run's folder. It reads the
+open run alone, not its campaign or the runs beside it; for a campaign, open
+each run. A record linked out of the study, or to a hidden file in it, is
+refused, and the list is then unavailable and names the record by its place
+in the study; of the hidden files, only the run's own process record
+(`.fastmdxplora_run.json`) is read, to tell a run going from one that ended.
+With the Agent beside a page, the Agent takes the side
+panel's place, so Log, Files and Problems come back when the Agent closes.
 
 **The sidebar** reads top-down:
 
@@ -343,6 +378,39 @@ And in the other direction: choose **A config I already have** and the GUI will
 **check it** (syntax and every setting, without running anything), **run it
 as-is**, or **open it for editing**. It never rewrites the file you gave it.
 
+In the Agent workspace, a Config version the Agent proposes lists each
+changed setting, old value to new value, with **Accept** and **Reject**
+beside **Use this version**. Additions, removals and changes to a
+setting's recorded reason are listed too. Systems, sweeps and compound
+settings such as a stopping rule are kept whole and said as the change
+list says them. **Accept all** and **Reject all** fill the choices
+without applying them. Equivalent names such as `prepared_from` and
+`setup_from` share one choice and keep their reasons together. A version
+with no changes, or one made from your own choices or from an earlier
+version, offers no choices.
+
+**Use this version** keeps the proposal as it is, as it does on an
+earlier version: the conversation says "Use version N", and a new version
+of the same Config says every change was accepted, with the labels and
+values shown.
+Once a change is rejected, **Use reviewed version** puts the chosen
+combination through the existing Config validator and creates a new
+version only when it passes; the changes not rejected stay as proposed.
+A refused combination is shown with the changes it involves marked, and
+the choices are kept so they can be corrected. While a rejected change
+is not yet applied, use one of the two before sending another message or
+running the study. The earlier versions stay intact, and the new version
+holds only the settings reviewed, each in the spelling its version used.
+The conversation records the choices with the labels and values shown.
+Choices not yet applied are kept in this browser, by conversation,
+version and the changes themselves, and survive a reload; another
+proposal given the same version number starts with no choices. They are
+never saved as a Config. After
+applying, Run, Download, Open in the builder and the next Agent message
+use the reviewed version. Agent exports retain chosen settings and reasons
+for inactive phases too; the full export adds the defaults for the phases
+currently running.
+
 **Open for editing** fills the page in from the file, but only with what the
 page can hold: the first system, `output`, `include`, the four phase blocks and
 the per-analysis options. A `sweep`, an `execution` block, any system after the
@@ -357,6 +425,81 @@ output. **Run as-is** writes nothing and runs the file you named, unmodified.
 ---
 
 ## Watching it happen
+
+The strip across the main page keeps the studies opened in this browser
+window, named as Recent names them: the system, and the folder too where
+another study of the workspace, or another open one, has the same system.
+The open study's tab is filled with a bar beneath it and kept in view; a
+fade at an edge says more tabs lie past it. Select a study to return to its
+last page or analysis section. **Open another study** opens All studies;
+the existing folder picker can open a study elsewhere. The open list
+survives reload for this workspace while browser session storage is
+available; where the browser does not allow it, the strip says the open
+studies are not kept. The strip is one stop for Tab: use Left/Right or
+Home/End to move along it, Enter to open a study and Delete or its Close
+button to close it. Long lists scroll within the strip, by a mouse wheel
+too. Scrolled down, the strip and what it says stay at the top, with the
+page's own header below it.
+
+Closing an inactive study leaves the current one open. Closing the active
+study opens its nearest neighbour; a neighbour found gone as it is tried is
+marked so and the next is tried. With none left, All studies is shown, the
+address no longer names the study, and a study found gone is named under
+the strip. Closing stops no simulation and removes no files: a run in the
+study closed goes on. If a switch is refused, the current study stays open
+and the strip says why. Browser Back and Forward continue to work,
+including reopening a closed study.
+
+A study whose folder has gone is said so on its tab ("folder gone").
+Choosing it asks again: it opens if its folder is back, and otherwise the
+strip says its folder is no longer there. When the open study's folder
+goes, its pages are not shown as an empty study: the page says the folder
+is no longer there, and the address still names it.
+
+Every way to another study the page offers (the strip, Recent, All
+studies, Load study, a study's runs, the run going elsewhere, the demo, a
+shared study, another study's conversation in the Agent's list, and Back
+or Forward within the page) first saves the Builder's workspace draft. A
+reply being written, a rejected Config change not applied (**Use reviewed
+version**, or **Use this version** to keep the proposal) or a run launch
+holds the switch, and so do an unsent Agent message or attachment, except
+on Back or Forward; the strip says what needs attention. While one switch
+is under way, the strip is busy and no second one is asked.
+
+Unsent Agent words and attachments are kept for the study they were begun
+in, in this window's session storage: the words, and of each attachment
+its path, name, size and digest, read again when they are put back (a
+file that cannot be read again, or changed since, is named beside the
+box). Opened again by any way, Back included, that study's Agent box has
+them again, after anything typed before the study was known; sending or
+clearing them forgets them, and so does closing the study's tab or its
+folder going. Where the browser does not keep them, the box says so, Back
+within the page holds for them as the other ways do, and the browser asks
+before the page is left (a Back to another page, a reload, an address
+typed); so it does for a Config draft it could not keep.
+
+The Agent shows and writes the conversation of the study the page is for:
+read once the study the address names is open, and read again if the page
+finds it showed another's. The server gives no conversation to a page for
+another study than the one open (`GET /api/agent/conversation?study=`),
+and refuses a write whose study is not the page's (`page_study`, 409).
+When the study open is changed elsewhere (another window, an AI app), a
+window says so, and unsent words typed there are kept for the study they
+were typed for, not left in the new study's box. **Open it** on an address
+from another site goes through the same hold as the other ways.
+
+A Config draft this browser could not save holds the switch, and the
+Builder's header says "Not saved in this browser": **Download config** or
+**Reset** releases it while the form stays as downloaded or reset. Another
+window's newer draft is kept: this window takes it where it changed nothing
+since; otherwise the header says "Not saved: another window saved a newer
+draft" and the switch is held until **Download config**, or a reload to
+take the newer draft. Back or Forward to a page the browser loads for
+another study is not held: the Agent words are kept as above, but this
+window's Config changes held by another window's newer draft are not. The
+Builder remains one draft for the workspace. The server's active study is
+still shared by browser windows; these tabs do not provide independent
+server sessions.
 
 Once a run starts, the page becomes a live view of it.
 

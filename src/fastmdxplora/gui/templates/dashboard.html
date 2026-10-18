@@ -9,6 +9,8 @@
   <link rel="stylesheet" href="/static/theme.css">
   <link rel="stylesheet" href="/static/dashboard.css">
   <link rel="stylesheet" href="/static/remote.css">
+  <link rel="stylesheet" href="/static/problems.css">
+  <link rel="stylesheet" href="/static/study-tabs.css">
   <!--__FASTMDX_LAB_ICON__-->
   <meta name="fastmdx-expansion" content="Fully Automated SysTem for Molecular Dynamics eXploration">
 </head>
@@ -451,6 +453,8 @@
              sidebar's lists of them would fill the bar. -->
         <button type="button" class="line-btn phone-convs" id="phone-convs" title="Conversations"
                 aria-label="Conversations"><!--icon:chat:line-icon--></button>
+        <button type="button" class="line-btn problems-phone" id="problems-phone" title="Study problems"
+                aria-label="Study problems"><!--icon:panel:line-icon--></button>
       </div>
 
       <!-- The newest studies of the workspace, one click from each; folded
@@ -628,6 +632,26 @@
 
     <!-- Main content -->
     <div class="main">
+
+      <nav class="study-tabs" id="study-tabs" aria-label="Open studies" hidden>
+        <div class="study-tabs-row">
+          <ul class="study-tabs-list" id="study-tabs-list" aria-label="Study documents"></ul>
+          <button type="button" class="line-btn study-tabs-open" id="study-tabs-open"
+                  aria-label="Open another study" title="Open another study"><!--icon:studies:line-icon--></button>
+        </div>
+        <p class="study-tabs-note" id="study-tabs-note" role="status" hidden></p>
+        <p class="study-tabs-note" id="study-tabs-unkept" role="status" hidden></p>
+      </nav>
+
+      <!-- The open study's folder is gone: said in place of its pages. -->
+      <section class="study-gone" id="study-gone" aria-labelledby="study-gone-title" hidden>
+        <h1 class="page-title" id="study-gone-title">This study's folder is no longer there</h1>
+        <p>Its records cannot be read, so its pages are not shown. Its tab stays until you close it; nothing else is changed.</p>
+        <div class="study-gone-actions">
+          <button type="button" class="ghost-btn" id="study-gone-close">Close its tab</button>
+          <button type="button" class="ghost-btn" id="study-gone-studies">All studies</button>
+        </div>
+      </section>
 
       <!-- Page views -->
       <main class="page-shell" id="page-shell" role="main" tabindex="-1">
@@ -1878,7 +1902,7 @@
             <div class="agent-attachments" id="agent-attachments" hidden></div>
             <div class="agent-composer-box">
               <button id="agent-attach" class="agent-plus" type="button" aria-label="Attach a file" title="Attach a file for the Agent to read: a config, a log, a manifest, a data table, a structure.">+</button>
-              <textarea id="agent-request" rows="1"
+              <textarea id="agent-request" rows="1" autocomplete="off"
                 placeholder="Describe a study, or ask about one in this folder"></textarea>
               <button id="agent-propose" class="agent-send" type="button" aria-label="Send" title="Send (Enter). Shift+Enter for a new line.">&#8593;</button>
               <input type="hidden" id="agent-attach-path">
@@ -1923,6 +1947,7 @@
                           title="Make this version the newest again, to run or change">Use this version</button>
                 </div>
                 <div class="agent-study-change" data-role="change" hidden></div>
+                <section class="agent-config-review" data-role="review" aria-label="Review Config changes" hidden></section>
                 <div class="agent-study-whole" data-role="whole">
                 <dl class="agent-plan" data-role="plan" id="agent-plan" hidden></dl>
                 <pre class="agent-result" data-role="result" id="agent-result" hidden></pre>
@@ -1961,10 +1986,11 @@
     <div class="col-handle" data-handle="panel" role="separator" aria-orientation="vertical" aria-label="Resize side panel"></div>
 
     <!-- Side panel: the run as it happens, and what it has written -->
-    <aside class="side-panel" id="side-panel" aria-label="Run log and files">
+    <aside class="side-panel" id="side-panel" aria-label="Run log, files and problems">
       <div class="side-panel-tabs" role="tablist">
         <button type="button" class="side-tab active" role="tab" data-side-tab="log" aria-selected="true">Log</button>
         <button type="button" class="side-tab" role="tab" data-side-tab="files" aria-selected="false">Files</button>
+        <button type="button" class="side-tab" id="problems-tab" role="tab" data-side-tab="problems" aria-selected="false" aria-controls="problems-pane">Problems</button>
         <span class="side-panel-spacer"></span>
         <button type="button" class="fold-btn side-collapse" id="side-collapse" title="Collapse panel" aria-label="Collapse side panel"><!--icon:panel:fold-icon--></button>
       </div>
@@ -2005,6 +2031,13 @@
           <div class="side-preview-body" id="side-preview-body"></div>
         </div>
       </div>
+      <div class="side-pane" id="problems-pane" data-side-pane="problems" role="tabpanel" aria-labelledby="problems-tab" hidden>
+        <div class="problems-toolbar">
+          <span id="problems-summary" role="status">Open a study to read its problems.</span>
+          <button type="button" class="line-btn" id="problems-refresh" aria-label="Refresh problems" title="Refresh problems"><!--icon:refresh:line-icon--></button>
+        </div>
+        <div class="problems-body" id="problems-body"></div>
+      </div>
     </aside>
     <button type="button" class="side-expand" id="side-expand" hidden title="Show panel" aria-label="Show side panel"><!--icon:panel:fold-icon--></button>
     <!-- The Agent beside whatever page is open, in the side panel's place:
@@ -2025,6 +2058,12 @@
   </div>
 
   <!-- Live region for screen readers -->
+  <dialog class="problems-mobile" id="problems-mobile" aria-label="Study log, files and problems">
+    <form method="dialog" class="problems-mobile-head">
+      <span>Study panel</span>
+      <button type="submit" class="line-btn" aria-label="Close study panel" title="Close"><!--icon:close:line-icon--></button>
+    </form>
+  </dialog>
   <div class="sr-only" aria-live="polite" id="sr-live"></div>
 
   <script src="/static/molstar/molstar.js?v=5.12.0"></script>
@@ -2041,10 +2080,12 @@
     <script src="/static/report-page.js"></script>
     <script src="/static/analyze-again.js"></script>
     <script src="/static/dashboard.js"></script>
+    <script src="/static/problems.js"></script>
     <script src="/static/files-page.js"></script>
     <script src="/static/files-actions.js"></script>
     <script src="/static/file-picker.js"></script>
     <script src="/static/run-builder.js"></script>
+    <script src="/static/study-tabs.js"></script>
   <script src="/static/charts.js"></script>
   <script src="/static/overview.js"></script>
   <script src="/static/series-chart.js"></script>

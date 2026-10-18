@@ -198,6 +198,7 @@ GETS_ANSWERED_BEYOND_LOOPBACK = frozenset(
         "/api/scenes",
         "/api/stopping",
         "/api/stream",
+        "/api/problems",
         "/analysis-figures-svg.zip",
         "/structure/topology.pdb",
         "/structure/live-frame.pdb",
@@ -259,6 +260,19 @@ def _private(parts: tuple[str, ...]) -> bool:
         return True
     store = CONVERSATIONS_SUBDIR.parts
     return any(parts[i:i + len(store)] == store for i in range(len(parts)))
+
+
+def _public_records(root: Path) -> Callable[[Path], bool]:
+    """Admission for a confined record read (`record_access`): inside the
+    resolved study ``root`` and one of its results, not `_private`."""
+
+    def admitted(path: Path) -> bool:
+        try:
+            return not _private(path.relative_to(root).parts)
+        except ValueError:
+            return False
+
+    return admitted
 
 
 def _served_beyond_loopback(root: Path, target: Path) -> bool:
@@ -726,7 +740,10 @@ def make_handler(
             if path == "/api/agent/conversation":
                 from fastmdxplora.gui.agent_panel import read_conversation
 
-                self._send_json(read_conversation(app_runtime))
+                # The study the page is for, by its key: another study's
+                # conversation is not given to it.
+                self._send_json(read_conversation(
+                    app_runtime, page_study=(parse_qs(parsed.query).get("study") or [""])[0]))
                 return
             if path == "/api/agent/receipt":
                 # What the AI model was sent for one reply, kept beside the
@@ -902,6 +919,31 @@ def make_handler(
                 payload["workspace"] = str(app_runtime.exploration_root)
                 self._send_json(payload)
                 return
+            if path == "/api/problems":
+                # A read-only list of the records already shown by status
+                # and analysis. Commands and proposed Configs stay on the
+                # private fixes route. The key prevents a late request
+                # from reading a different study after a switch.
+                from fastmdxplora.gui.problems_view import problems_payload
+                from fastmdxplora.gui.workspace import study_key
+
+                if _no_study(root):
+                    # No study open: said as that, not read as a folder.
+                    self._send_json({"ok": True, "study": "", "active_run": None,
+                                     "items": [], "notes": [], "read": [],
+                                     "unavailable": [], "available": False})
+                    return
+                wanted = (parse_qs(parsed.query).get("study") or [""])[0]
+                if wanted and wanted != study_key(root):
+                    self._send_json({"ok": False, "study": study_key(root),
+                                     "reason": "The open study changed."})
+                    return
+                answer = problems_payload(root, admit_evidence=True)
+                # A study whose folder has gone is still the one open.
+                answer["active_run"] = (str(root) if answer.get("state") == "gone"
+                                        or is_study(root) else None)
+                self._send_json(answer)
+                return
             if path == "/api/status":
                 # A run that ended without saying so is said to have.
                 status = status_as_it_stands(root)
@@ -1050,10 +1092,22 @@ def make_handler(
                 self._send_json(series_payload(root, name))
                 return
             if path == "/api/analysis-overview":
-                # What every analysis recorded, read together.
+                # What every analysis recorded, read together, from the
+                # study's own results only: a record linked out of the study,
+                # or to a hidden file in it, is not read (`record_access`).
                 from fastmdxplora.gui.analysis_overview import overview_of
+                from fastmdxplora.record_access import confined_records
 
-                self._send_json(overview_of(root))
+                if not root.is_dir():
+                    self._send_json(overview_of(root))
+                    return
+                inside = root.resolve()
+                try:
+                    with confined_records(inside, _public_records(inside)):
+                        answer = overview_of(inside)
+                except OSError:
+                    answer = {"ok": False, "reason": "The study's records could not be read."}
+                self._send_json(answer)
                 return
             if path == "/api/convergence":
                 from fastmdxplora.gui.analysis_overview import convergence_payload
@@ -1647,6 +1701,13 @@ def make_handler(
                     payload or {}, app_runtime,
                     path_for=hosting.inside if hosting is not None else None))
                 return
+            if path == "/api/agent/review-config":
+                # Choosing among actual Config values, never applying paths
+                # supplied by the browser. This checks; it does not launch.
+                from fastmdxplora.gui.config_review import review_config
+
+                self._send_json(review_config(payload or {}))
+                return
             if path == "/api/agent/propose":
                 # A sentence in, a config out -- through the same
                 # `propose_config` the CLI uses and the same validator a
@@ -1755,9 +1816,12 @@ def make_handler(
                 # through the command line's own validator first, so a
                 # configuration that would fail there fails here, while the
                 # form that produced it is still on the screen.
-                from fastmdxplora.gui.config_builder import config_yaml
+                from fastmdxplora.gui.config_builder import config_yaml, export_config
 
                 request = payload or {}
+                if isinstance(request.get("config"), dict):
+                    self._send_json(export_config(request["config"], full=bool(request.get("full"))))
+                    return
                 self._send_json(
                     config_yaml(request, full=bool(request.get("full")))
                 )
@@ -1799,7 +1863,7 @@ def make_handler(
                     dashboard_url=self.headers.get("Origin")))
                 return
             if path == "/api/agent/conversation":
-                from fastmdxplora.gui.agent_panel import write_conversation
+                from fastmdxplora.gui.agent_panel import page_study_refused, write_conversation
 
                 asked = payload or {}
                 # Named, the conversation is written where it lives, a chat
@@ -1814,6 +1878,10 @@ def make_handler(
                         study = self._optional_path_for(asked.get("study"))
                         if study is False:
                             return
+                    refused = page_study_refused(app_runtime, study, asked.get("page_study"))
+                    if refused:
+                        self._send_json(refused, status=409)
+                        return
                     self._send_json(merge_conversation(
                         app_runtime, asked.get("entries"), asked.get("seen"),
                         asked.get("id") or None, study, key=asked.get("key"),
@@ -1827,8 +1895,19 @@ def make_handler(
                     study = self._optional_path_for(asked.get("study"))
                     if study is False:
                         return
+                    refused = page_study_refused(app_runtime, study, asked.get("page_study"))
+                    if refused:
+                        self._send_json(refused, status=409)
+                        return
                     self._send_json(write_conversation(
                         app_runtime, asked.get("entries"), asked.get("id"), study))
+                    return
+                from fastmdxplora.gui.agent_panel import _HERE
+
+                refused = page_study_refused(app_runtime, _HERE,
+                                             asked.get("page_study"))
+                if refused:
+                    self._send_json(refused, status=409)
                     return
                 self._send_json(write_conversation(app_runtime, asked.get("entries")))
                 return

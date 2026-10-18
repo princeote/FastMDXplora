@@ -52,9 +52,21 @@
     runId: "",
     runTitle: "FastMDXplora Live",
     apiErrors: {},
+    /* Per study key: "asking", "gone" (its folder is no longer there) or
+     * "no", for an open study the status says is not a study. */
+    goneChecks: {},
+    /* The open study whose tab was closed with no other open: not named. */
+    studyClosed: "",
+    /* Until when a change of study is one a run started here makes. */
+    ownChangeUntil: 0,
   };
 
   let chartHistorySamples = 600;
+
+  /* Settled once the study the address names is open, or refused: what is
+   * read for the page's study (the Agent's conversation) is read after. */
+  let studySettledNow;
+  const studySettled = new Promise((done) => { studySettledNow = done; });
 
   document.addEventListener("DOMContentLoaded", boot);
 
@@ -70,6 +82,7 @@
     navigate(location.hash.replace(/^#/, "") || "overview", {updateHash: false});
     // The study the address names, opened before the page reads one.
     openAskedFirst().finally(() => {
+      studySettledNow();
       startLoadingChecklist();
       schedulePoll(0);
       openChangeStream();
@@ -88,6 +101,7 @@
     const demoButton = byId("open-demo");
     if (demoButton) {
       demoButton.addEventListener("click", async () => {
+        if (beginStudySwitch()) return;
         demoButton.disabled = true;
         if (Number(state.appState?.demo_to_fetch || 0)) demoButton.textContent = "Fetching the demo study\u2026";
         try {
@@ -103,6 +117,7 @@
         } catch (error) {
           demoButton.textContent = "The server did not answer.";
         }
+        endStudySwitch();
         demoButton.disabled = false;
       });
     }
@@ -130,6 +145,13 @@
         return;
       }
       if (asked && state.addressKnown && asked !== studyNamed() && !state.addressAsking) {
+        // Work the switch would lose holds it, and the reason is said. A
+        // step naming the study still open is added after the one asked,
+        // which stays for a Back once the work is done.
+        if (holdStudySwitch("back")) {
+          history.pushState(history.state, "", addressFor(studyNamed(), `#${routeShown()}`));
+          return;
+        }
         openAsked(asked);
         return;
       }
@@ -145,6 +167,8 @@
     // A page kept by the browser and shown again on Back is read afresh.
     window.addEventListener("pageshow", (event) => {
       if (event.persisted) {
+        state.addressAsking = false;
+        document.body.classList.remove("study-switching");
         state.addressKnown = false;
         state.addressRecheck = true;
         schedulePoll(0);
@@ -578,9 +602,15 @@
 
     // Establish the study before its panels, but do not hold results behind
     // an unrelated trajectory/topology request that is still being read.
-    applyResponse(await responses[0], 0);
+    const first = await responses[0];
+    // A successful switch can precede its HTTP answer. Do not paint the
+    // new study under the previous study's address while navigation waits.
+    if (state.addressAsking) return;
+    applyResponse(first, 0);
     await Promise.all(responses.slice(1).map(async (response, index) => {
-      applyResponse(await response, index + 1);
+      const answer = await response;
+      if (state.addressAsking) return;
+      applyResponse(answer, index + 1);
     }));
 
     if (successes) {
@@ -859,7 +889,35 @@
     // another's (a study opened elsewhere between two polls).
     emit("status-updated", {status, health, times: state.times, study: payload.study || ""});
     state.studyIsOne = payload.study_named !== false;
+    if (state.studyIsOne) state.goneChecks = {};
+    else if (payload.study) askIfGone(payload.study);
     addressTheStudy(payload.study || "");
+    studyAddressed();
+  }
+
+  function studyAddressed() {
+    const key = studyNamed();
+    emit("study-addressed", {
+      key, title: byId("topbar-run-title")?.textContent || "Study",
+      folder: byId("study-folder")?.dataset.name || "",
+      gone: Boolean(key) && state.goneChecks[key] === "gone",
+    });
+  }
+
+  /* An open study that is not a study: a folder not yet one, or a study
+   * whose folder has gone. The Problems record says which, by the key; a
+   * gone one stays named, as the study open, and is said to be gone. */
+  async function askIfGone(key) {
+    if (state.goneChecks[key]) return;
+    state.goneChecks[key] = "asking";
+    let answer = null;
+    try { answer = await fetchJSON(`/api/problems?study=${encodeURIComponent(key)}`); } catch (error) { answer = null; }
+    if (state.goneChecks[key] !== "asking") return;
+    state.goneChecks[key] = answer && answer.study === key && answer.state === "gone" ? "gone" : "no";
+    if (state.studyShown === key) {
+      addressTheStudy(key);
+      studyAddressed();
+    }
   }
 
   /* ---- The study in the address ------------------------------------ */
@@ -873,7 +931,14 @@
   // The open study as the address names it: a folder not yet a study,
   // which cannot be opened again as one, is not named.
   function studyNamed() {
-    return state.studyIsOne === false ? "" : (state.studyShown || "");
+    const key = state.studyShown || "";
+    if (key && key === state.studyClosed) return "";
+    if (state.studyIsOne === false) return state.goneChecks[key] === "gone" ? key : "";
+    return key;
+  }
+
+  function routeShown() {
+    return state.activePage + (state.activePage === "analysis" && state.activePlace ? `/${state.activePlace}` : "");
   }
 
   function addressFor(key, hash) {
@@ -902,19 +967,92 @@
    * before. A switch's answer names it; an answer that does not (the demo,
    * a shared study) leaves the address to name what the page then finds. */
   function studyOpened(answer, page) {
+    emit("study-opening", {key: (answer && answer.study_key) || ""});
     goTo(addressFor((answer && answer.study_key) || "", `#${page || "overview"}`), false);
   }
 
+  /* A switch by key. A study the server cannot find, or whose folder has
+   * gone, is said so without the server's path for it (`gone`). */
   async function switchToKeyed(asked) {
     try {
       const response = await fetch("/api/explore/switch", {
         method: "POST", headers: {"content-type": "application/json"},
         body: JSON.stringify({study: asked}),
       });
-      return await response.json();
+      const answer = await response.json();
+      if (answer && !answer.ok && /^No such folder\b/.test(String(answer.error || ""))) {
+        return {...answer, gone: "folder", error: "This study's folder is no longer there."};
+      }
+      if (answer && !answer.ok && response.status === 404) {
+        return {...answer, gone: "missing", error: "This study is not among the studies here."};
+      }
+      return answer;
     } catch (error) {
       return null;
     }
+  }
+
+  /* What a switch of study would lose here (unsent Agent words, a Config
+   * draft not saved, a rejected change not applied, a launch or reply
+   * under way): the reason, or "". Back ("back") is not held by Agent
+   * words kept for the study in this window. */
+  function switchHeld(how) {
+    const back = how === "back";
+    return window.FastMDXAgent?.beforeStudySwitch?.({back}) || window.FastMDXRun?.beforeStudySwitch?.() || "";
+  }
+
+  /* Asked by every way to another study before the server is asked: a
+   * held switch is said, by the strip and as a notice, and the current
+   * study stays open. */
+  function holdStudySwitch(how) {
+    const held = state.addressAsking ? "A study is already opening." : switchHeld(how);
+    if (held) {
+      emit("study-switch-held", held);
+      showToast(held, "warning");
+    }
+    return held;
+  }
+
+  /* One switch in flight at a time, whichever way asked it: the strip is
+   * busy and no poll paints the new study's records under the old one.
+   * The strip's own switch hides the pages until the new one loads; other
+   * ways keep their page, which says how the switch is going. */
+  function switching(on, hide) {
+    state.addressAsking = on;
+    document.body.classList.toggle("study-switching", Boolean(on && hide));
+    emit("study-switching", on);
+  }
+
+  /* The hold asked, then the switch marked as in flight: "" when it may
+   * go on, or the reason said. A switch not made is ended with
+   * endStudySwitch; one made loads the page again. */
+  function beginStudySwitch(how) {
+    const held = holdStudySwitch(how);
+    if (!held) switching(true);
+    return held;
+  }
+
+  function endStudySwitch() {
+    if (state.addressAsking) switching(false);
+  }
+
+  /* Internal workspace tabs switch through the same admitted key as Back.
+   * A pending switch has one owner; unsaved work is checked before the
+   * server changes its active study. */
+  async function openStudyTab(key, page, beforeOpen) {
+    if (state.addressAsking) return {ok: false, error: "A study is already opening."};
+    const held = switchHeld();
+    if (held) return {ok: false, error: held};
+    switching(true, true);
+    const answer = await switchToKeyed(key);
+    if (answer && answer.ok) {
+      if (beforeOpen) beforeOpen(answer);
+      studyOpened(answer, page);
+      return answer;
+    }
+    switching(false);
+    if (!answer) schedulePoll(0);
+    return answer || {ok: false, error: "The server did not answer. Refresh to check which study is open."};
   }
 
   /* Opened as the page starts, so what it reads first is that study. */
@@ -950,7 +1088,21 @@
 
   function addressTheStudy(key) {
     const asked = studyInAddress();
+    const was = state.studyShown;
     state.studyShown = key;
+    // The study changed under this window, not by a way of its own (each
+    // of those loads the page again) nor by a run it started: said, with
+    // the study now shown.
+    if (state.addressKnown && was && key && was !== key && !state.addressAsking) {
+      if (Date.now() < state.ownChangeUntil) {
+        state.ownChangeUntil = 0;
+      } else {
+        const title = byId("topbar-run-title")?.textContent || "Another study";
+        emit("study-changed-elsewhere", {from: was, to: key, title});
+        showToast(`${title} was opened elsewhere, in another window or by an AI app: this window now shows it.`,
+                  "warning");
+      }
+    }
     if (!state.addressKnown) {
       state.addressKnown = true;
       if (state.addressRefused) showToast(state.addressRefused, "warning");
@@ -959,7 +1111,7 @@
       state.addressOffered = "";
       if (offered && offered !== key) {
         showToast("This address, from another site, names another study.", "warning",
-                  {label: "Open it", run: () => openAsked(offered)});
+                  {label: "Open it", run: () => { if (!holdStudySwitch()) openAsked(offered); }});
       }
       // Shown again by the browser on Back, with another study open since.
       if (state.addressRecheck && asked && asked !== key) {
@@ -968,7 +1120,8 @@
         return;
       }
     }
-    if (asked !== studyNamed() && !state.addressAsking) {
+    // Whether its folder has gone is not known yet: the address waits.
+    if (asked !== studyNamed() && !state.addressAsking && state.goneChecks[key] !== "asking") {
       history.replaceState(history.state, "", addressFor(studyNamed()));
     }
   }
@@ -976,7 +1129,7 @@
   /* Opened once the page is shown (Back or Forward to a step naming
    * another study): read again from the start. */
   async function openAsked(asked) {
-    state.addressAsking = true;
+    switching(true);
     const answer = await switchToKeyed(asked);
     if (answer && answer.ok) {
       goTo(addressFor(answer.study_key || asked), true);
@@ -984,7 +1137,7 @@
     }
     showToast((answer && answer.error) || "The study this address names could not be opened.",
               "warning");
-    state.addressAsking = false;
+    switching(false);
     history.replaceState(history.state, "", addressFor(studyNamed()));
     // The page the step names, with the study open: address and page agree.
     followAddress();
@@ -2637,6 +2790,22 @@
     toast: (message, kind, action) => showToast(message, kind, action),
     /* A study opened from the page, by the switch's answer. */
     studyOpened: (answer, page) => studyOpened(answer, page),
+    openStudyTab,
+    /* Settled once the address's study is open, or refused. */
+    studySettled,
+    /* A run started here: the study it opens is this window's own change. */
+    studyChangeComing: () => { state.ownChangeUntil = Date.now() + 60000; },
+    studyChangeNotComing: () => { state.ownChangeUntil = 0; },
+    /* Asked before any other way opens another study: "" or the reason. */
+    holdStudySwitch,
+    /* The same, and the switch marked as in flight where it may go on. */
+    beginStudySwitch,
+    endStudySwitch,
+    /* The open study's tab closed with none left: not named until shown again. */
+    studyClosed: (key) => {
+      state.studyClosed = key || "";
+      if (state.addressKnown) history.replaceState(history.state, "", addressFor(studyNamed()));
+    },
     figureChip: (name, made) => provenanceChip(name, made),
     listenForFigureChips: (host, lookup) => listenForProvenance(host, lookup),
     /* A name shortened in its middle to the width given (studies.js). */

@@ -36,6 +36,7 @@ FastMDXplora/
 │       ├── cost.py                # How long a study will take, on this machine
 │       ├── naming.py              # One rule for the name of a study's output folder
 │       ├── refusals.py            # What a refusal is, in a word a program can read
+│       ├── record_access.py       # Request-local admission of actual record reads
 │       ├── remedies.py            # What would fix a refusal, and what the fix costs here
 │       ├── marking.py             # Marking what nothing checked, where the mark has to survive
 │       ├── uncertainty.py         # An error bar on a quantity that is not a mean
@@ -179,12 +180,14 @@ FastMDXplora/
 │       │   ├── figure_data.py     # The numbers behind an analysis's other figures, to plot in the page's colours
 │       │   ├── stopping_view.py   # A study run until it is determined, for the Overview
 │       │   ├── fixes_view.py      # What would fix the study on screen
+│       │   ├── problems_view.py   # The study's recorded problems, read and never acted on
 │       │   ├── figure_provenance.py  # What made each figure, and the command that makes it again
 │       │   ├── report_page.py     # The report as a document, in the page
 │       │   ├── browse.py          # Walking the filesystem from the page; what is a study
 │       │   ├── again_view.py      # What the GUI offers to run again on the study on screen
 │       │   ├── directory_inspect.py  # What is in a folder, and what can be done with it
 │       │   ├── config_builder.py  # What the page holds as a config file, checked
+│       │   ├── config_review.py   # Individually selected Config changes, validated as a new version
 │       │   ├── run_from_config.py # Run what the page describes, from the file it would give
 │       │   ├── schema_payload.py  # The settings, described for the browser to lay out
 │       │   ├── starters.py        # Studies to start from, in the builder
@@ -199,7 +202,10 @@ FastMDXplora/
 │       │   ├── report_dashboard.py  # Static dashboard written into a report
 │       │   ├── static/            # theme.css (shared tokens), dashboard.css, dashboard.js,
 │       │   │                      #   frame.js (columns, side panel, theme), theme-first.js
-│       │   │                      #   (the scheme before the first paint), fonts/ (Inter and
+│       │   │                      #   (the scheme before the first paint), problems.js and
+│       │   │                      #   problems.css (the read-only Problems tab), study-tabs.js
+│       │   │                      #   and study-tabs.css (open studies and their last pages),
+│       │   │                      #   fonts/ (Inter and
 │       │   │                      #   JetBrains Mono, SIL OFL 1.1), studies.js,
 │       │   │                      #   preferences.js (the dialogs, preferences kept),
 │       │   │                      #   run-builder.js, file-picker.js, report-page.js, analyze-again.js,

@@ -9,6 +9,53 @@ Versioning: [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- A strip of open studies keeps each study's last page in this browser
+  window. Studies can be selected or closed individually; closing never
+  stops a run or removes files, and closing the open one goes past a
+  neighbour whose folder is gone. The list survives reload. A refused
+  switch keeps the current study, and a Config draft not saved, a rejected
+  change not applied, a reply or launch under way, or unsent Agent words
+  hold the switch with a reason on every way the page offers, the Agent's
+  list of conversations included; one switch goes at a time. Unsent Agent
+  words and attachments are kept per study in this window, so Back loses
+  none of them; of each attachment only its path, name, size and digest
+  are kept, and it is read again on return, a file that cannot be is named.
+  Where the browser keeps neither unsent words nor a Config draft, it asks
+  before the page is left. The Agent reads and writes only the
+  conversation of the study the page is for, and the server refuses one
+  for another study; a window whose study was changed elsewhere says so
+  and keeps its unsent words with the study they were typed for. A draft this browser cannot save is released by Download
+  config or Reset. Tabs are named by their folders too where the workspace
+  has studies of one system, as Recent names them. A study whose folder is
+  gone is said so on its tab, is asked for again when chosen, and is not
+  shown as an empty study. The open tab is kept in view, a fade shows more
+  tabs past an edge, a mouse wheel scrolls the strip, and the page's
+  header stays below the strip when scrolled.
+
+- An Agent Config version shows each changed setting, old value to new
+  value, with **Accept** and **Reject** beside **Use this version**. Use
+  this version keeps the proposal as it is and says so in the
+  conversation, as it does on an earlier version; once a change is rejected,
+  **Use reviewed version** checks the chosen combination and creates a new
+  version, preserving the earlier Configs and each chosen value's decision
+  record. Compound settings are reviewed whole and said as the change list
+  says them; equivalent setting names share one choice. A refused
+  combination names the changes to choose again. Choices not yet applied
+  are kept in the browser through a reload, and the conversation records
+  the choices with the labels and values reviewed. Agent exports keep
+  chosen values and decisions for inactive phases as well as the phases
+  running now.
+
+- A Problems tab beside Log and Files lists the open study's recorded
+  refusals (its phases' and the report formats it could not produce), a
+  run interrupted or stopped as the Overview says it, the report's verdict
+  that an observable has not equilibrated, the warnings of the run and of
+  its log, and undetermined analysis means, with their reasons and
+  available remedies. Its evidence controls open the record
+  in Files. Missing records are said, and changing studies clears the old
+  list before another is read. The panel only reads; fixes are run through
+  the existing confirmed actions on the Overview.
+
 - The Agent's evaluation has its first run with an AI model
   (`anthropic/claude-opus-5-5`, the 72 cases three times each). The safety,
   write, edit, repair, act and docs claims are met; the records cases, not
@@ -82,6 +129,53 @@ Versioning: [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html)
   why. See `docs/agent.md`, Looking before it answers, and `docs/mcp.md`.
 
 ### Fixed
+
+- A long value in an Agent Config version's change list (a "Prepared
+  from" path) wraps inside the card instead of running past its edge.
+
+- The phone-to-desktop browser check waits for the side panel to return
+  after its dialog closes, avoiding a timing-sensitive assertion.
+
+- Problems confines actual record reads and helper reads to the open run's
+  public files. It checks evidence candidates without recursively listing
+  artifacts, so unrelated trajectory links and scratch trees do not block
+  the list. Unused axis and remedy-price work is skipped; unexpected reader
+  failures retain a public note and a private debug traceback. A record
+  linked out of the study is named by its place in it.
+
+- `/api/analysis-overview` no longer shows the text of a record linked out
+  of the study, or to a hidden file in it.
+
+- Problems reads the run's own process record, so a running study is read
+  (and is not a problem), and a run the Overview calls Interrupted is listed.
+  A stop or interruption is listed only while the Overview says so: a study
+  being carried on, or carried on to the end, lists neither the stop nor the
+  stop's own warnings. Each warning in `simulation/live_events.log`, a
+  piece's own narration or `fastmdxplora.log` is listed once, with the
+  record it came from, and without the runner's "warning:" before it. A
+  warning the log keeps from a phase a later run did again, as a run with
+  `--force-overwrite` or Analyze again does, is not listed. A run that
+  stopped or was interrupted in the piece carrying it on opens that piece's
+  record as its evidence. A phase is titled as the Overview says it ("Setup
+  failed").
+
+- Problems names the records it read, and names each record missing or
+  unreadable, `manifest.json`, the analysis manifest, the narration and the
+  log included; the headline then never says there are no problems. A
+  running study's `manifest.json`, written when the run ends, is said as
+  that, and a folder with no records yet says so rather than asking for a
+  study to be opened.
+
+- Under What would fix it, Problems gives a withheld mean's recorded
+  shortfall in its record's own words (where the count is a floor, at
+  least so much more and then a new estimate) and a retryable refusal's
+  registry remedy; where none is recorded, it says so, and what the
+  telemetry says of a warning is given as its reason, not as a fix. A quantity the same in every frame is named as the Overview
+  names it.
+
+- `/api/problems` answers with no study open, or with the study's folder
+  gone, instead of failing; a folder above the study need only be
+  searchable.
 
 - A path longer than its column in the Config Builder (a structure, a
   setting for one system, a config file not found) breaks where it must in

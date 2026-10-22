@@ -4,7 +4,7 @@ This module validates and loads small-molecule ligands for parameterization
 with the OpenFF small-molecule force fields (via ``openmmforcefields``'
 ``SystemGenerator``). It deliberately keeps the *loading/validation* concern
 separate from the *system build* concern (which lives in
-:mod:`fastmdxplora.setup.prepare`): here we turn a ligand file into a
+:mod:`fastmdxplora.setup.prepare`): here a ligand file becomes a
 validated OpenFF ``Molecule`` with a known net charge; the prepare step feeds
 that molecule to the ``SystemGenerator``.
 
@@ -19,10 +19,13 @@ opaque ImportError, so the setup phase can degrade gracefully.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fastmdxplora.utils.logging import get_logger
+from fastmdxplora.refusals import CodedError
+from fastmdxplora.refusals import StudyError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     pass
@@ -33,7 +36,7 @@ logger = get_logger("setup.ligand")
 SUPPORTED_LIGAND_FORMATS = ("sdf", "mol2")
 
 
-class LigandError(Exception):
+class LigandError(CodedError, Exception):
     """Raised for ligand input problems (format, missing file, charge, deps)."""
 
 
@@ -52,7 +55,7 @@ def detect_ligand_format(ligand_file: str | Path) -> str:
             f"Unsupported ligand format {ext!r} for {ligand_file!r}. "
             f"Use one of: {supported}. (A ligand embedded in a PDB lacks the "
             f"bond/charge information OpenFF needs; export it to SDF/MOL2.)"
-        )
+        , code="setup.ligand.format_unsupported", given=ext, permitted=list(SUPPORTED_LIGAND_FORMATS))
     return ext
 
 
@@ -68,11 +71,671 @@ def _import_openff() -> Any:
     except ImportError as exc:  # pragma: no cover - exercised on hosts w/o openff
         raise LigandError(
             "Ligand parameterization needs the OpenFF toolkit, which is not "
-            "installed. Install the ligand extra (pip install "
-            "'fastmdxplora[ligand]') or via conda-forge "
-            "(conda install -c conda-forge openff-toolkit openmmforcefields)."
-        ) from exc
+            "installed and is not on PyPI: it is distributed through "
+            "conda-forge only, so pip cannot fetch it whatever extra is "
+            "named.\n\n"
+            "    conda install -c conda-forge openff-toolkit "
+            "openmmforcefields ambertools\n\n"
+            "Or install FastMDXplora itself from conda-forge, which brings "
+            "the whole ligand path with it."
+        , code="environment.backend.missing", packages=["openff-toolkit"]) from exc
     return Molecule
+
+
+def takes_am1bcc_charges(small_molecule_forcefield: str | None) -> bool:
+    """Whether a small-molecule force field gives a ligand AM1-BCC charges.
+
+    The OpenFF force fields and GAFF both do, through the OpenFF toolkit.
+    Anything else (espaloma assigns its own) is not held to a charge
+    provider it would not use.
+    """
+    name = str(small_molecule_forcefield or "").strip().lower()
+    return name.startswith(("openff", "smirnoff", "gaff"))
+
+
+def am1bcc_provider() -> str | None:
+    """What will compute a ligand's AM1-BCC charges here, or None.
+
+    The OpenFF toolkit computes them by calling AmberTools' ``sqm`` or,
+    where it is licensed, OpenEye's toolkit. Without either it still loads,
+    and offers NAGL, RDKit and its built-in charges, none of which is
+    AM1-BCC, so the first a study hears of it is a toolkit error raised
+    after the system has been solvated. conda-forge's openff-toolkit does
+    not bring AmberTools with it, so the toolkit being present says nothing
+    about this.
+
+    Raises ImportError where the toolkit itself is absent: that is a
+    different thing missing, with its own install line.
+    """
+    from openff.toolkit.utils.toolkits import (
+        AmberToolsToolkitWrapper,
+        OpenEyeToolkitWrapper,
+    )
+
+    if AmberToolsToolkitWrapper.is_available():
+        return "AmberTools"
+    if OpenEyeToolkitWrapper.is_available():
+        return "OpenEye"
+    return None
+
+
+POSE_POLICIES = ("auto", "structure", "file")
+
+
+def pose_by_policy(molecule: Any, structure: str | Path, resname: str,
+                   *, policy: str = "auto",
+                   copy: int = 0) -> tuple[Any, str | None]:
+    """Apply the pose the config asked for, or the one the files imply.
+
+    ``auto`` is :func:`pose_from_structure` deciding by looking, and is the
+    default because the files usually do say. Where the structure holds the
+    residue and its pose cannot be taken, ``auto`` refuses rather than
+    guess; the file's pose stands only where the structure has no such
+    residue. The other two exist for the
+    cases where what the author wants is not what the files imply, and both
+    were discovered by a run that wanted them:
+
+    ``file`` keeps the supplied file's coordinates even where the structure
+    holds the residue. That is an unbound start on a complex -- the T4
+    lysozyme control began life as a bug that did exactly this, and turned
+    out to be the known-negative the contact analyses needed. A control
+    should be a choice rather than an accident.
+
+    ``structure`` requires the structure's pose, so a structure with no
+    residue of that name is refused as well. On a bound run that fallback
+    is the seventeen-Angstroms failure returning silently.
+    """
+    chosen = str(policy).strip().lower()
+    if chosen not in POSE_POLICIES:
+        raise LigandError(
+            f"ligand_pose: unknown policy {policy!r}; expected one of "
+            f"{', '.join(POSE_POLICIES)}. `auto` takes the pose from the "
+            "structure where it holds the residue and from the file where "
+            "it does not; `structure` and `file` insist on one side.", code="setup.ligand.pose_unavailable", policy=policy)
+    if chosen == "file":
+        return molecule, (
+            f"the supplied file's pose stands for {resname} by request "
+            "(ligand_pose: file), whether or not the structure holds it")
+    return pose_from_structure(
+        molecule, structure, resname, copy=copy,
+        required=(chosen == "structure"))
+
+
+def pose_from_structure(molecule: Any, structure: str | Path, resname: str,
+                        *, copy: int = 0,
+                        required: bool = False) -> tuple[Any, str | None]:
+    """Decide which file says where the ligand is.
+
+    There are two ways a person arrives with a protein and a ligand, and they
+    want opposite things from the same pair of files.
+
+    **The ligand is in the structure.** A complex from the PDB has the ligand
+    at its crystallographic coordinates and no chemistry: a PDB cannot express
+    bond orders, formal charges or aromaticity, which is exactly what a force
+    field needs. So the author supplies those separately -- an SDF or MOL2,
+    often the ideal component from the Chemical Component Dictionary. That
+    file's *coordinates* are idealised and mean nothing here. **The structure
+    wins**, and this replaces them.
+
+    Getting that backwards is not a small error. On T4 lysozyme with benzene,
+    the ideal component sat seventeen Angstroms from the cavity it was
+    supposed to occupy. Setup succeeded, the clash check passed -- seventeen
+    Angstroms is not a clash -- and the run was of a benzene floating in
+    solvent rather than a benzene in a binding site. Everything looked right.
+
+    **The ligand is not in the structure.** An apo protein, and a pose from
+    docking or built by hand. Here the supplied file is the only thing that
+    knows where the ligand goes, and its coordinates are the author's answer.
+    **The file wins**, and this leaves it alone.
+
+    The two are told apart by looking: if the structure holds a residue of
+    this name whose heavy atoms match the file's, element for element and
+    bond for bond, it is the first case. If
+    it does not, it is the second. Nothing has to be declared, because the
+    files already say which situation it is -- and in the second case the
+    author is responsible for the pose being a bound one, which no amount of
+    checking here can establish.
+
+    Returns the molecule and a sentence about what happened, or ``None``
+    where there is no structure, or it has no such residue, and the SDF's
+    own coordinates stand -- which is right when the ligand is being placed
+    deliberately rather than read from a complex.
+
+    Where the structure does hold a residue of this name and its pose
+    cannot be taken -- too few copies, a different atom count, bonds that
+    do not match, a structure that will not read -- this refuses. Those
+    fell back to the file's coordinates, and on the T4 system the silent
+    version of each was a run of benzene floating in solvent that looked in
+    every respect like a run of benzene in a binding site. With
+    ``required=True`` a structure without the residue refuses too.
+    """
+
+    def _stand(reason: str) -> tuple[Any, str]:
+        """A pose the structure should give and cannot: refused, under
+        ``auto`` as under ``structure``. ``auto`` fell back to the file's
+        coordinates here, which on a complex is a ligand simulated away
+        from its site with nothing but a log line to say so."""
+        if required:
+            raise LigandError(
+                f"ligand_pose: structure was asked for, but {reason}.", code="setup.ligand.pose_unavailable")
+        raise LigandError(
+            f"The ligand's pose cannot be taken from the structure: {reason}. "
+            "Setup stops rather than place it at the supplied file's own "
+            "coordinates, which on a complex are not in the binding site. "
+            "Where the file's pose is the one meant -- a docked or "
+            "deliberately unbound start -- say so with ligand_pose: file.",
+            code="setup.ligand.pose_unavailable")
+
+    import numpy as _np
+
+    if not Path(structure).is_file():
+        # No structure at all, as for a system given as a sequence: nothing
+        # holds a pose, and the file's is the only one there is.
+        if required:
+            raise LigandError(
+                f"ligand_pose: structure was asked for, but there is no "
+                f"structure at {structure} to take a pose from.",
+                code="setup.ligand.pose_unavailable")
+        return molecule, None
+    try:
+        import mdtraj as _md  # noqa: PLC0415
+
+        frame = _md.load(str(structure))
+    except Exception as exc:  # noqa: BLE001 - a structure that will not read
+        # Unread, whether it holds the ligand is not known.
+        return _stand(
+            f"{Path(structure).name} could not be read for it "
+            f"({type(exc).__name__}), so whether it holds the ligand is not "
+            "known")
+
+    # By residue, not by name across the structure. A component can appear
+    # more than once -- two copies of a substrate, a cofactor in each half of
+    # a dimer -- and collecting every atom that shares the name gathers all
+    # of them into one molecule's worth of coordinates. `copy` says which.
+    wanted = resname.strip().upper()
+    matches = [residue for residue in frame.topology.residues
+               if residue.name.strip().upper() == wanted]
+    if not matches:
+        if required:
+            raise LigandError(
+                f"ligand_pose: structure was asked for, but "
+                f"{Path(structure).name} holds no residue named {wanted}, so "
+                "there is no pose in the structure to take. Where the pose is "
+                "meant to come from the supplied file -- an apo protein and a "
+                "docked or deliberately unbound ligand -- say so with "
+                "ligand_pose: file.", code="setup.ligand.pose_unavailable")
+        return molecule, None
+    if copy >= len(matches):
+        return _stand(
+            f"{Path(structure).name} holds {len(matches)} "
+            f"cop{'y' if len(matches) == 1 else 'ies'} of {wanted} and this "
+            f"is copy {copy + 1}, so there is none left to place it at")
+
+    residue = matches[copy]
+    indices = [atom.index for atom in residue.atoms]
+
+    # Heavy atoms only: a crystal structure has no hydrogens, and the SDF
+    # has them. Matching on count is what establishes the two are the same
+    # molecule rather than something that merely shares a residue name.
+    heavy = [i for i, atom in enumerate(molecule.atoms)
+             if atom.atomic_number > 1]
+    if len(indices) != len(heavy):
+        return _stand(
+            f"{wanted} in {Path(structure).name} has {len(indices)} atoms and "
+            f"the supplied file has {len(heavy)} heavy atoms, so they are not "
+            "the same molecule (or the deposited residue is incomplete)")
+
+    positions = _np.array(molecule.conformers[0].m_as("nanometer")
+                          if molecule.conformers else None, dtype=float)
+    if positions is None or positions.size == 0:
+        return _stand("the supplied file carries no coordinates to replace")
+
+    # Which crystal atom is which of the file's heavy atoms, by element and
+    # bond graph. File order was trusted here, and two files listing the
+    # atoms differently gave bonds of 3 and 4.5 Angstroms with no error: the
+    # clash check measures the ligand against the protein, never against
+    # itself. The crystal has no bond records to rely on, so its bonds are
+    # read from its geometry.
+    crystal = frame.xyz[0][indices]
+    elements = [_atomic_number(frame.topology.atom(i)) for i in indices]
+    order = _heavy_atom_match(
+        [molecule.atoms[i].atomic_number for i in heavy],
+        _heavy_graph(molecule, positions, heavy),
+        elements, _bonds_by_distance(crystal, elements),
+        positions_a=positions[heavy], positions_b=crystal)
+    if order is None:
+        return _stand(
+            f"the bonds between the atoms of {wanted} in "
+            f"{Path(structure).name} do not match the supplied file's, "
+            "element for element, so they are not the same molecule (or the "
+            "deposited geometry is broken)")
+    reordered = order != list(range(len(heavy)))
+    moved = positions.copy()
+    moved[heavy] = crystal[order]
+
+    # Each hydrogen hangs off its own heavy atom, turned by the rotation that
+    # best lays the file's heavy atoms onto the structure's. The file's
+    # conformer is in an arbitrary frame, so one translation for all of them
+    # would leave X-H bonds several Angstroms long.
+    rotation = _superposing_rotation(positions[heavy], moved[heavy])
+    for index, parent in _hydrogen_parents(molecule, positions, heavy).items():
+        moved[index] = moved[parent] + rotation @ (
+            positions[index] - positions[parent])
+
+    # Wrapped the way the molecule's own conformer is wrapped, rather than
+    # by importing the units package: this function is then testable
+    # wherever the arithmetic is, and the toolkit is conda-forge-only.
+    existing = molecule.conformers[0]
+    try:
+        molecule._conformers = [type(existing)(moved, "nanometer")]
+    except Exception:  # noqa: BLE001 - a wrapper that takes only the values
+        molecule._conformers = [type(existing)(moved)]
+    which = (f" (copy {copy + 1} of {len(matches)})" if len(matches) > 1
+             else "")
+    matched = ("; the two files list its atoms in different orders, so they "
+               "were matched by element and bond" if reordered else "")
+    return molecule, (
+        f"placed {wanted}{which} at its coordinates in "
+        f"{Path(structure).name} rather than the supplied file's, which "
+        f"carries the chemistry and an arbitrary pose{matched}")
+
+
+#: Covalent radii in nanometres (Cordero et al. 2008), for reading bonds off
+#: a structure that has no bond records. Elements not listed use 0.15 nm.
+_COVALENT_RADIUS_NM = {
+    5: 0.084, 6: 0.076, 7: 0.071, 8: 0.066, 9: 0.057, 14: 0.111, 15: 0.107,
+    16: 0.105, 17: 0.102, 34: 0.120, 35: 0.120, 53: 0.139,
+}
+
+
+def _atomic_number(atom: Any) -> int:
+    element = getattr(atom, "element", None)
+    return int(getattr(element, "atomic_number", 0) or 0)
+
+
+def _bonds_by_distance(points: Any, elements: list[int]) -> list[set[int]]:
+    """Heavy atoms closer than 1.2 times the sum of their covalent radii.
+
+    The factor admits a stretched bond in a poorly resolved structure and
+    stays below the 1-3 distance across a bond angle (C-C-C: 0.25 nm
+    against 0.18 nm for C-C).
+    """
+    import numpy as _np
+
+    points = _np.asarray(points, dtype=float)
+    radii = _np.array([_COVALENT_RADIUS_NM.get(e, 0.15) for e in elements])
+    distance = _np.linalg.norm(points[:, None] - points[None], axis=2)
+    bonded = (distance <= 1.2 * (radii[:, None] + radii[None])) & (distance > 0.05)
+    _np.fill_diagonal(bonded, False)
+    return [set(_np.flatnonzero(row).tolist()) for row in bonded]
+
+
+def _heavy_graph(molecule: Any, positions: Any,
+                 heavy: list[int]) -> list[set[int]]:
+    """The file's heavy-atom bonds, by position in ``heavy``: from its bond
+    list where it has one, otherwise from its own conformer."""
+    where = {atom: k for k, atom in enumerate(heavy)}
+    graph: list[set[int]] = [set() for _ in heavy]
+    bonds = getattr(molecule, "bonds", None)
+    if bonds is None:
+        return _bonds_by_distance(
+            positions[heavy], [molecule.atoms[i].atomic_number for i in heavy])
+    for bond in bonds:
+        first, second = where.get(bond.atom1_index), where.get(bond.atom2_index)
+        if first is not None and second is not None:
+            graph[first].add(second)
+            graph[second].add(first)
+    return graph
+
+
+def _heavy_atom_match(elements_a: list[int], graph_a: list[set[int]],
+                      elements_b: list[int], graph_b: list[set[int]],
+                      *, positions_a: Any = None, positions_b: Any = None,
+                      limit: int = 200_000,
+                      solutions: int = 256) -> list[int] | None:
+    """For each atom of ``a``, the atom of ``b`` it is: same element, and
+    bonded exactly where ``a`` is. ``None`` where no such correspondence
+    exists, or none is found within ``limit`` steps.
+
+    A molecule with symmetry has several. Heavy atoms alone do not tell an
+    amidine's NH2 from its NH, or an acid's OH from its O, but the geometry
+    does: given both sets of positions, the one that lays ``a`` best onto
+    ``b`` is returned, among the first ``solutions`` found.
+    """
+    import numpy as _np
+
+    n = len(elements_a)
+    if n != len(elements_b):
+        return None
+    signature_a = sorted((elements_a[i], len(graph_a[i])) for i in range(n))
+    signature_b = sorted((elements_b[i], len(graph_b[i])) for i in range(n))
+    if signature_a != signature_b:
+        return None
+
+    # Visit ``a`` breadth first from its rarest kind of atom, so each atom
+    # after the first of its fragment is placed beside one already placed.
+    rarity = {kind: signature_a.count(kind) for kind in set(signature_a)}
+    visit: list[int] = []
+    seen: set[int] = set()
+    for start in sorted(range(n), key=lambda i: (rarity[(elements_a[i], len(graph_a[i]))], i)):
+        if start in seen:
+            continue
+        queue = [start]
+        seen.add(start)
+        while queue:
+            atom = queue.pop(0)
+            visit.append(atom)
+            for neighbour in sorted(graph_a[atom]):
+                if neighbour not in seen:
+                    seen.add(neighbour)
+                    queue.append(neighbour)
+
+    mapping: dict[int, int] = {}
+    used: set[int] = set()
+    found: list[list[int]] = []
+    steps = 0
+
+    def extend(depth: int) -> bool:
+        """False once the search should stop."""
+        nonlocal steps
+        if depth == n:
+            found.append([mapping[i] for i in range(n)])
+            return len(found) < solutions
+        atom = visit[depth]
+        placed = {mapping[j] for j in graph_a[atom] if j in mapping}
+        # The atom's own position first, so the order the files share, where
+        # they share one, is the first answer.
+        for candidate in [atom, *(c for c in range(n) if c != atom)]:
+            steps += 1
+            if steps > limit:
+                return False
+            if (candidate in used or elements_b[candidate] != elements_a[atom]
+                    or len(graph_b[candidate]) != len(graph_a[atom])
+                    or graph_b[candidate] & used != placed):
+                continue
+            mapping[atom] = candidate
+            used.add(candidate)
+            going = extend(depth + 1)
+            del mapping[atom]
+            used.discard(candidate)
+            if not going:
+                return False
+        return True
+
+    extend(0)
+    if not found:
+        return None
+    if positions_a is None or positions_b is None or len(found) == 1:
+        return found[0]
+    a = _np.asarray(positions_a, dtype=float)
+    b = _np.asarray(positions_b, dtype=float)
+
+    def misfit(order: list[int]) -> float:
+        target = b[order]
+        rotation = _superposing_rotation(a, target)
+        laid = (a - a.mean(axis=0)) @ rotation.T
+        return float(((laid - (target - target.mean(axis=0))) ** 2).sum())
+
+    return min(found, key=misfit)
+
+
+def _superposing_rotation(mobile: Any, target: Any) -> Any:
+    """The proper rotation that best lays ``mobile`` onto ``target`` (Kabsch).
+
+    The determinant is forced to +1: a reflection can fit a flat or nearly
+    flat set of heavy atoms as well as a rotation does, and would put every
+    out-of-plane hydrogen on the wrong face.
+    """
+    import numpy as _np
+
+    a = mobile - mobile.mean(axis=0)
+    b = target - target.mean(axis=0)
+    u, _, vt = _np.linalg.svd(a.T @ b)
+    sign = 1.0 if _np.linalg.det(vt.T @ u.T) >= 0 else -1.0
+    return vt.T @ _np.diag([1.0, 1.0, sign]) @ u.T
+
+
+def _hydrogen_parents(molecule: Any, positions: Any,
+                      heavy: list[int]) -> dict[int, int]:
+    """Each hydrogen's heavy atom: by the bond graph where the molecule has
+    one, otherwise the heavy atom it sits nearest in the file's conformer."""
+    import numpy as _np
+
+    heavy_atoms = set(heavy)
+    parents: dict[int, int] = {}
+    try:
+        for bond in molecule.bonds:
+            first, second = bond.atom1_index, bond.atom2_index
+            if first in heavy_atoms and second not in heavy_atoms:
+                parents[second] = first
+            elif second in heavy_atoms and first not in heavy_atoms:
+                parents[first] = second
+    except AttributeError:
+        parents = {}
+    for index, atom in enumerate(molecule.atoms):
+        if atom.atomic_number <= 1 and index not in parents:
+            distances = _np.linalg.norm(positions[heavy] - positions[index],
+                                        axis=1)
+            parents[index] = heavy[int(_np.argmin(distances))]
+    return parents
+
+
+#: A residue name as a PDB file and the force fields write it: one to three
+#: letters or digits.
+_NAME = re.compile(r"[A-Za-z0-9]{1,3}")
+
+#: A title taken as a residue name: one to three letters or digits, the first
+#: a letter, since `resname 07` is not a selection MDTraj can read.
+_TITLE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9]{0,2}")
+
+#: Residue names a molecule's title is never given as its own: the standard
+#: residues of proteins and nucleic acids, their caps, water and the ions.
+#: A ligand called ALA, HOH or CL would be selected with the protein, the
+#: solvent or the ions by every analysis that selects by residue name.
+_STANDARD_RESIDUES = frozenset({
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+    "SEC", "PYL", "ACE", "NME", "NMA", "UNK",
+    "HID", "HIE", "HIP", "HSD", "HSE", "HSP", "ASH", "GLH", "LYN", "CYM",
+    "CYX", "MSE", "SEP", "TPO", "PTR",
+    "DA", "DC", "DG", "DT", "DI", "DU", "A", "C", "G", "U", "I", "T",
+})
+
+
+def _polymer_water_and_ion_names() -> frozenset[str]:
+    """The names that are never a ligand: the residues of proteins and
+    nucleic acids, their caps and variants, water and the ions."""
+    from fastmdxplora.protein_names import PROTEIN_VARIANTS
+    from fastmdxplora.setup.heterogens import ION_NAMES, WATER_NAMES
+
+    return _STANDARD_RESIDUES | PROTEIN_VARIANTS | ION_NAMES | WATER_NAMES
+
+
+def _reserved_names() -> frozenset[str]:
+    """The names a title is not taken as: those above, and every name
+    MDTraj's `protein` keyword selects, some of which are cofactors (SAH)."""
+    reserved = _polymer_water_and_ion_names()
+    try:
+        # Every name MDTraj's `protein` keyword selects.
+        from mdtraj.core.residue_names import _PROTEIN_RESIDUES
+    except ImportError:
+        return reserved
+    return reserved | frozenset(_PROTEIN_RESIDUES)
+
+
+def _generated_names():
+    """Residue names for molecules whose title cannot be one: L01 to L99,
+    then LA0 to LZZ."""
+    for number in range(1, 100):
+        yield f"L{number:02d}"
+    digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for first in digits[10:]:
+        for second in digits:
+            yield f"L{first}{second}"
+
+
+def _split_records(text: str, suffix: str) -> list[str]:
+    """The molecules of an SDF or MOL2 text, each as its own record.
+
+    Done on the text rather than through the toolkit, so a file is divided
+    before OpenFF is needed and each record reaches the toolkit exactly as it
+    was written.
+    """
+    if suffix == ".sdf":
+        # Each record keeps its own `$$$$` line, so the blank line that ends
+        # its last data item stays; only a last record written without one
+        # is given it.
+        records: list[str] = []
+        start = 0
+        for end in re.finditer(r"(?m)^\$\$\$\$[^\n]*(?:\n|\Z)", text):
+            record = text[start:end.end()]
+            if text[start:end.start()].strip():
+                records.append(record if record.endswith("\n") else record + "\n")
+            start = end.end()
+        rest = text[start:]
+        if rest.strip():
+            records.append(rest + ("" if rest.endswith("\n") else "\n") + "$$$$\n")
+        return records
+    parts = re.split(r"(?m)^(?=@<TRIPOS>MOLECULE)", text)
+    return [r for r in parts if r.startswith("@<TRIPOS>MOLECULE")]
+
+
+def _record_title(record: str, suffix: str) -> str:
+    """The molecule's own name: an SDF record's first line, a MOL2
+    molecule's line after `@<TRIPOS>MOLECULE`."""
+    lines = record.splitlines()
+    if suffix == ".sdf":
+        return lines[0].strip() if lines else ""
+    return lines[1].strip() if len(lines) > 1 else ""
+
+
+def title_can_name(name: str) -> bool:
+    """Whether a molecule's title can be its residue name."""
+    return bool(_TITLE_NAME.fullmatch(name)) and name.upper() not in _reserved_names()
+
+
+def _as_name(stem: str) -> str:
+    """The residue name a file's stem gives its ligand, as preparation reads it."""
+    return stem.strip().upper()[:3] or "LIG"
+
+
+def expand_ligand_files(ligands: Any, out_dir: str | Path,
+                        told: list[str] | None = None,
+                        named: bool = False) -> Any:
+    """Give every molecule its own file, so a file of several reads as several.
+
+    A list of N files is already N ligands; one file holding N molecules is
+    the same thing written differently, and is divided here into the files it
+    would otherwise have been supplied as, in the order the molecules are
+    written. Everything after this sees one molecule per file, which is what
+    :func:`load_ligand` and the system build expect.
+
+    Each new file is named for its molecule's title where that is a usable
+    residue name: one to three letters or digits, not a standard residue,
+    water or ion name, and not shared with another molecule being divided.
+    The others are named ``L01``, ``L02`` ... in turn, skipping every name
+    already in use. The file stem becomes the residue name, so the names
+    differ; a title that is the name of a ligand supplied as its own file is
+    refused (``setup.ligand.names_collide``), since whether the two are the
+    same component cannot be told from the files.
+
+    ``told`` collects one sentence per divided file, for the person.
+    ``named`` says the caller gives every ligand its residue name, so a title
+    that is a whole file's name is no clash.
+
+    Returns ``ligands`` itself, unchanged, when no file holds more than one
+    molecule.
+    """
+    as_list = [ligands] if isinstance(ligands, (str, Path)) else list(ligands)
+    divided: dict[int, tuple[Path, str, list[str], list[str]]] = {}
+    for index, entry in enumerate(as_list):
+        path = Path(entry).expanduser()
+        suffix = path.suffix.lower()
+        if suffix not in (".sdf", ".mol2") or not path.is_file():
+            continue                   # load_ligand says what is wrong with it
+        # The bytes as written, whatever their encoding: a record reaches the
+        # toolkit as it was in the file.
+        with open(path, encoding="utf-8", errors="surrogateescape",
+                  newline="") as handle:
+            text = handle.read()
+        records = _split_records(text, suffix)
+        if len(records) > 1:
+            divided[index] = (path, suffix, records,
+                              [_record_title(r, suffix) for r in records])
+    if not divided:
+        return ligands
+
+    # The names the files supplied whole give their ligands.
+    whole = {index: _as_name(Path(entry).expanduser().stem)
+             for index, entry in enumerate(as_list) if index not in divided}
+    taken = set(whole.values())
+    reserved = _reserved_names()
+    titles = [title.upper() for _, _, _, found in divided.values()
+              for title in found if _TITLE_NAME.fullmatch(title)]
+    usable = {t for t in titles
+              if titles.count(t) == 1 and t not in reserved}
+    clashing = sorted(usable & taken)
+    if clashing and not named:
+        said = (f"A molecule in a ligand file of several is called "
+                f"{clashing[0]}, the name a ligand supplied as its own file "
+                "already takes" if len(clashing) == 1 else
+                f"Molecules in a ligand file of several are called "
+                f"{', '.join(clashing)}, names ligands supplied as their own "
+                "files already take")
+        raise LigandError(
+            f"{said}. Two different "
+            "molecules cannot share a residue name, and whether these are "
+            "one component cannot be told from the files. Give the molecule "
+            "another title in its file (an SDF record's first line, a MOL2 "
+            "molecule's line after @<TRIPOS>MOLECULE), or rename the other "
+            "file."
+        , code="setup.ligand.names_collide", names=clashing,
+            option="setup.ligand")
+    if named:
+        usable -= taken
+    taken |= usable
+    fresh = (name for name in _generated_names()
+             if name not in taken and name not in reserved)
+
+    out_dir = Path(out_dir)
+    out: list[str] = []
+    for index, entry in enumerate(as_list):
+        if index not in divided:
+            out.append(str(entry))
+            continue
+        path, suffix, records, found = divided[index]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        parts: list[str] = []
+        for number, (record, title) in enumerate(zip(records, found), start=1):
+            name = title.upper() if title.upper() in usable else next(fresh, None)
+            if name is None:
+                raise LigandError(
+                    "The ligand files hold more molecules than there are "
+                    "residue names to give them. A ligand file is a few "
+                    "molecules beside a protein; a library of compounds is "
+                    "studied one study at a time."
+                , code="setup.ligand.too_many_molecules",
+                    option="setup.ligand")
+            target = out_dir / f"{name}{suffix}"
+            with open(target, "w", encoding="utf-8", errors="surrogateescape",
+                      newline="") as handle:
+                handle.write(record)
+            out.append(str(target))
+            if title.upper() == name:
+                parts.append(name)
+            elif title:
+                shown = title.encode("utf-8", "surrogateescape").decode(
+                    "utf-8", "replace")
+                parts.append(f"'{shown}' as {name}")
+            else:
+                parts.append(f"molecule {number} (untitled) as {name}")
+        sentence = (f"The ligand file {path.name} holds {len(records)} "
+                    f"molecules, each prepared as its own ligand: "
+                    f"{', '.join(parts)}.")
+        logger.info("%s", sentence)
+        if told is not None:
+            told.append(sentence)
+    return out
 
 
 def load_ligand(
@@ -108,7 +771,26 @@ def load_ligand(
     """
     path = Path(ligand_file).expanduser().resolve()
     if not path.exists():
-        raise LigandError(f"Ligand file not found: {path}")
+        # A residue name here is a common mistake, and the bare "file not
+        # found" sends somebody looking for a file they never meant to make.
+        # `ligand:` takes chemistry from outside; naming a component that is
+        # already in the structure is `heterogens: auto`.
+        given = str(ligand_file).strip()
+        if given.isalnum() and 1 <= len(given) <= 3 and not Path(given).suffix:
+            raise LigandError(
+                f"No file at {path}. {given.upper()!r} looks like a residue "
+                "name rather than a path.\n\n"
+                "`ligand` takes an SDF or MOL2 file, for chemistry supplied "
+                "from outside the structure. To use a component the "
+                "structure already holds, set `heterogens: auto` instead, "
+                "which identifies it and looks its chemistry up.\n\n"
+                "Where that lookup is not available -- an offline machine, "
+                "or a structure given as a local file -- fetch the entry and "
+                "pass the path:\n\n"
+                f"    curl -O https://files.rcsb.org/ligands/download/"
+                f"{given.upper()}_ideal.sdf"
+            , code="setup.ligand.pose_unavailable")
+        raise LigandError(f"Ligand file not found: {path}", code="setup.ligand.unreadable", path=str(path))
     detect_ligand_format(path)
 
     Molecule = _import_openff()
@@ -118,32 +800,67 @@ def load_ligand(
         raise LigandError(
             f"Could not read ligand {path.name!r} as a valid molecule: {exc}. "
             f"Ensure the SDF/MOL2 has explicit hydrogens and bond orders."
-        ) from exc
+        , code="setup.ligand.unreadable", path=str(path)) from exc
 
-    # Molecule.from_file may return a list when the file holds multiple
-    # molecules; we parameterize a single ligand for now (the config is
-    # list-shaped so multi-ligand support can layer on later).
+    # A file of several molecules is divided by :func:`expand_ligand_files`
+    # before it gets here, so a list means a caller reached this directly.
     if isinstance(molecule, list):
         if len(molecule) != 1:
             raise LigandError(
                 f"Ligand file {path.name!r} contains {len(molecule)} "
-                f"molecules; provide a single-molecule SDF/MOL2 (multi-ligand "
-                f"support is not yet implemented)."
-            )
+                f"molecules, and this loads one at a time; pass it through the "
+                f"setup phase, or divide it with expand_ligand_files."
+            , code="setup.ligand.multiple_molecules", path=str(path), count=len(molecule))
         molecule = molecule[0]
 
     molecule.name = name
 
-    # Net charge: infer from formal charges unless the user overrides.
+    # Net charge: read from the formal charges the file carries. A stated
+    # `ligand_net_charge` is checked against it rather than substituted for
+    # it, because the number is not what the force field sees: the atoms
+    # are. A file drawn as a neutral amidine parameterises as a neutral
+    # amidine however the configuration labels it, so accepting the label
+    # would produce a run whose charge record and whose chemistry disagree.
+    #
+    # This was a finding before it was a check. A benchmark supplied
+    # benzamidine as the Chemical Component Dictionary's ideal SDF, which
+    # is the neutral form, and the salt bridge that system is known for was
+    # absent from two independent tools. Both were right about the molecule
+    # they were given.
     inferred = _infer_net_charge(molecule)
-    if net_charge is not None and inferred is not None and net_charge != inferred:
-        logger.warning(
-            "Ligand %s: user net_charge=%d overrides inferred charge=%d.",
-            name, net_charge, inferred,
-        )
+    if inferred is None:
+        # Refused rather than carried as "unknown". Formal charges in an
+        # SDF or MOL2 are whole numbers, so failing to sum them to one means
+        # the file was not read as the chemistry it describes -- and the
+        # check below, which stops a stated charge standing against the
+        # file's, was skipped whenever it happened, so the stated number went
+        # into the record unchecked.
+        raise StudyError(
+            f"Ligand {name}: the formal charges in {path.name} could not be "
+            "read as a whole-number net charge, so the charge this run would "
+            "record cannot be taken from the file or checked against one "
+            "stated in the study. Check that the file carries explicit "
+            "hydrogens and its formal charges (an SDF's `M  CHG` lines), and "
+            "supply it again."
+        , code="setup.chemistry.charge_undetermined", resname=name)
+    if net_charge is not None and net_charge != inferred:
+        raise StudyError(
+            f"Ligand {name}: the study states a net charge of {net_charge:+d}, "
+            f"and {path.name} carries formal charges summing to "
+            f"{inferred:+d}. The file is the chemistry -- its protonation "
+            "decides what is parameterised -- so the two cannot both stand. "
+            "Supply a file in the protonation state the study means (for an "
+            "amidine or a carboxylate at physiological pH that is usually "
+            "not the Chemical Component Dictionary's ideal form, which is "
+            "given neutral), or drop `ligand_net_charge` and let the file "
+            "speak for itself."
+        , code="setup.chemistry.charge_contradicted", resname=name, stated=net_charge)
     resolved_charge = net_charge if net_charge is not None else inferred
     logger.info(
-        "Loaded ligand %s from %s (net charge=%s).",
+        "Loaded ligand %s from %s (net charge=%s, taken from the file's own "
+        "formal charges). Supplying chemistry as a file sets the protonation "
+        "state: an ideal SDF is given in one particular form, and it is the "
+        "form that will be simulated.",
         name, path.name,
         resolved_charge if resolved_charge is not None else "unknown",
     )

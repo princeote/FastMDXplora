@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from fastmdxplora import record_access as _records
+
 
 @dataclass(frozen=True)
 class PhaseContext:
@@ -35,7 +37,7 @@ def load_phase_context(project_root: Path) -> PhaseContext:
     phases: set[str] = set()
     manifest_path = project_root / "manifest.json"
     try:
-        with manifest_path.open(encoding="utf-8") as fh:
+        with _records.open_text(manifest_path, encoding="utf-8") as fh:
             manifest = json.load(fh)
         raw_phases = manifest.get("phases", [])
         if isinstance(raw_phases, list):
@@ -48,14 +50,9 @@ def load_phase_context(project_root: Path) -> PhaseContext:
         phases = set()
 
     if not phases:
-        if (project_root / "setup").is_dir():
-            phases.add("setup")
-        if (project_root / "simulation").is_dir():
-            phases.add("simulation")
-        if (project_root / "analysis").is_dir():
-            phases.add("analysis")
-        if (project_root / "report").is_dir():
-            phases.add("report")
+        for phase in ("setup", "simulation", "analysis", "report"):
+            if _records.is_dir(project_root / phase):
+                phases.add(phase)
 
     return PhaseContext(
         setup_present="setup" in phases,
@@ -63,3 +60,30 @@ def load_phase_context(project_root: Path) -> PhaseContext:
         analysis_present="analysis" in phases,
         report_present="report" in phases,
     )
+
+
+def _system_label(system: object) -> str:
+    """What to call the system in a title.
+
+    The name of the structure, not the path to it. A report is a document
+    somebody sends to a colleague or attaches to a submission, and the title
+    read "FastMDXplora Study --- /home/aaina/ala3.pdb": the author's home
+    directory, on the first line, in a file meant to leave the machine. A
+    four-character PDB entry is already a name and is kept as one.
+    """
+    from pathlib import Path
+
+    text = str(system)
+    if len(text) == 4 and text.isalnum():
+        return text.upper()
+    stem = Path(text).name
+    # Repeatedly, because a compressed structure carries two: taking one left
+    # "trp_cage.pdb" as the name of a study.
+    changed = True
+    while changed:
+        changed = False
+        for suffix in (".gz", ".bz2", ".pdb", ".cif", ".pdbx", ".ent"):
+            if stem.lower().endswith(suffix) and len(stem) > len(suffix):
+                stem = stem[: -len(suffix)]
+                changed = True
+    return stem or text

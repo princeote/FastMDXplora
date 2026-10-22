@@ -19,7 +19,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from fastmdxplora.config import validate_config, generate_template
-from fastmdxplora.config.loader import load_config_file
 import yaml
 
 from fastmdxplora.simulation import runner as _runner
@@ -34,22 +33,31 @@ class TestIntegratorFactory:
         openmm = MagicMock()
         return {"openmm": openmm, "unit": unit}
 
-    @pytest.mark.parametrize("name,attr", [
-        ("langevin_middle", "LangevinMiddleIntegrator"),
-        ("langevin", "LangevinIntegrator"),
-        ("brownian", "BrownianIntegrator"),
-        ("verlet", "VerletIntegrator"),
-        ("variable_langevin", "VariableLangevinIntegrator"),
-        ("variable_verlet", "VariableVerletIntegrator"),
+    @pytest.mark.parametrize("name,attr,friction", [
+        ("langevin_middle", "LangevinMiddleIntegrator", 1.0),
+        ("langevin", "LangevinIntegrator", 1.0),
+        ("brownian", "BrownianIntegrator", 200.0),
+        ("variable_langevin", "VariableLangevinIntegrator", 1.0),
     ])
-    def test_each_integrator_constructs(self, name, attr):
+    def test_each_integrator_constructs(self, name, attr, friction):
         omm = self._fake_omm()
         _runner._make_integrator(
-            omm, name=name, temperature_K=300.0, friction_per_ps=1.0,
+            omm, name=name, temperature_K=300.0, friction_per_ps=friction,
             timestep_fs=2.0, error_tolerance=0.001, random_seed=None,
         )
         # The matching OpenMM constructor was called
         assert getattr(omm["openmm"], attr).called
+
+    @pytest.mark.parametrize("name", ["verlet", "variable_verlet"])
+    def test_an_integrator_with_no_thermostat_is_refused(self, name):
+        omm = self._fake_omm()
+        with pytest.raises(ValueError, match="no thermostat"):
+            _runner._make_integrator(
+                omm, name=name, temperature_K=300.0, friction_per_ps=1.0,
+                timestep_fs=2.0, error_tolerance=0.001, random_seed=None,
+            )
+        assert not omm["openmm"].VerletIntegrator.called
+        assert not omm["openmm"].VariableVerletIntegrator.called
 
     def test_unknown_integrator_raises(self):
         omm = self._fake_omm()
@@ -433,7 +441,7 @@ class TestFixedPdb:
         out = tmp_path / "setup"
         out.mkdir()
 
-        artifacts = setup_run(
+        setup_run(
             orchestrator=orch, output_dir=out,
             fixed_pdb=str(tmp_path / "does_not_exist.pdb"),
         )
@@ -464,17 +472,17 @@ class TestMDEngineCLIRouting:
         rc = cli_main([
             "explore", "--system", str(pdb), "--output", str(out),
             "--include", "simulation",
-            "--simulate-integrator", "brownian",
+            "--simulate-integrator", "langevin",
             "--simulate-pressure-atm", "1.0",
             "--simulate-checkpoint-interval-steps", "2500",
         ])
-        assert rc == 0
-        # Simulation degrades gracefully (no setup outputs), but the
-        # manifest still records the parameters that were requested.
+        assert rc == 1
+        # Missing setup/backend is a real workflow error, but the manifest
+        # still records the parameters that were requested.
         params = json.loads(
             (out / "simulation" / "simulation_parameters.json").read_text(encoding="utf-8")
         )["parameters"]
-        assert params["integrator"] == "brownian"
+        assert params["integrator"] == "langevin"
         assert params["pressure_atm"] == 1.0
         assert params["checkpoint_interval_steps"] == 2500
 

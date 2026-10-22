@@ -25,11 +25,12 @@ from pathlib import Path
 from typing import Any
 
 from fastmdxplora.utils.logging import get_logger
+from fastmdxplora.refusals import CodedError
 
 logger = get_logger("simulation.plumed")
 
 
-class PlumedError(RuntimeError):
+class PlumedError(CodedError, RuntimeError):
     """Raised for PLUMED configuration or environment problems."""
 
 
@@ -43,7 +44,7 @@ def _import_plumed():
             "which is not installed. Install it with:\n"
             "    conda install -c conda-forge openmm-plumed\n"
             "or disable PLUMED (simulation.plumed.enabled = false)."
-        ) from exc
+        , code="environment.backend.missing") from exc
     return PlumedForce
 
 
@@ -63,14 +64,14 @@ def load_plumed_script(script: str | Path) -> str:
                                   or "/" in text or "\\" in text):
         # Looked like a path but doesn't exist — fail clearly rather than
         # silently treating a typo'd path as an (invalid) inline script.
-        raise PlumedError(f"PLUMED script file not found: {candidate}")
+        raise PlumedError(f"PLUMED script file not found: {candidate}", code="environment.path.not_found")
     return text
 
 
 def adjust_plumed_output_paths(script: str, output_dir: Path) -> str:
     """Redirect PLUMED ``FILE=`` outputs into the run's output directory.
 
-    PLUMED scripts write COLVAR/HILLS/etc. to whatever ``FILE=`` names; we
+    PLUMED scripts write COLVAR/HILLS/etc. to whatever ``FILE=`` names; this
     rewrite those to live under ``output_dir`` (keeping only the basename) so
     a run's PLUMED outputs land with its other artifacts, using forward
     slashes for cross-platform correctness.
@@ -92,6 +93,8 @@ def add_plumed_force(
     system: Any,
     plumed_config: dict[str, Any],
     output_dir: Path,
+    *,
+    resolved_name: str = "plumed.dat",
 ) -> Any | None:
     """Add a PLUMED biasing force to ``system`` if PLUMED is enabled.
 
@@ -111,6 +114,13 @@ def add_plumed_force(
             ``.dat``/``.plumed`` file.
     output_dir : pathlib.Path
         Directory for PLUMED output files (COLVAR, HILLS, ...).
+    resolved_name : str
+        What to call the copy of the resolved script saved beside the run.
+        A run that attaches twice -- an umbrella window, held through
+        equilibration with one script and switched to another at production
+        -- would otherwise have the second overwrite the first, and the
+        record of what actually ran during equilibration would be the
+        production script.
 
     Returns
     -------
@@ -124,7 +134,7 @@ def add_plumed_force(
         raise PlumedError(
             "simulation.plumed.enabled is true but no 'script' was provided. "
             "Supply a PLUMED script (inline text or a path to a .dat file)."
-        )
+        , code="simulation.bias.parameter_missing")
 
     PlumedForce = _import_plumed()
 
@@ -137,10 +147,10 @@ def add_plumed_force(
     system.addForce(force)
 
     # Save the resolved script alongside the run for reproducibility.
-    resolved = output_dir / "plumed.dat"
+    resolved = output_dir / resolved_name
     resolved.write_text(script, encoding="utf-8")
-    logger.info(
-        "PLUMED enabled: biasing force added; resolved script -> %s",
-        resolved.as_posix(),
-    )
+    # Said by the caller, not here. This runs inside a block that redirects
+    # the file descriptors to catch PLUMED's own forty lines of setup, and a
+    # message logged in there goes into the capture file with them -- so the
+    # one line saying the bias was attached would vanish from the terminal.
     return force

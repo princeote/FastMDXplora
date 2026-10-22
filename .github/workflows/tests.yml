@@ -5,15 +5,167 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # 03:00 UTC daily, for the corpus job below.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+# A push superseding another cancels its run. Fifteen jobs per push against
+# a twenty-job account ceiling meant an afternoon of pushes queued for hours
+# behind runs whose commits were already history -- and the one hand-canceled
+# run read as a mystery failure until the workflow was read closely.
+#
+# Grouped by event as well. With the branch alone, `git push && gh workflow
+# run` cancelled the push's run with the dispatch it had just asked for, and
+# a push near 03:00 cancelled the nightly corpus run. A run now supersedes
+# only a run of its own kind.
+concurrency:
+  group: tests-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
 
 jobs:
+  # The corpus that finds what the suite does not.
+  #
+  # `pytest.ini` deselects `-m "not network"` by default and the job below
+  # runs bare `pytest`, so the 105 network-marked tests -- the whole
+  # structure corpus and the method-produces-its-result suite -- ran nowhere:
+  # not in CI, not in the documented contributor workflow, which says only
+  # "run the test suite". `tests/validation/structures.py` opens by saying
+  # every defect found on 2026-08-07 was found by running a real structure
+  # "not by the test suite, which was green at 1,900 tests throughout", and
+  # the 2026-09-04 audit was another instance of that sentence.
+  #
+  # Nightly rather than per-push because it fetches from RCSB and runs real
+  # dynamics, and `workflow_dispatch` so it can be asked for before a
+  # release. It does not gate a pull request: a corpus that fetches from the
+  # network will go red for reasons that are not the contributor's, and a
+  # required check that does that gets ignored or removed.
+  corpus:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # 90 was reached exactly, at 90% of the corpus, on 2026-09-06 -- and 70 of
+    # those minutes were one structure prepared seven times because a failed
+    # preparation was not cached. With that fixed the run is about 40 minutes;
+    # this leaves room for a slow fetch without leaving room for a silent hang.
+    timeout-minutes: 120
+    # conda, not pip, and the reason is in `environment.yml`'s own comments.
+    # Two capabilities in this corpus have no wheel at all:
+    #
+    #   openmm-plumed  -- "conda-only, which is the reason this file exists:
+    #                     there is deliberately no `plumed` pip extra, so a
+    #                     clone set up any other way has no umbrella,
+    #                     metadynamics or steered support."
+    #   openff-toolkit -- `fastmdx doctor` prints, in every job that has run:
+    #                     "OpenFF toolkit  missing  conda install -c
+    #                     conda-forge openff-toolkit"
+    #
+    # Installed by pip, this job ran the corpus with no enhanced sampling and
+    # no ligand chemistry, so `test_it_runs` refused for umbrella,
+    # metadynamics and steered, and the ligand structure refused too -- four
+    # clean, correct refusals that read as four defects. An extras group pip
+    # can satisfy is not the same thing as an environment the physics can run
+    # in, and only `environment.yml` describes the second.
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # The declared stack, from the file the package already ships and that
+      # `test_the_stack_is_actually_there` already checks against.
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          cache-environment: true
+          # [validation] brings MDAnalysis and ProLIF, which no job has ever
+          # installed -- so `validation/cross_tool.py`, 853 lines of genuine
+          # independent comparison with pre-registered tolerances, has never
+          # been executed by CI either. From conda-forge here so pip does not
+          # resolve numpy or scipy over the build openmm was compiled for.
+          create-args: >-
+            mdanalysis>=2.10
+            prolif>=2.2
+            pytest
+            pytest-timeout
+            pytest-cov
+
+      - name: Install FastMDXplora without re-resolving the stack
+        run: python -m pip install -e . --no-deps
+
+      # State the environment rather than leaving it to be inferred from
+      # which tests failed. Four hours were spent reading a failure whose
+      # cause this command prints in one line.
+      - name: What this environment actually has
+        run: fastmdx info
+
+      # `--timeout-method=signal` fails the hung test instead of killing the
+      # session. On 2026-09-06 one structure hung for the full 600 s and took
+      # the whole report with it: no failure section, no summary, nothing for
+      # the other hundred tests. A corpus that fetches real structures will
+      # meet a slow one, and it should cost that one test.
+      # Before the corpus, because it takes eight seconds and the corpus
+      # takes an hour. These are the tests that need a real OpenMM: the
+      # seeding path opens a trajectory, builds a context and writes a
+      # `state.xml`, none of which the pip-installed matrix legs can do.
+      # It was 44% of a diff and it held both bugs that reached a real run.
+      - name: Run the tests that need a real OpenMM
+        run: pytest tests/test_seeding_end_to_end.py -v --timeout-method=signal --timeout=600
+
+      # The network-marked tests outside the corpus: a PDB ID fetched through
+      # the command line, and PROPKA on a real complex. The step below runs
+      # tests/validation only, so these ran in no job at all.
+      - name: Run the other network-marked tests
+        run: pytest -m network tests --ignore=tests/validation -v --timeout-method=signal --timeout=600
+
+      - name: Run the network-marked corpus
+        run: pytest -m network tests/validation -v --timeout-method=signal --timeout=2400
+
   test:
     runs-on: ${{ matrix.os }}
+    # A hung leg otherwise holds a runner for the six-hour default, which
+    # during a pileup is a fifth of the account's whole capacity. The
+    # coverage leg runs the same tests traced, about twice as long, and
+    # was cancelled at 99% under the 45 minutes the others take. With the
+    # browser tests it took 86 minutes at 0bcdf122 and was cancelled at 90
+    # in run #729.
+    timeout-minutes: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' && 150 || 60 }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        # Linux and macOS are what FastMDXplora supports. AmberTools, which
+        # gives every ligand its charges, has no Windows build.
+        os: [ubuntu-latest, macos-latest]
+        # The floor, the coverage leg, and the ceiling: 3.10 keeps the
+        # `>=3.10` claim honest, 3.11 is the one job codecov reads, and
+        # the ceiling is where what is coming breaks first. The floor was
+        # 3.9 until OpenMM stopped publishing wheels for it, which made
+        # every 3.9 job the one without the physics; that role is kept on
+        # purpose below, on the floor. The versions in between are bracketed --
+        # nothing in the tree branches on the interpreter version, so a
+        # suite green at both ends is green in the middle.
+        #
+        # The ceiling moves rather than a fourth leg being added: every
+        # version is a job on each operating system, against a twenty-job
+        # account ceiling, and a pileup of those is what the concurrency
+        # rule above exists to prevent.
+        #
+        # It sat briefly at 3.14 and came back. Every distribution here
+        # publishes cp314 wheels, which is what was checked beforehand and
+        # was the wrong question: PROPKA installs on 3.14 and then raises
+        # at runtime. `propka/parameters.py` reads `self.__annotations__`,
+        # an instance lookup that resolved to the class dict through 3.13
+        # and does not under PEP 649, where class annotations are computed
+        # lazily through `__annotate__`. Latest is 3.5.1, it declares
+        # `>=3.8` with no upper bound, and no fix has been released.
+        #
+        # PROPKA is a run dependency of the conda package -- the install
+        # route the README leads with -- so `requires-python` cannot claim
+        # 3.14 while pKa assignment raises on it. Move the ceiling when
+        # PROPKA ships a release that runs there; a wheel existing is not
+        # evidence that it does.
+        python-version: ["3.10", "3.11", "3.13"]
 
     steps:
       - uses: actions/checkout@v5
@@ -24,15 +176,100 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+          # The [test] and [md] wheels together are hundreds of megabytes --
+          # rdkit, OpenMM, mdtraj -- and fifteen jobs re-downloaded all of
+          # it on every push.
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Install package and test dependencies
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[test]"
+          # The physics too, except on the floor. Without OpenMM the suite
+          # skips everything that touches it, and for three rounds "low
+          # coverage" meant "the dependency was silently absent where
+          # coverage was measured"; the 3.11 job carries it and is the one
+          # codecov reads. The floor job stays without it on purpose: a
+          # base install with no physics is what an analysis-only user
+          # has, and the jobs that lacked OpenMM were the ones that found
+          # an unguarded import, a missing markdown fallback and a launch
+          # that never checked its stack. Best-effort elsewhere: a job that
+          # cannot install it skips those tests. Coverage is measured and
+          # uploaded from the ubuntu 3.11 job only, not merged across jobs.
+          if [ "${{ matrix.python-version }}" = "3.10" ]; then echo "::notice::the floor job runs the base install, without the [md] extra, on purpose"; else
+          python -m pip install -e ".[md]" || echo "::notice::the [md] extra has no wheels here; physics-dependent tests will skip"
+          fi
+
+      - name: Install ffmpeg for the movie tests
+        # The GUI makes a movie with the ffmpeg of the computer it runs on,
+        # and is never given one. It was put in the corpus job's
+        # environment, which runs no movie test, so here every test that
+        # encodes a real movie skipped and coverage read the encoding as
+        # untested. The pipeline itself is tested against a stand-in ffmpeg
+        # on every job; these run the real one, on Linux, where it installs
+        # in seconds.
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -hide_banner -version | head -1
+
+      - name: Install a browser for the GUI tests
+        # The GUI is a web page, and what its scripts do can only be checked
+        # in a browser: the composer's layout, the study frame, what the run
+        # builder submits. Those tests drive Chromium through Playwright and
+        # skip where it is absent, which was every job here, so they had only
+        # ever run on machines that happened to have it. One job holds them,
+        # the one coverage is measured on. A test tool, not a dependency:
+        # nobody installing FastMDXplora gets it.
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        shell: bash
+        run: |
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
 
       - name: Run tests
+        # Coverage is measured where it is uploaded and nowhere else. The
+        # tracer taxes every line of every test, and fourteen of the fifteen
+        # term-missing tables were written into logs nobody reads while the
+        # upload step below only ever sends the ubuntu-3.11 file. The other
+        # legs exist to prove the suite passes there, and they prove it
+        # faster untraced.
+        shell: bash
         run: |
-          pytest --cov=fastmdxplora --cov-report=term-missing --cov-report=xml
+          # -rfEs lists each failed test, each error and each skipped test
+          # with its reason, so a red job names what failed and a program or
+          # a package missing from a job is read here rather than inferred
+          # from a coverage report.
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ] && [ "${{ matrix.python-version }}" = "3.11" ]; then
+            pytest -rfEs --cov=fastmdxplora --cov-report=term-missing --cov-report=xml
+          else
+            pytest -rfEs
+          fi
+
+      - name: Lint
+        # CONTRIBUTING has required this since before there was a job for it,
+        # which is how 474 findings accumulated -- three of them an undefined
+        # name, one a dict literal whose earlier value could never take
+        # effect, and three of them a test function defined twice in one file
+        # so that the earlier one never ran.
+        #
+        # Gated on F and B only, and the reason is in pyproject: the E, W, I
+        # and UP backlog is 350 findings of import order and line length that
+        # would have to be cleared in one 138-file commit before this job
+        # could go green, and holding the bug-finding rules hostage to that is
+        # how a lint job ends up permanently disabled. `ruff check src tests`
+        # still reports everything, and CONTRIBUTING says which subset must
+        # pass.
+        #
+        # One OS and one version: lint findings do not vary by platform, and
+        # fifteen copies of the same answer is fifteen runner-minutes.
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        shell: bash
+        run: ruff check src tests --select F,B
 
       - name: CLI smoke test
         shell: bash

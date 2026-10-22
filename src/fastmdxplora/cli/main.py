@@ -9,6 +9,7 @@ Subcommands
   analyze            Run only the analysis phase
   report             Run only the report phase
   info               Print environment and component info
+  remote             Inspect other machines, reached over SSH
 
 Each per-phase subcommand exposes the phase's own options (e.g.
 ``--ph`` for setup, ``--duration-ns`` for simulate). The ``explore``
@@ -26,8 +27,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -38,7 +39,9 @@ from fastmdxplora import (
     __expansion__,
     __version__,
 )
-from fastmdxplora.orchestrator import FastMDXplora
+from fastmdxplora.utils.logging import get_logger
+
+logger = get_logger("cli")
 
 
 # ---------------------------------------------------------------------------
@@ -53,16 +56,22 @@ from fastmdxplora.orchestrator import FastMDXplora
 # The kwarg_name is what gets passed to the phase's run() function.
 
 _SETUP_OPTIONS: list[tuple[str, str, dict[str, Any]]] = [
-    ("ph", "ph", {"type": float, "help": "pH for hydrogen placement (default 7.0)."}),
+    ("ph", "ph", {"type": float, "help": "pH for hydrogen placement."}),
+    ("protonation-margin", "protonation_margin", {"type": float, "metavar": "UNITS",
+        "help": "How close a ligand's pKa may come to the pH before setup "
+                "stops rather than choose a charge state. Narrow it only for "
+                "a ligand whose protonation you already know."}),
+    ("heterogens", "heterogens", {"type": str, "help": "How to treat non-standard residues: auto decides per "
+                "component and stops where the structure does not determine "
+                "what to simulate; drop removes them all; keep retains them."}),
     ("keep-heterogens", "keep_heterogens", {"action": "store_true", "default": None,
-        "help": "Retain non-standard residues (ligands, cofactors, ions)."}),
+        "help": "Retain non-standard residues. Same as --setup-heterogens keep."}),
     ("keep-water", "keep_water", {"action": "store_true", "default": None,
         "help": "Retain crystallographic waters."}),
     ("fixed-pdb", "fixed_pdb", {"type": str, "metavar": "PATH",
         "help": "Use an already-fixed PDB and skip PDBFixer."}),
-    ("forcefield", "forcefield", {"choices": ["charmm36", "amber14", "amber-fb15", "amber-openff"],
-        "help": "Named force field (default 'charmm36'). Resolves to the "
-                "right XMLs and water model. Use 'amber-openff' for ligands."}),
+    ("forcefield", "forcefield", {"help": "Named force field, resolved to the right XMLs and water "
+                "model. 'amber-openff' is the one that takes a ligand."}),
     ("force-field", "force_field", {"nargs": "+", "metavar": "XML",
         "help": "Raw OpenMM XML(s), overriding --forcefield (power users)."}),
     ("ligand", "ligand", {"nargs": "+", "metavar": "FILE",
@@ -70,7 +79,7 @@ _SETUP_OPTIONS: list[tuple[str, str, dict[str, Any]]] = [
     ("ligand-forcefield", "ligand_forcefield", {"type": str, "metavar": "NAME",
         "help": "OpenFF small-molecule force field (e.g. openff-2.2.1)."}),
     ("ligand-name", "ligand_name", {"type": str, "metavar": "NAME",
-        "help": "Residue/molecule name for the ligand (default 'LIG')."}),
+        "help": "Residue/molecule name for the ligand."}),
     ("ligand-net-charge", "ligand_net_charge", {"type": int, "metavar": "INT",
         "help": "Ligand formal net charge (default: inferred from SDF)."}),
     ("no-ligand-clash-check", "check_ligand_clashes", {"action": "store_false",
@@ -78,31 +87,27 @@ _SETUP_OPTIONS: list[tuple[str, str, dict[str, Any]]] = [
         "help": "Skip the ligand-protein clash check at setup."}),
     ("ligand-clash-threshold-nm", "ligand_clash_threshold_nm", {"type": float,
         "metavar": "NM",
-        "help": "Min ligand-protein contact distance in nm (default 0.15)."}),
+        "help": "Min ligand-protein contact distance in nm."}),
     ("water-model", "water_model", {"type": str, "metavar": "NAME",
         "help": "Water model for Modeller (e.g. 'tip3p', 'tip4pew')."}),
     ("solvent-padding-nm", "solvent_padding_nm", {"type": float,
-        "help": "Min distance between solute and box wall in nm (default 1.0)."}),
-    ("box-shape", "box_shape", {"choices": ["cube", "dodecahedron", "octahedron"],
-        "help": "Periodic box geometry (default 'cube')."}),
-    ("nonbonded-method", "nonbonded_method", {"choices": [
-        "NoCutoff", "CutoffNonPeriodic", "CutoffPeriodic", "PME", "Ewald"],
-        "help": "Nonbonded method (default 'PME')."}),
+        "help": "Min distance between solute and box wall in nm."}),
+    ("box-shape", "box_shape", {"help": "Periodic box geometry."}),
+    ("nonbonded-method", "nonbonded_method", {"help": "Nonbonded method."}),
     ("ion-positive", "ion_positive", {"type": str, "metavar": "ION",
-        "help": "Counter-ion cation (default 'Na+')."}),
+        "help": "Counter-ion cation."}),
     ("ion-negative", "ion_negative", {"type": str, "metavar": "ION",
-        "help": "Counter-ion anion (default 'Cl-')."}),
+        "help": "Counter-ion anion."}),
     ("ion-concentration-M", "ion_concentration_M", {"type": float,
-        "help": "Target ionic strength in M (default 0.15)."}),
+        "help": "Target ionic strength in M."}),
     ("temperature-K", "temperature_K", {"type": float,
-        "help": "Initial velocity temperature in K (default 300)."}),
+        "help": "Initial velocity temperature in K."}),
 ]
 
 _SIMULATION_OPTIONS: list[tuple[str, str, dict[str, Any]]] = [
-    ("preset", "preset", {"choices": ["gentle"],
-        "help": "Simulation preset. 'gentle' uses conservative smoke-test settings."}),
     ("duration-ns", "duration_ns", {"type": float,
-        "help": "Production length in ns (standard MD convention; equilibration is independent)."}),
+        "help": ("Production length in ns (standard MD convention; equilibration is "
+                 "independent). 0 equilibrates and stops, with no production.")}),
     ("nvt-duration-ns", "nvt_duration_ns", {"type": float,
         "help": "NVT equilibration in ns (default: fixed 500 ps regardless of production length)."}),
     ("npt-duration-ns", "npt_duration_ns", {"type": float,
@@ -114,31 +119,25 @@ _SIMULATION_OPTIONS: list[tuple[str, str, dict[str, Any]]] = [
     ("production-steps", "production_steps", {"type": int,
         "help": "Production step count (overrides --duration-ns)."}),
     ("timestep-fs", "timestep_fs", {"type": float,
-        "help": "Integrator timestep in fs (default 2.0)."}),
-    ("integrator", "integrator", {"choices": [
-        "langevin_middle", "langevin", "brownian", "verlet",
-        "variable_langevin", "variable_verlet"],
-        "help": "Integrator (default 'langevin_middle')."}),
+        "help": "Integrator timestep in fs."}),
+    ("integrator", "integrator", {"help": "Integrator."}),
     ("temperature-K", "temperature_K", {"type": float,
-        "help": "Production temperature in K (default 300)."}),
+        "help": "Production temperature in K."}),
     ("pressure-bar", "pressure_bar", {"type": float,
-        "help": "Barostat pressure in bar (OpenMM-native; default 1.0)."}),
+        "help": "Barostat pressure in bar, OpenMM-native."}),
     ("pressure-atm", "pressure_atm", {"type": float,
         "help": "Barostat pressure in atm (converted to bar)."}),
     ("friction-per-ps", "friction_per_ps", {"type": float,
-        "help": "Langevin friction in 1/ps (default 1.0)."}),
-    ("platform", "platform", {"choices": ["auto", "CUDA", "OpenCL", "CPU", "HIP"],
-        "help": "OpenMM compute platform (default 'auto': CUDA → OpenCL → CPU)."}),
-    ("precision", "precision", {"choices": ["single", "mixed", "double"],
-        "help": "GPU precision (default 'mixed')."}),
+        "help": "Langevin friction in 1/ps."}),
+    ("platform", "platform", {"help": "OpenMM compute platform. 'auto' tries CUDA, then OpenCL, "
+                "then CPU."}),
+    ("precision", "precision", {"help": "GPU precision."}),
     ("device-index", "device_index", {"type": str, "metavar": "IDX",
         "help": "GPU device index for multi-GPU machines (e.g. '0' or '0,1')."}),
     ("checkpoint-interval-steps", "checkpoint_interval_steps", {"type": int,
-        "help": "Checkpoint (.chk) interval in steps; 0 disables (default 10000)."}),
-    ("live-telemetry", "live_telemetry", {"action": "store_true", "default": None,
-        "help": "Write lightweight live dashboard telemetry during simulation."}),
+        "help": "Checkpoint (.chk) interval in steps; 0 disables."}),
     ("telemetry-interval", "telemetry_interval", {"type": int,
-        "help": "Minimum step interval for live telemetry updates (default 1000)."}),
+        "help": "Minimum step interval for live telemetry updates."}),
     ("trajectory-interval-steps", "trajectory_interval_steps", {"type": int,
         "help": "Trajectory (.dcd) frame interval in steps (default: adaptive, ~2000 frames)."}),
     ("random-seed", "random_seed", {"type": int,
@@ -155,20 +154,38 @@ _ANALYSIS_OPTIONS: list[tuple[str, str, dict[str, Any]]] = [
         "help": "Trajectory file (default: simulation/production.dcd)."}),
     ("topology", "topology", {"type": str, "metavar": "PATH",
         "help": "Topology file (default: simulation/topology.pdb)."}),
+    ("ligand-resname", "ligand_resname", {"type": str, "metavar": "NAME",
+        "help": "Ligand residue name for ligand-aware analyses."}),
     ("analyses", "include", {"nargs": "+", "metavar": "NAME",
         "help": "Subset of analyses to run (e.g. rmsd rmsf rg). Default: all."}),
     ("exclude-analyses", "exclude", {"nargs": "+", "metavar": "NAME",
         "help": "Analyses to skip. Mutually exclusive with --analyses."}),
     ("selection", "selection", {"type": str, "metavar": "EXPR",
         "help": "Default MDTraj atom selection (e.g. 'name CA'). Overrides --scope."}),
-    ("scope", "scope", {"choices": ["solute", "protein", "ligand", "all"],
-        "help": "Atom scope for analyses (default 'solute' = protein+ligand)."}),
+    ("scope", "scope", {"help": "Atom scope for analyses. 'solute' is protein plus ligand."}),
     ("stride", "stride", {"type": int,
         "help": "Frame stride for trajectory loading (default 1)."}),
     ("first", "first", {"type": int,
         "help": "First frame index to include (default 0)."}),
     ("last", "last", {"type": int,
         "help": "Last frame index (exclusive). Default: full trajectory."}),
+    ("dimred-methods", "dimred_methods", {"nargs": "+", "choices": ["pca", "tsne", "umap"],
+        "metavar": "METHOD",
+        "help": "Dimensionality-reduction methods (e.g. pca)."}),
+    ("dimred-components", "dimred_components", {"type": int, "metavar": "N",
+        "help": "Number of dimensionality-reduction components (default 2)."}),
+    ("cluster-methods", "cluster_methods", {"nargs": "+",
+        "choices": ["kmeans", "hierarchical", "dbscan"], "metavar": "METHOD",
+        "help": "Clustering methods (e.g. hierarchical)."}),
+    ("cluster-n-clusters", "cluster_n_clusters", {"type": int, "metavar": "N",
+        "help": "Number of clusters for k-means/hierarchical clustering."}),
+    ("cluster-features", "cluster_features", {"choices": ["rmsd", "coordinates"],
+        "help": "What clustering compares frames in: rmsd superposes every "
+                "pair optimally; coordinates superposes each onto the first "
+                "and compares directly."}),
+    ("cluster-linkage", "cluster_linkage",
+        {"choices": ["ward", "complete", "average", "single"],
+         "help": "Hierarchical clustering linkage method."}),
 ]
 
 _REPORT_OPTIONS: list[tuple[str, str, dict[str, Any]]] = [
@@ -187,6 +204,198 @@ _REPORT_OPTIONS: list[tuple[str, str, dict[str, Any]]] = [
     ("no-reproducibility", "include_reproducibility", {"action": "store_false", "default": None,
         "help": "Skip the Reproducibility section."}),
 ]
+
+
+#: Settings the schema declares that deliberately get no flag of their own.
+#: Each is reachable, by a flag with a different name or through a structured
+#: block a command line cannot express, and the reason is recorded so this
+#: does not become a place to hide a setting nobody wired up.
+_NO_FLAG_OF_ITS_OWN: dict[str, str] = {
+    # A mapping, and a list of blocks, were withheld as things a flag cannot
+    # carry. A flag reads a mapping as YAML now, and each item of a list the
+    # same way, so `--analyze-options '{cluster: {n_clusters: 5}}'` and
+    # `--report-region-highlights '{label: helix, start: 3, end: 7}'` carry
+    # them; the config file is still the readable place for either.
+    # Named differently on the command line, for the reason given.
+    "plumed": "reached by --simulate-plumed-script, which takes a path",
+    "force_field": "reached by --setup-forcefield, which resolves a name",
+    # Already flags on the dashboard command, without a phase prefix, because
+    # that is where somebody sets them.
+    "dashboard_ligand_resname": "reached by --dashboard-ligand-resname",
+    "dashboard_binding_pocket_cutoff_A":
+        "reached by --dashboard-binding-pocket-cutoff-A",
+    "dashboard_max_playback_frames":
+        "reached by --dashboard-max-playback-frames",
+}
+
+
+class _PercentSafeHelp(argparse.RawDescriptionHelpFormatter):
+    """Render help without treating a literal percent as a format spec.
+
+    argparse expands help strings with `%`, so `71% of a cube` in box_shape
+    read as a `% o` octal conversion and raised at print_help() time while the
+    parser still built. Escaping in the schema is wrong: config/generate.py
+    and gui/schema_payload.py print the same text verbatim and would show
+    `71%%`, and the interface-parity test requires the stored help to equal
+    the schema's byte for byte. So the doubling happens here, at render, and
+    nowhere earlier.
+    """
+
+    def _get_help_string(self, action):
+        return (super()._get_help_string(action) or "").replace("%", "%%")
+
+
+def _schema_for(phase: str):
+    """The schema a CLI verb (or block name) refers to, or None.
+
+    Three functions used to write `PHASE_SCHEMAS.get(_SCHEMA_KEY.get(...))`
+    separately, which made `execution` invisible to the flag generator, the
+    default reader and the choice reader in the same stroke -- it is a
+    top-level block and not a phase, so it is in `all_schemas()` and not in
+    `PHASE_SCHEMAS`. One lookup, and adding a block to `all_schemas()` is
+    enough to reach all three.
+    """
+    from fastmdxplora.config.schema import all_schemas
+
+    return all_schemas().get(_SCHEMA_KEY.get(phase, phase))
+
+
+def _generated_options(phase: str, written: list[tuple]) -> list[tuple]:
+    """A flag for every setting the schema declares.
+
+    The flags were listed by hand beside a schema declaring the same settings,
+    and the list drifted: twenty-four settings had no flag at all, and of the
+    sixty that did, fifty-three carried help text that had fallen behind the
+    schema's. Keeping the wording was the argument for the table, and the
+    wording was the thing that had rotted -- ``--setup-ph`` said "pH for
+    hydrogen placement" where the schema explains that it sets protonation
+    states.
+
+    So everything derivable is derived: the help, the type, the accepted
+    values, whether it takes a list. What remains in the table is what cannot
+    be: a flag deliberately named something other than its setting, and a
+    convenience flag that has no setting of its own.
+    """
+    group = _schema_for(phase)
+    if group is None:
+        return written
+
+    # The wording comes from the schema even where the table supplied some.
+    # Fifty-three of its sixty entries had help that had fallen behind the
+    # declaration, which is what a second copy of a sentence does. What the
+    # table keeps is the flag name and the argparse mechanics -- how the value
+    # is spelled on the command line, not what it means.
+    refreshed: list[tuple] = []
+    for flag, dest, options in written:
+        field = group.get(dest)
+        if field is not None and field.help:
+            options = dict(options)
+            if options.get("action") == "store_false":
+                options["help"] = (
+                    f"Do not: {field.help[0].lower()}{field.help[1:]}")
+            else:
+                options["help"] = field.help
+        refreshed.append((flag, dest, options))
+    written = refreshed
+
+    already = {dest for _flag, dest, _kw in written}
+    generated: list[tuple] = []
+    for field in group.fields:
+        if field.name in already or field.name in _NO_FLAG_OF_ITS_OWN:
+            continue
+        flag = field.name.replace("_", "-")
+        help_text = field.help or f"Set {field.name}."
+
+        if field.type is bool:
+            # Both directions, because a setting defaulting to true needs a
+            # way off and one defaulting to false needs a way on -- and which
+            # it is can change without the flag having to.
+            generated.append((flag, field.name, {
+                "action": "store_true", "default": None, "help": help_text}))
+            generated.append((f"no-{flag}", field.name, {
+                "action": "store_false", "default": None,
+                "help": f"Do not: {help_text[0].lower()}{help_text[1:]}"}))
+            continue
+
+        options: dict[str, Any] = {"help": help_text}
+        if field.choices:
+            options["choices"] = list(field.choices)
+        if field.type is list:
+            options["nargs"] = "+"
+            options["metavar"] = "VALUE"
+            # Each item as the config file would read it, so `--execution-devices
+            # 0 1` is a list of numbers and `--setup-chains A B` of names. Read
+            # as text before, so the devices arrived as the strings "0" and "1".
+            options["type"] = item
+        else:
+            options["type"] = _parser_for(field.type)
+            options["metavar"] = _METAVAR.get(options["type"], "VALUE")
+        generated.append((flag, field.name, options))
+    return list(written) + generated
+
+
+from fastmdxplora.refusals import CodedError  # noqa: E402
+
+
+def number(text: str) -> int | float:
+    """A setting the schema lets be whole or not: whole where it is written
+    whole. Read as text before, so `--setup-temperature-K 310` reached the
+    study as the string "310"."""
+    try:
+        return int(text)
+    except ValueError:
+        return float(text)
+
+
+class NotTheTypeItTakes(CodedError, argparse.ArgumentTypeError):
+    """A flag's value that is not the type its setting takes. argparse reports
+    it as the flag's error; the code says which refusal it is."""
+
+    default_code = "config.option.wrong_type"
+
+
+def item(text: str) -> Any:
+    """One item of a list setting, read as the config file reads a value."""
+    import yaml
+
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError:
+        return text
+
+
+def mapping(text: str) -> dict[str, Any]:
+    """A block of settings, written as a YAML mapping. Read as text before, so
+    a block could not be given on the command line at all: what arrived was a
+    string, and the validator named its characters as unknown settings."""
+    import yaml
+
+    try:
+        value = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise NotTheTypeItTakes(
+            f"not a mapping: {str(exc).splitlines()[0]}") from exc
+    if not isinstance(value, dict):
+        raise NotTheTypeItTakes(
+            "expects a mapping of settings, as in "
+            "'{collective_variable: distance, from: 0.3, to: 1.5}'")
+    return value
+
+
+def _parser_for(kind: Any) -> Any:
+    """How the command line reads a value, from the type the schema declares."""
+    if kind in (int, float, str):
+        return kind
+    if kind is dict:
+        return mapping
+    if isinstance(kind, tuple) and set(kind) <= {int, float}:
+        return number
+    return str
+
+
+#: What to call the value in help, by how it is read. Cosmetic, and derived
+#: rather than written per flag so a new setting does not need a decision.
+_METAVAR = {int: "N", float: "X", str: "TEXT", number: "X", mapping: "YAML"}
 
 
 # Map: phase -> (options-list, explore-prefix)
@@ -208,6 +417,64 @@ _PHASE_TO_ORCH = {
 }
 
 
+#: The CLI names a phase for the verb, the schema for the noun.
+_SCHEMA_KEY = {
+    "setup": "setup", "simulate": "simulation",
+    "analyze": "analysis", "report": "report",
+}
+
+
+# Filled in once the schema key is known: the hand-written flags above, plus
+# one for every setting they do not cover. Done here rather than in the
+# literal because the mapping from a CLI verb to a schema block is declared
+# below it.
+for _phase in list(_PHASE_SPEC):
+    _table, _prefix = _PHASE_SPEC[_phase]
+    _PHASE_SPEC[_phase] = (_generated_options(_phase, _table), _prefix)
+
+#: `execution` is not a phase -- it has no subcommand and does not appear in
+#: a plan -- so it is not in `_PHASE_SPEC`. It is still a block of the config
+#: with four settings, and it had no flag and no form control: writing a file
+#: was the only way to reach `mode`, `workers`, `devices` or
+#: `continue_on_error`, against a README that says no interface is a subset
+#: of another. Generated the same way, attached to the commands that schedule
+#: more than one run.
+_EXECUTION_OPTIONS = _generated_options("execution", [])
+
+
+def _schema_defaults(phase: str) -> dict[str, Any]:
+    """Every default for a phase, read from the one place they are declared."""
+    group = _schema_for(phase)
+    if group is None:
+        return {}
+    return {field.name: field.default for field in group.fields}
+
+
+def _schema_choices(phase: str) -> dict[str, tuple[str, ...]]:
+    """Every accepted-value list for a phase, from the schema that declares it."""
+    group = _schema_for(phase)
+    if group is None:
+        return {}
+    return {f.name: f.choices for f in group.fields if f.choices}
+
+
+def _with_default(help_text: str, kwarg: str, defaults: dict[str, Any]) -> str:
+    """Append the schema's default to a help string.
+
+    Written out by hand, a default drifts: the help said pH 7.0 after it had
+    moved to 7.4, and named charmm36 after the force field became auto. Someone
+    reading --help has no way to tell and no reason to doubt it. So the value
+    is taken from the schema, which is where it is decided.
+    """
+    if kwarg not in defaults:
+        return help_text
+    default = defaults[kwarg]
+    if default is None or isinstance(default, bool):
+        # A flag's default is carried by whether passing it turns something on.
+        return help_text
+    return f"{help_text} Default: {default}.".strip()
+
+
 def _attach_phase_options(
     parser: argparse.ArgumentParser,
     options: list[tuple[str, str, dict[str, Any]]],
@@ -215,6 +482,7 @@ def _attach_phase_options(
     prefix: str = "",
     dest_prefix: str = "",
     group_title: str = "options",
+    phase: str = "",
 ) -> None:
     """Attach a phase's options to a parser under an argparse group.
 
@@ -232,14 +500,59 @@ def _attach_phase_options(
     group_title : str
         Title for the argument group (shown in --help).
     """
-    group = parser.add_argument_group(group_title)
-    for cli_suffix, kwarg, argparse_kwargs in options:
+    # One group per set of related settings, so `--help` reads as sections
+    # rather than as thirty-seven flags in declaration order. The grouping is
+    # the schema's, which is where the browser gets it too -- two views of one
+    # list, rather than two lists that agree until one is edited.
+    from fastmdxplora.config.schema import SETTING_GROUPS
+
+    schema_key = _SCHEMA_KEY.get(phase, phase)
+    titles = {name: title
+              for title, _why, names in SETTING_GROUPS.get(schema_key, ())
+              for name in names}
+    order = [title for title, _why, _names in SETTING_GROUPS.get(schema_key, ())]
+    groups: dict[str, Any] = {}
+
+    def _group_for(kwarg: str):
+        """The argument group a setting belongs in, made when first needed."""
+        title = titles.get(kwarg)
+        if title is None:
+            # A convenience flag with no setting of its own -- there is
+            # nothing in the schema to have grouped it by.
+            stem = (group_title or "").removesuffix(" options")
+            heading = f"{stem}: other" if stem else "other"
+            return groups.setdefault(heading, parser.add_argument_group(heading))
+        # "simulate options" reads badly in front of a group name, and the
+        # word carries nothing: every flag is an option.
+        stem = (group_title or "").removesuffix(" options")
+        heading = f"{stem}: {title.lower()}" if stem else title
+        if title not in groups:
+            groups[title] = parser.add_argument_group(heading)
+        return groups[title]
+
+    defaults = _schema_defaults(phase)
+    choices = _schema_choices(phase)
+    for cli_suffix, kwarg, argparse_kwargs in sorted(
+        options, key=lambda o: (order.index(titles[o[1]])
+                                if o[1] in titles else len(order))
+    ):
+        group = _group_for(kwarg)
         if prefix:
             flag = f"--{prefix}-{cli_suffix}"
             dest = f"{dest_prefix}__{kwarg}"
         else:
             flag = f"--{cli_suffix}"
             dest = kwarg
+        argparse_kwargs = dict(argparse_kwargs)
+        argparse_kwargs["help"] = _with_default(
+            argparse_kwargs.get("help", ""), kwarg, defaults)
+        # The accepted values come from the schema too. They were written out
+        # here as well, and in the browser, and beside the code that validates
+        # them -- four copies of one list, agreeing by nobody having touched
+        # them.
+        allowed = choices.get(kwarg)
+        if allowed and "choices" not in argparse_kwargs:
+            argparse_kwargs["choices"] = list(allowed)
         group.add_argument(flag, dest=dest, **argparse_kwargs)
 
 
@@ -265,9 +578,85 @@ def _harvest_phase_options(
     return out
 
 
+#: Flags whose name does not become the option name by dropping the analysis
+#: prefix. --analyze-dimred-components reads better than
+#: --analyze-dimred-n-components, but the option is n_components, and stripping
+#: the prefix produced "components", which no analysis has ever accepted. The
+#: flag was therefore ignored in silence.
+_OPTION_KEY_OVERRIDES = {
+    ("dimred", "dimred_components"): "n_components",
+}
+
+
+def _option_key(analysis: str, flag_key: str) -> str:
+    """The option name a CLI flag stands for."""
+    override = _OPTION_KEY_OVERRIDES.get((analysis, flag_key))
+    if override is not None:
+        return override
+    return flag_key[len(analysis) + 1:] if flag_key.startswith(f"{analysis}_") else flag_key
+
+
+def _normalize_analysis_options(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Move CLI analysis-method flags into the nested ``options`` mapping.
+
+    The analysis orchestrator accepts method-specific settings under
+    ``options`` (for example ``options.cluster.n_clusters``), while argparse
+    naturally harvests flat flags. Keeping this conversion at the CLI
+    boundary makes the same options work for both ``analyze`` and prefixed
+    ``explore`` flags without changing the Python API.
+    """
+    out = dict(kwargs)
+    nested = {
+        "dimred": {
+            key: out.pop(key)
+            for key in ("dimred_methods", "dimred_components")
+            if key in out
+        },
+        "cluster": {
+            key: out.pop(key)
+            for key in ("cluster_methods", "cluster_n_clusters",
+                        "cluster_linkage", "cluster_features")
+            if key in out
+        },
+    }
+    options = dict(out.get("options") or {})
+    for name, values in nested.items():
+        if values:
+            current = dict(options.get(name) or {})
+            current.update(
+                {_option_key(name, key): value for key, value in values.items()}
+            )
+            options[name] = current
+    if options:
+        out["options"] = options
+    elif "options" in out:
+        out.pop("options")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Parser construction
 # ---------------------------------------------------------------------------
+def _study_level_args(p: argparse.ArgumentParser) -> None:
+    """The three study-level settings the config file carries and the study
+    records: how it was written, by which AI model, and its budget. On
+    `explore` only: a single-phase command attaches that phase's own
+    `agent` field without a prefix, so `--agent` there means the phase's.
+    Generated from the schema, as the phase settings are."""
+    from fastmdxplora.config.loader import STUDY_LEVEL_KEYS
+    from fastmdxplora.config.schema import TOP_LEVEL
+
+    study = p.add_argument_group("study")
+    for name in STUDY_LEVEL_KEYS:
+        field = TOP_LEVEL.get(name)
+        options: dict[str, Any] = {"dest": name, "default": None, "help": field.help}
+        if field.choices:
+            options["choices"] = list(field.choices)
+        options["type"] = _parser_for(field.type)
+        options["metavar"] = _METAVAR.get(options["type"], "VALUE")
+        study.add_argument("--" + name.replace("_", "-"), **options)
+
+
 def _common_input_args(p: argparse.ArgumentParser) -> None:
     """Arguments shared by all subcommands that accept a system input.
 
@@ -300,7 +689,7 @@ def _common_input_args(p: argparse.ArgumentParser) -> None:
         help=(
             "YAML config file capturing the whole run (system, output, "
             "phase selection, per-phase options). Command-line flags "
-            "override values in the file. See `fastmdx init-config`."
+            "override values in the file. See `fastmdx config`."
         ),
     )
     src.add_argument(
@@ -309,13 +698,36 @@ def _common_input_args(p: argparse.ArgumentParser) -> None:
         metavar="DIR",
         help=(
             "Output directory for project artifacts "
-            "(default: ./fastmdxplora_output_<UTC-timestamp>)."
+            "(default: ./fastmdxplora_<system>_study_<UTC-timestamp>)."
         ),
     )
     src.add_argument(
         "--verbose",
         action="store_true",
         help="Also stream debug logging to the terminal.",
+    )
+    # Top-level rather than per-phase, so it is written here rather than
+    # generated from the schema alongside the phase settings.
+    src.add_argument(
+        "--no-explain",
+        dest="explain",
+        action="store_false",
+        default=True,
+        help=(
+            "Do not say why each step happens. Explanations are on, because "
+            "a pipeline that runs silently teaches nothing; turn them off "
+            "once the steps are familiar."
+        ),
+    )
+    src.add_argument(
+        "--no-defaults",
+        dest="no_defaults",
+        action="store_true",
+        help=(
+            "Run without your defaults: the nearest fastmdx-defaults.yml in "
+            "the study's folder or a folder above it, which otherwise fills "
+            "what the config leaves unset."
+        ),
     )
     dash = p.add_argument_group("dashboard")
     dash.add_argument(
@@ -325,7 +737,7 @@ def _common_input_args(p: argparse.ArgumentParser) -> None:
         action="store_true",
         default=False,
         help=(
-            "Launch the local live dashboard for this output folder before "
+            "Open the local GUI for this output folder before "
             "the workflow starts. Implies live telemetry when simulation runs."
         ),
     )
@@ -382,8 +794,9 @@ def _common_input_args(p: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         metavar="FRAMES",
-        help="Maximum number of frames the molecular viewer will load for "
-             "trajectory playback (default 200).",
+        help="Maximum number of frames of the trajectory the molecular viewer "
+             "is sent (default 2000; a system over 5,000 atoms is sent fewer, "
+             "ten million atoms times frames at most).",
     )
     dash.add_argument(
         "--dashboard-open-browser",
@@ -394,6 +807,61 @@ def _common_input_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _overwrite_args(p: argparse.ArgumentParser) -> None:
+    """How a command runs into a folder that holds what it would write.
+
+    Refused without one of these, and only then: a phase writes freely
+    into a new folder, or into a study whose phases before it have run.
+    With either, what the phases write and what they leave stale after
+    them (a report from the analyses before) is cleared first
+    (`fastmdxplora.replaced`).
+    """
+    group = p.add_mutually_exclusive_group()
+    group.add_argument(
+        "--force-overwrite",
+        "--force",
+        dest="force",
+        action="store_true",
+        help=(
+            "Run phases whose output the --output folder already holds: that "
+            "output, and the output after it that it was written from, is "
+            "removed first. Without this or --rerun such a run is refused."
+        ),
+    )
+    group.add_argument(
+        "--rerun",
+        dest="rerun",
+        action="store_true",
+        help=(
+            "As --force-overwrite, keeping what it replaces in the study's "
+            "previous/<phase> (in place of what was kept there before) "
+            "rather than removing it."
+        ),
+    )
+
+
+class _Accumulate(argparse.Action):
+    """Add to what is there rather than replacing it.
+
+    With `nargs="+"` argparse replaces on a second use, so `--include
+    analysis --include report` runs report alone -- half the request dropped,
+    and nothing said. Both spellings work now: repeated flags and a single
+    flag with several values mean the same thing, which is what somebody
+    typing either of them intends.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        current = list(getattr(namespace, self.dest, None) or [])
+        for value in values if isinstance(values, list) else [values]:
+            if value not in current:
+                current.append(value)
+        setattr(namespace, self.dest, current)
+
+
+#: The file `fastmdx config` writes when not told where.
+_CONFIG_FILE = "fastmdxplora.yml"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fastmdx",
@@ -402,7 +870,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Project-level orchestrator for end-to-end molecular dynamics "
             "studies: setup → simulate → analyze → report."
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_PercentSafeHelp,
         epilog=(
             "Examples:\n"
             "  fastmdx explore -system protein.pdb\n"
@@ -444,24 +912,71 @@ def _build_parser() -> argparse.ArgumentParser:
             ),
             description=(
                 "Run the full FastMDXplora pipeline end-to-end on the given "
-                "system. Use --include or --exclude to run a subset of phases. "
+                "system. Use --include-phase or --exclude-phase to run a subset "
+                "of phases. "
                 "Each phase's flags are available under a per-phase prefix "
                 "(--setup-*, --simulate-*, --analyze-*, --report-*)."
             ),
-            formatter_class=argparse.RawDescriptionHelpFormatter,
+            formatter_class=_PercentSafeHelp,
         )
         _common_input_args(ep)
+        _study_level_args(ep)
         ep.add_argument(
-            "--include",
+            "--sweep", action="append", dest="sweep", metavar="AXIS=VALUES",
+            help=(
+                "Run the study once for every value of a setting: "
+                "--sweep simulation.temperature_K=300,310,320. Give it once "
+                "per axis; the runs are every combination. Where a value "
+                "holds a comma, write the list in brackets: "
+                "--sweep 'setup.ligand=[\"a.sdf\", \"b.sdf\"]'."
+            ),
+        )
+        _overwrite_args(ep)
+        ep.add_argument(
+            "--rerun-window",
+            dest="rerun_windows",
             nargs="+",
+            type=int,
+            action=_Accumulate,
+            metavar="N",
+            help=(
+                "For an umbrella study that has run: run these windows again "
+                "in place, with whatever the config now gives them, keep every "
+                "other window, and recombine the free energy. The earlier runs "
+                "are moved to superseded/."
+            ),
+        )
+        ep.add_argument(
+            "--rerun-force-constant",
+            dest="rerun_force_constant",
+            type=float,
+            metavar="K",
+            help=(
+                "With --rerun-window: hold the windows named at this force "
+                "constant, in kJ/mol per unit of the collective variable "
+                "squared (nm^2 for a distance, rad^2 for an angle). Every "
+                "other window keeps the one it ran with."
+            ),
+        )
+        # The setting is `include_phase`, so the flag is too. `--include`
+        # and `--exclude` still work: they are what every script and every
+        # set of notes already says, and breaking them to rename a flag
+        # would cost more than the confusion it removes.
+        ep.add_argument(
+            "--include-phase", "--include",
+            dest="include",
+            nargs="+",
+            action=_Accumulate,
             metavar="PHASE",
             help="Subset of phases to run: setup, simulation, analysis, report.",
         )
         ep.add_argument(
-            "--exclude",
+            "--exclude-phase", "--exclude",
+            dest="exclude",
             nargs="+",
+            action=_Accumulate,
             metavar="PHASE",
-            help="Phases to skip (mutually exclusive with --include).",
+            help="Phases to skip (mutually exclusive with --include-phase).",
         )
         ep.add_argument(
             "--no-report",
@@ -475,6 +990,17 @@ def _build_parser() -> argparse.ArgumentParser:
                  "phases) without running anything.",
         )
 
+        # The execution block: how the runs a plan produces are scheduled.
+        # Prefixed like the phases, because `--mode` and `--workers` on their
+        # own say nothing about which part of the study they belong to.
+        _attach_phase_options(
+            ep, _EXECUTION_OPTIONS,
+            prefix="execution",
+            dest_prefix="execution",
+            group_title="execution options",
+            phase="execution",
+        )
+
         # Per-phase options under per-phase prefix
         for phase, (opts, prefix) in _PHASE_SPEC.items():
             _attach_phase_options(
@@ -482,39 +1008,32 @@ def _build_parser() -> argparse.ArgumentParser:
                 prefix=prefix,
                 dest_prefix=phase,
                 group_title=f"{phase} options",
+                phase=phase,
             )
 
     # ---------- per-phase subcommands: phase-specific flags only ----------
+    # Each is `explore --include-phase <phase>` with that phase's flags
+    # unprefixed, and runs through it (`_cmd_phase`).
     for phase, (opts, _) in _PHASE_SPEC.items():
         pp = sub.add_parser(
             phase,
             help=f"Run only the {phase} phase.",
-            description=f"Run only the {phase} phase of the FastMDXplora pipeline.",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
+            description=(
+                f"Run only the {phase} phase of the FastMDXplora pipeline: "
+                f"`fastmdx explore --include-phase {_PHASE_TO_ORCH[phase]}`, "
+                "with this phase's flags unprefixed. Given an --output folder "
+                "that holds a study and no system or config, it runs on that "
+                "study, from the settings the study recorded."),
+            formatter_class=_PercentSafeHelp,
         )
         _common_input_args(pp)
-        _attach_phase_options(pp, opts, group_title=f"{phase} options")
+        _overwrite_args(pp)
+        _attach_phase_options(pp, opts, group_title=f"{phase} options",
+                              phase=phase)
+        if phase == "report":
+            _share_args(pp)
 
-    health = sub.add_parser(
-        "health",
-        help="Run repository health checks and environment diagnostics.",
-        description=(
-            "Run the repository doctor checks to validate the local checkout, "
-            "environment, and package readiness."
-        ),
-    )
-    health.add_argument(
-        "--no-fix",
-        action="store_true",
-        help="Only diagnose problems; do not install or modify anything.",
-    )
-    health.add_argument(
-        "--yes",
-        action="store_true",
-        help="Accept all fixes automatically.",
-    )
-
-    sub.add_parser(
+    info = sub.add_parser(
         "info",
         help="Print FastMDXplora environment information.",
         description=(
@@ -522,162 +1041,550 @@ def _build_parser() -> argparse.ArgumentParser:
             "for each phase, and the citation."
         ),
     )
+    info.add_argument(
+        "--json",
+        action="store_true",
+        help=("Print the same information as JSON, for a program to read. "
+              "This is how `fastmdx remote` learns what a machine has."),
+    )
 
-    dashboard = sub.add_parser(
-        "dashboard",
-        help="Serve local dashboard views for an existing output directory.",
+    sel = sub.add_parser(
+        "select",
+        help="Show which atoms and residues a selection matches.",
         description=(
-            "Serve a local-only dashboard for completed outputs and live "
-            "simulation telemetry. Binds to 127.0.0.1 by default."
+            "Resolve a selection against a structure and print what it "
+            "matches, before a run uses it. A selection that matches the "
+            "wrong atoms is not an error and nothing downstream can detect "
+            "it, so the way to know is to look."
         ),
     )
-    dashboard_sub = dashboard.add_subparsers(dest="dashboard_command", metavar="<dashboard-command>")
-    serve = dashboard_sub.add_parser(
-        "serve",
-        help="Serve the live dashboard for an output directory.",
-        description="Start the local dashboard server for an existing FastMDXplora output.",
+    sel.add_argument("expression",
+                     help="The selection, e.g. 'resSeq 189 to 195 and name CA'.")
+    sel.add_argument("--structure", "--topology", "-s", dest="structure",
+                     required=True,
+                     help="A PDB, CIF or trajectory topology to resolve against.")
+    sel.add_argument("--limit", type=int, default=40,
+                     help="How many atoms to list (default 40). 0 lists all.")
+    sel.add_argument("--atoms", action="store_true",
+                     help="List every matching atom rather than the residues.")
+
+    dif = sub.add_parser(
+        "diff",
+        help="Show the settings two studies or Configs differ in.",
+        description=(
+            "Compare two Configs, or the folders two studies were written to, "
+            "setting by setting. A phase setting either leaves out is taken at "
+            "its default, so a short Config and the full one it resolves to "
+            "compare as the same study. Exits 1 where they differ in what they "
+            "asked for, 0 where they do not."
+        ),
     )
-    serve.add_argument(
+    dif.add_argument("first", metavar="FIRST", help="A Config file or a study folder.")
+    dif.add_argument("second", metavar="SECOND", help="A Config file or a study folder.")
+    dif.add_argument("--json", action="store_true", help="Print the differences as JSON.")
+
+    scn = sub.add_parser(
+        "scene",
+        help="Write a view of a study as a scene file (MolViewSpec).",
+        description=(
+            "Write a view of a study as a MolViewSpec scene (.mvsx): the atoms "
+            "shown, at a frame where one is asked, with the study's secondary "
+            "structure, colours and selections, opened as it is in any viewer "
+            "built on Mol*, such as molstar.org. The scene is written in the "
+            "study's scenes folder, and copied where --output says."
+        ),
+    )
+    scn.add_argument("study", metavar="STUDY", help="The study's folder.")
+    scn.add_argument("--view", default=None, metavar="NAME",
+                     help="A view saved with the study in the GUI (its camera, frame, "
+                          "representation, colouring and parts shown).")
+    scn.add_argument("--frame", type=int, default=None, metavar="N",
+                     help="The frame of the trajectory as the GUI plays it, from 0 "
+                          "(default: the view's, else the structure).")
+    scn.add_argument("--name", default=None, help="The scene's name (default: the view's, "
+                                                  "else 'scene').")
+    scn.add_argument("--output", "-o", default=None, metavar="FILE",
+                     help="Also copy the scene to this file.")
+    scn.add_argument("--no-selections", action="store_true",
+                     help="Leave out the selections named in the GUI.")
+
+    mov = sub.add_parser(
+        "movie",
+        help="Make a movie of a study's frames, as the GUI's Viewer makes one.",
+        description=(
+            "Make a movie of a study's frames without opening the GUI: the "
+            "Viewer renders each frame in a browser with no window (Playwright's "
+            "Chromium, or Chrome or Edge), as a view saved with the study shows "
+            "it, and ffmpeg on this computer encodes the movie into the study's "
+            "movies folder (MP4, or WebM where ffmpeg has no H.264 encoder)."
+        ),
+    )
+    mov.add_argument("study", metavar="STUDY", help="The study's folder.")
+    mov.add_argument("--view", default=None, metavar="NAME",
+                     help="A view saved with the study in the GUI (default: the Viewer as "
+                          "it opens).")
+    mov.add_argument("--representation", default=None,
+                     choices=["cartoon", "backbone", "sticks", "ballAndStick", "lines",
+                              "surface", "spacefill"], help="How the protein is represented.")
+    mov.add_argument("--colour", "--color", default=None, metavar="COLOUR",
+                     help="chain, spectrum, residue, element, secondary_structure, "
+                          "monochrome, or a per-residue result as result:<analysis>.")
+    mov.add_argument("--superposed", default=None, choices=["none", "backbone", "pocket"],
+                     help="Fit the frames on this.")
+    mov.add_argument("--from", dest="first", type=int, default=None, metavar="N",
+                     help="The first frame, from 0 (default 0).")
+    mov.add_argument("--to", dest="last", type=int, default=None, metavar="N",
+                     help="The last frame (default the last); before --from, the movie "
+                          "plays backwards.")
+    mov.add_argument("--every", type=int, default=1, metavar="N",
+                     help="Every Nth frame (default 1).")
+    mov.add_argument("--between", type=int, default=0, choices=[0, 1, 3, 7],
+                     help="Frames put in between each two, each atom moved in a straight "
+                          "line: smoother, not more simulation (default 0).")
+    mov.add_argument("--fps", type=int, default=24, choices=[10, 15, 24, 25, 30, 60],
+                     help="Frames a second (default 24).")
+    mov.add_argument("--size", default="1920x1080",
+                     choices=["1280x720", "1920x1080", "3840x2160"],
+                     help="Width x height in pixels (default 1920x1080).")
+    mov.add_argument("--turn", action="store_true",
+                     help="Turn the camera once about the screen's vertical over the movie.")
+    mov.add_argument("--no-time", action="store_true",
+                     help="Leave out each frame's simulated time.")
+    mov.add_argument("--name", default="movie", help="The movie's name (default 'movie').")
+
+    gui = sub.add_parser(
+        "gui",
+        help="Open the FastMDXplora graphical interface in a browser.",
+        description=(
+            "Serve the local FastMDXplora GUI: build and save a study "
+            "configuration, launch a run locally, watch live telemetry, view "
+            "the structure and trajectory, and browse results. Binds to "
+            "127.0.0.1 by default."
+        ),
+    )
+    gui.add_argument(
         "--output",
-        required=True,
+        default=None,
         metavar="DIR",
-        help="FastMDXplora output directory to watch.",
+        help=(
+            "Output directory to open. Defaults to the current directory, "
+            "which is the right choice when you are designing a new study."
+        ),
     )
-    serve.add_argument(
-        "--host",
-        default="127.0.0.1",
-        help="Bind address (default: 127.0.0.1).",
+    gui.add_argument("--demo", nargs="?", const=".", default=None, metavar="DIR",
+                     help="Copy the demo study, trypsin with benzamidine (3PTB), "
+                          "finished, into DIR (default: the current folder) and "
+                          "open it. Fetched the first time (about 11 MB) and kept "
+                          "in the cache, once it is published; it is not yet.")
+    gui.add_argument("--open", default=None, metavar="SOURCE",
+                     help="Open a shared study: its DOI (10.5281/zenodo.N), its Zenodo "
+                          "address, or the archive's file. Every file is checked against "
+                          "its SHA-256 before it opens. See docs/sharing.md.")
+    gui.add_argument("--open-into", default=None, metavar="DIR",
+                     help="With --open: the folder the study is unpacked into (default: "
+                          "the current folder).")
+    gui.add_argument("--open-most-gb", type=float, default=None, metavar="GB",
+                     help="With --open: the largest archive downloaded and opened "
+                          "(default: 2).")
+    gui.add_argument("--host", default="127.0.0.1",
+                     help="Bind address (default: 127.0.0.1).")
+    gui.add_argument("--port", type=int, default=8765,
+                     help="Port to serve on (default: 8765).")
+    gui.add_argument("--no-browser", action="store_true",
+                     help="Do not open a browser window automatically.")
+    gui.add_argument("--ligand-resname", type=str, default=None, metavar="RESNAME",
+                     help="Force a ligand residue name for the ligand tools.")
+    gui.add_argument("--binding-pocket-cutoff-A", type=float, default=None,
+                     metavar="ANGSTROM",
+                     help="Binding-pocket cutoff used by the viewer.")
+    gui.add_argument("--accent", default=None, type=str.lower,
+                     choices=("cyan", "blue", "violet", "magenta", "graphite"),
+                     help="The interface's accent for everyone it serves, and for "
+                          "the reports of the studies it starts on this machine "
+                          "(default: FASTMDX_ACCENT if set, else cyan). A "
+                          "person's own choice, in the settings, comes first.")
+    hosted = gui.add_argument_group(
+        "serving it to someone else",
+        "For a service that runs the GUI for other people, behind a proxy "
+        "that signs them in. The proxy adds a secret to every request, read "
+        "here from FASTMDX_PROXY_SECRET; requests without it are refused. "
+        "See docs/hosting.md.")
+    hosted.add_argument("--hosted", action="store_true",
+                        help="Serve through a signing-in proxy: answer only "
+                             "requests carrying its secret, under the names "
+                             "given with --allowed-host, inside --workspace.")
+    hosted.add_argument("--workspace", default=None, metavar="DIR",
+                        help="With --hosted: the one folder the GUI reads and "
+                             "writes. New studies go here, and nothing outside "
+                             "it is opened. Default: the current directory.")
+    hosted.add_argument("--allowed-host", action="append", default=[],
+                        metavar="NAME",
+                        help="With --hosted: a name the proxy serves this GUI "
+                             "under, such as app.example.org. Repeat for more.")
+    hosted.add_argument("--account-url", default="", metavar="PATH",
+                        help="With --hosted: the service's own page for the "
+                             "person, linked from the sidebar, as a path on "
+                             "the same site, such as /account/.")
+    hosted.add_argument("--product-name", default="", metavar="NAME",
+                        help="With --hosted: the service's name, shown at the "
+                             "top of the sidebar and in the window's title in "
+                             "place of FastMDXplora's.")
+    hosted.add_argument("--product-tagline", default="", metavar="TEXT",
+                        help="With --hosted: the line under the service's "
+                             "name. Default: none with --product-name, "
+                             "FastMDXplora's own without.")
+    hosted.add_argument("--product-logo", default="", metavar="FILE",
+                        help="With --hosted: the service's logo (PNG, JPEG, GIF, "
+                             "WebP, ICO or SVG, at most 256 KB), shown as the "
+                             "tab's icon and the avatar in place of the lab's.")
+    hosted.add_argument("--runs-url", default="", metavar="PATH",
+                        help="With --hosted: the service's page that runs a "
+                             "study on its compute, as a path on the same "
+                             "site, such as /runs. The builder then offers "
+                             "Run on a GPU, which saves the config in the "
+                             "workspace and opens that page with it.")
+    hosted.add_argument("--memory-dir", default="", metavar="DIR",
+                        help="With --hosted: the folder the Agent's memory of "
+                             "this GUI's person is kept in (or "
+                             "FASTMDX_MEMORY_DIR). Learning from chats starts "
+                             "off there, until the person turns it on. Without "
+                             "this or --memory-store, the Agent keeps no memory.")
+    hosted.add_argument("--memory-store", default="", metavar="NAME",
+                        help="With --hosted: a memory store an installed package "
+                             "offers (entry points in fastmdxplora.memory_stores), "
+                             "in place of --memory-dir (or FASTMDX_MEMORY_STORE).")
+
+
+    resume = sub.add_parser(
+        "resume",
+        help="Carry a study that stopped part-way on to the end of its plan.",
+        description=(
+            "Read how far a study got and do what is left: nothing if it "
+            "finished; the analyses and report if production did; the rest "
+            "of production from its last sealed checkpoint if production "
+            "had begun; the whole study again if it had not. A study that "
+            "stopped with a refusal is not run again, since that was its "
+            "answer. Running this twice does the work once, so a service "
+            "can run it every time a job restarts."
+        ),
     )
-    serve.add_argument(
-        "--port",
-        type=int,
-        default=8765,
-        help="Port to serve on (default: 8765).",
+    resume.add_argument("study", metavar="STUDY",
+                        help="The study folder, as given to --output when it ran.")
+    resume.add_argument("--json", action="store_true",
+                        help="Print the outcome as one line of JSON, for a program to read.")
+
+    # ---------- mcp: the same, for an AI app --------------------------------
+    mc = sub.add_parser(
+        "mcp",
+        help="Serve FastMDXplora to an AI app over the Model Context Protocol.",
+        description=(
+            "Let an AI app that speaks MCP (an AI chat app, an AI coding tool, "
+            "an AI agent your lab builds) design, check, run and read studies in one "
+            "workspace folder. The AI app starts this command itself and talks "
+            "to it over standard input and output; it is not run by hand. The "
+            "AI app's model writes a study's config and the validator judges "
+            "it; the optional ask_agent tool has the FastMDXplora Agent write "
+            "it instead, with the AI app's model where the AI app lends it, "
+            "and otherwise the AI model `fastmdx agent model` chose, on your "
+            "own API key. A study runs only from a config the validator "
+            "accepted and whose plan was checked, with your go-ahead where "
+            "your AI app can ask for it, and its own approval of the call "
+            "where it cannot."
+        ),
     )
-    serve.add_argument(
-        "--refresh-seconds",
+    mc.add_argument("--workspace", default=None, metavar="DIR",
+                    help="The one folder the AI app's tools read and write: "
+                         "studies are written here, and nothing outside it is "
+                         "opened. Default: the current directory.")
+    mc.add_argument("--read-only", action="store_true",
+                    help="Offer no tool that starts or stops a study: the "
+                         "AI app can still write and check configs, and "
+                         "read studies, but runs nothing.")
+
+    # ---------- agent: write a study from a sentence ------------------------
+    ag = sub.add_parser(
+        "agent",
+        help="Write a study from a sentence, using an AI model you choose.",
+        description=(
+            "Describe a study in plain language and get a config. The "
+            "config goes through the same validation as one written by "
+            "hand, so a refusal here is the refusal you would have got "
+            "anyway -- the agent cannot ask for something the software "
+            "will not do. Run `fastmdx agent model` once to choose an AI model; "
+            "nothing else in FastMDXplora needs one."
+        ),
+        formatter_class=_PercentSafeHelp,
+    )
+    ag.add_argument(
+        "request",
+        nargs="?",
+        metavar="REQUEST",
+        help=(
+            "What the study should do, in plain language. The word `model` "
+            "shows the AI model in use and chooses one instead; the word "
+            "`memory` lists what the Agent remembers of you. With none, "
+            "opens the agent panel."
+        ),
+    )
+    remembered = ag.add_argument_group(
+        "what the Agent remembers of you (`fastmdx agent memory`)",
+        "Short lines about you and how you work, told to the Agent with each "
+        "message, kept in agent_memory.md in your settings folder. Open that "
+        "file in any editor, or use these. See docs/agent.md.")
+    remembered.add_argument("--add", dest="memory_add", metavar="TEXT", default=None,
+                            help="Add a line, such as \"You are new to molecular dynamics.\"")
+    remembered.add_argument("--forget", dest="memory_forget", metavar="N", default=None,
+                            help="Remove line N, as the list numbers it.")
+    remembered.add_argument("--change", dest="memory_change", nargs=2, metavar=("N", "TEXT"),
+                            default=None, help="Put new words in line N.")
+    remembered.add_argument("--undo", dest="memory_undo", action="store_true",
+                            help="Undo the last change not undone yet.")
+    remembered.add_argument("--clear", dest="memory_clear", action="store_true",
+                            help="Remove every line, told or not, asked first; your own "
+                                 "notes in the file stay.")
+    remembered.add_argument("--yes", dest="memory_yes", action="store_true",
+                            help="With --clear: do not ask (for a script).")
+    switch = remembered.add_mutually_exclusive_group()
+    switch.add_argument("--on", dest="memory_use", action="store_const", const=True,
+                        default=None, help="Tell the Agent the memory (the default).")
+    switch.add_argument("--off", dest="memory_use", action="store_const", const=False,
+                        help="Tell the Agent nothing of it; the lines stay.")
+    remembered.add_argument("--learn-from-chats", dest="memory_learn", choices=("on", "off"),
+                            default=None,
+                            help="Whether the Agent adds to it from what you write to it.")
+    ag.add_argument(
+        "-f", "-file", "--file",
+        dest="request_file",
+        metavar="FILE",
+        help=(
+            "Read the request from a file instead. For anything longer "
+            "than a shell quote comfortably holds."
+        ),
+    )
+    ag.add_argument(
+        "-o", "--output",
+        dest="agent_output",
+        metavar="FILE",
+        help=(
+            "Write the config here instead of printing it. The config is "
+            "printed either way; this also saves it."
+        ),
+    )
+    ag.add_argument(
+        "--phases",
+        metavar="PHASES",
+        default="setup,simulation",
+        help=(
+            "Which phases to describe to the AI model (default: "
+            "setup,simulation). Fewer is a cheaper call and a smaller "
+            "space to go wrong in."
+        ),
+    )
+    mode = ag.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--assisted",
+        dest="agent_mode",
+        action="store_const",
+        const="assisted",
+        help=(
+            "Seeker (built-in, assisted): draft the study and stop, so you "
+            "see it before it runs. The default, and the only one that needs "
+            "no further decision."
+        ),
+    )
+    mode.add_argument(
+        "--autonomous",
+        dest="agent_mode",
+        action="store_const",
+        const="autonomous",
+        help=(
+            "Ranger (built-in, autonomous): draft the study and run it "
+            "without showing it to you first. Refused without a cost "
+            "estimate: approving five days is a decision, approving an "
+            "unknown duration is not."
+        ),
+    )
+    mode.add_argument(
+        "--unvalidated",
+        dest="agent_mode",
+        action="store_const",
+        const="unvalidated",
+        help=(
+            "Outside the schema, not one of the modes: work outside this "
+            "schema, so nothing checks the result and every file says so. "
+            "Specified and not yet built."
+        ),
+    )
+    ag.set_defaults(agent_mode="assisted")
+    ag.add_argument(
+        "--budget-hours",
         type=float,
-        default=None,
-        metavar="SECONDS",
-        help="Browser polling interval hint surfaced to the dashboard.",
+        metavar="HOURS",
+        help=(
+            "The most GPU time an unattended study may spend. Required by "
+            "--autonomous, which runs without showing you the config: a "
+            "budget is the only thing left that can stop it. Checked after "
+            "setup, which is when the solvated particle count -- and so "
+            "the cost -- is first known."
+        ),
     )
-    serve.add_argument(
-        "--ligand-resname",
-        type=str,
-        default=None,
-        metavar="RESNAME",
-        help="Force a ligand residue name for the dashboard ligand tools.",
-    )
-    serve.add_argument(
-        "--binding-pocket-cutoff-A",
-        type=float,
-        default=None,
-        metavar="ANGSTROM",
-        help="Binding-pocket cutoff in angstrom (default 5.0).",
-    )
-    serve.add_argument(
-        "--frame-interval",
+    ag.add_argument("--host", default="127.0.0.1",
+                    help=("Bind address for the panel (default: 127.0.0.1). "
+                          "Anything else disables the endpoints that read "
+                          "the filesystem or spend an API key, because "
+                          "there is no login."))
+    ag.add_argument("--port", type=int, default=8765,
+                    help="Port to serve the panel on (default: 8765).")
+    ag.add_argument("--no-browser", action="store_true",
+                    help="Serve the panel without opening a browser.")
+    ag.add_argument(
+        "--attempts",
         type=int,
+        metavar="N",
         default=None,
-        metavar="STEPS",
-        help="Simulation telemetry interval used by the live dashboard.",
-    )
-    serve.add_argument(
-        "--max-playback-frames",
-        type=int,
-        default=None,
-        metavar="FRAMES",
-        help="Maximum frames the molecular viewer will load for playback.",
-    )
-    serve.add_argument(
-        "--open-browser",
-        action="store_true",
-        default=False,
-        help="Open the dashboard URL in the user's default browser.",
+        help=(
+            "How many attempts it gets in all, the first included, before "
+            "giving up (default: 3, as in the browser and from Python). "
+            "Each attempt is checked before anything runs, "
+            "so they cost seconds rather than GPU time. Three is measured "
+            "rather than guessed: claude-sonnet-4-6 took at most two on "
+            "the evaluation set with the schema's help text, and at most "
+            "three without it."
+        ),
     )
 
-    # init-config: write a commented YAML template
-    ic = sub.add_parser(
-        "init-config",
+    # ---------- remote: other machines, reached over SSH --------------------
+    rm = sub.add_parser(
+        "remote",
+        help="Inspect other machines, reached over SSH, to run studies on.",
+        description=(
+            "Machines a study can run on, reached with your own ssh and "
+            "~/.ssh/config, and the studies sent to them. With no arguments, "
+            "lists the machines and jobs as last recorded, without "
+            "connecting. With --machine alone, inspects the machine, "
+            "records it, and says whether it is ready or how FastMDXplora "
+            "would be installed there; inspecting changes nothing. A "
+            "study's Config never names a machine: the records are kept "
+            "with your other settings, not in any study."
+        ),
+        formatter_class=_PercentSafeHelp,
+    )
+    rm.add_argument(
+        "--machine",
+        metavar="NAME",
+        help=("The machine: an alias from ~/.ssh/config, or user@host. "
+              "Inspects it and records what it has."),
+    )
+    actions = rm.add_subparsers(dest="remote_action", metavar="<action>",
+                                title="actions")
+
+    def _on_machine(action: argparse.ArgumentParser) -> None:
+        # Its own dest: a subparser's default would otherwise overwrite a
+        # --machine given before the action word.
+        action.add_argument(
+            "--machine", dest="action_machine", metavar="NAME",
+            help=("The machine. May be left out when only one has been "
+                  "inspected."))
+
+    install = actions.add_parser(
+        "install",
+        help="Install FastMDXplora on a machine, after you confirm the plan.",
+        description=(
+            "Inspect the machine again, show the install plan `--machine` "
+            "prints, and run it once you answer yes. Nothing runs without "
+            "that answer, and there is no flag to skip it. Everything goes "
+            "inside your own account."),
+    )
+    _on_machine(install)
+
+    send = actions.add_parser(
+        "send",
+        help="Run a study's Config on a machine.",
+        description=(
+            "Check the Config here, copy it and the files it names to the "
+            "machine, and start `fastmdx explore` there in the installation "
+            "that holds this computer's code. Only files in the Config's own "
+            "folder travel, and a prepared study named by setup_from or "
+            "resume_from beside it. Refused if the machine is not ready, or "
+            "if no GPU of a workstation has the memory the study needs free. "
+            "The job runs on without this terminal."),
+        formatter_class=_PercentSafeHelp,
+    )
+    send.add_argument("-c", "-config", "--config", dest="config",
+                      metavar="FILE", required=True,
+                      help="The study's YAML Config.")
+    _on_machine(send)
+    send.add_argument("--output", dest="output_dir", metavar="DIR",
+                      help=("Where fetch puts the run on this computer. Its "
+                            "folder name is the job's name on both "
+                            "computers. Default: the Config's `output`, "
+                            "else a new study folder here."))
+    send.add_argument("--dry-run", action="store_true",
+                      help="Check and show what would be sent, and send nothing.")
+    send.add_argument("--force-overwrite", dest="force", action="store_true",
+                      help="Replace a job of the same name, here and there.")
+    send.add_argument("--partition", metavar="NAME", default="",
+                      help="SLURM partition. Ignored on a workstation.")
+    send.add_argument("--time", dest="time_limit", metavar="LIMIT", default="",
+                      help=("SLURM time limit, as sbatch reads it "
+                            "(e.g. 24:00:00). Ignored on a workstation."))
+
+    status = actions.add_parser(
+        "status", help="How the jobs sent from here are doing.",
+        description="Ask each job's machine how it is doing.")
+    status.add_argument("job", nargs="?", metavar="JOB",
+                        help="One job. Default: every job not yet finished.")
+
+    fetch = actions.add_parser(
+        "fetch", help="Bring a job's results back.",
+        description=("Copy a job's run folder back to this computer, leaving "
+                     "trajectories and checkpoints on the machine unless "
+                     "asked for."))
+    fetch.add_argument("job", metavar="JOB")
+    fetch.add_argument("--with-trajectory", action="store_true",
+                       help="Bring trajectories and checkpoints as well.")
+
+    cancel = actions.add_parser(
+        "cancel", help="Stop a job. Its folder on the machine stays.",
+        description="Stop a running or waiting job.")
+    cancel.add_argument("job", metavar="JOB")
+
+    forget = actions.add_parser(
+        "forget",
+        help="Remove a machine's record. Nothing on the machine is touched.",
+        description=("Remove the record of a machine from this computer. "
+                     "Nothing on the machine itself is changed or deleted."),
+    )
+    forget.add_argument("forget_name", metavar="NAME",
+                        help="The machine to forget.")
+
+    cf = sub.add_parser(
+        "config",
         help="Write a commented YAML config template to edit.",
         description=(
-            "Generate a FastMDXplora config template. By default writes a "
-            "comprehensive, fully-commented template with every option, its "
-            "default, and a description. Edit it and run with "
+            "Write a FastMDXplora config template: by default every setting, "
+            "its default and its help as a comment. Edit it and run it with "
             "`fastmdx explore --config <file>`."
         ),
     )
-    ic.add_argument(
-        "-o", "--output",
-        dest="config_output",
+    cf.add_argument(
+        "-f", "--file",
+        dest="config_file",
         metavar="FILE",
-        default="fastmdxplora.yml",
-        help="Where to write the template (default: fastmdxplora.yml).",
+        default=_CONFIG_FILE,
+        help=f"Where to write the template (default: {_CONFIG_FILE}).",
     )
-    ic.add_argument(
+    cf.add_argument(
         "--minimal",
         action="store_true",
         help="Write a short starter template with only the essentials.",
     )
-    ic.add_argument(
+    cf.add_argument(
+        "--force-overwrite",
         "--force",
+        dest="force",
         action="store_true",
-        help="Overwrite the output file if it already exists.",
-    )
-
-    def _add_bootstrap_parser(name: str, *, description: str, help_text: str) -> argparse.ArgumentParser:
-        parser_obj = sub.add_parser(
-            name,
-            help=help_text,
-            description=description,
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-        )
-        parser_obj.add_argument(
-            "--env-name",
-            default="fastmdxplora",
-            help="Conda environment name to create (default: fastmdxplora).",
-        )
-        parser_obj.add_argument(
-            "--python-version",
-            default="3.10",
-            help="Python version to install in the environment (3.9-3.12).",
-        )
-        parser_obj.add_argument(
-            "--force",
-            action="store_true",
-            help="Recreate the environment if it already exists.",
-        )
-        parser_obj.add_argument(
-            "--yes",
-            "-y",
-            action="store_true",
-            help="Skip confirmation prompts if any.",
-        )
-        return parser_obj
-
-    _add_bootstrap_parser(
-        "install",
-        description=(
-            "Create a conda environment and install FastMDXplora. If you run it "
-            "inside a repository checkout, the local checkout is installed; "
-            "otherwise the published package is installed."
-        ),
-        help_text="Install FastMDXplora into a conda environment.",
-    )
-    _add_bootstrap_parser(
-        "bootstrap",
-        description=(
-            "Alias for `install`; kept for compatibility with older docs and scripts."
-        ),
-        help_text="Alias for install.",
-    )
-    _add_bootstrap_parser(
-        "install-e",
-        description=(
-            "Create a conda environment and install the current repository checkout "
-            "in editable mode for contributors and editors."
-        ),
-        help_text="Install the current repository checkout in editable mode.",
+        help="Overwrite the file if it already exists.",
     )
 
     return parser
@@ -703,44 +1610,60 @@ def _infer_system_from_output(output_dir: str | None) -> str | None:
     if system:
         return str(system)
 
-    topology = root / "simulation" / "topology.pdb"
+    # The topology beside the trajectory where one was written: with
+    # `save_selection` leaving the solvent out by default, the prepared
+    # system's topology describes more atoms than the trajectory holds.
+    _saved = root / "simulation" / "trajectory_topology.pdb"
+    topology = (_saved if _saved.is_file()
+                else root / "simulation" / "topology.pdb")
     if topology.exists():
         return str(topology)
     return None
 
 
-def _make_orchestrator(args: argparse.Namespace, *, phase: str | None = None) -> FastMDXplora:
-    """Build a single-system orchestrator for the per-phase subcommands.
+def _no_systems_in(config: dict[str, Any], path: Any) -> str:
+    """What to say about a config with no `systems:` list.
 
-    The per-phase commands (setup/simulate/analyze/report) operate on one
-    system directly, so they bypass the batch layer. `explore` always goes
-    through BatchExplorer instead.
+    `system:` at the top level is the natural thing to write for one
+    structure, and it was answered with "explore requires a system", which
+    reads as though the file had not been read. Its value is shown in the
+    shape the key wants.
     """
-    config = getattr(args, "config", None)
-    inferred_system = (
-        _infer_system_from_output(args.output_dir)
-        if phase in {"analyze", "report"} else None
-    )
-    if not args.system and not config and not inferred_system:
-        raise SystemExit(
-            "fastmdx: this command requires a system input "
-            "(-s / -system / --system) or a --config file."
-        )
-    # For per-phase commands with a config file, pull the first system out.
-    if config and not args.system:
-        from fastmdxplora.config import load_config_file
-        from fastmdxplora.batch.sweep import normalize_systems
+    where = f" in {path}" if path else ""
+    given = config.get("system")
+    if given is None:
+        return (f"fastmdx: the config{where} has no `systems:` list, so there "
+                "is no structure to run. Add one, or pass -s/--system PATH.")
+    return (f"fastmdx: the config{where} has a top-level `system:`; the key is "
+            "`systems:`, a list, so that one file can hold several:\n\n"
+            f"  systems:\n    - system: {given}\n")
 
-        raw = load_config_file(config)
-        systems = normalize_systems(raw.get("systems") or [])
-        system = systems[0]["system"]
-    else:
-        system = args.system or inferred_system
-    return FastMDXplora(
-        system=system,
-        output_dir=args.output_dir,
-        verbose=args.verbose,
-    )
+
+def _sweep_from_flags(given: list[str]) -> dict[str, list[Any]]:
+    """`--sweep AXIS=VALUES`, once per axis, as the config's `sweep` block.
+
+    VALUES is a comma-separated list, or a bracketed one where a value holds
+    a comma. Each value is read the way the config file reads it, so 300 is
+    a number and true is a truth value, and the axes are checked by the same
+    rule the file's are.
+    """
+    from fastmdxplora.batch.sweep import SweepError, normalize_sweep, values_from_text
+
+    axes: dict[str, list[Any]] = {}
+    for item in given:
+        axis, sep, values = item.partition("=")
+        if not sep or not axis.strip() or not values.strip():
+            raise SystemExit(
+                "fastmdx: --sweep takes AXIS=VALUES, as in "
+                f"--sweep simulation.temperature_K=300,310; got {item!r}.")
+        try:
+            axes[axis.strip()] = values_from_text(values)
+        except SweepError as exc:
+            raise SystemExit(f"fastmdx: {exc}") from exc
+    try:
+        return normalize_sweep(axes)
+    except SweepError as exc:
+        raise SystemExit(f"fastmdx: {exc}") from exc
 
 
 def _build_explore_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -756,21 +1679,34 @@ def _build_explore_config(args: argparse.Namespace) -> dict[str, Any]:
     one, written with the flat output layout).
     """
     from fastmdxplora.config import load_config_file
+    from fastmdxplora.config.recorded import laid_over
 
-    # Start from the file, if any.
+    # Start from the file, if any; else, given no system, from the study
+    # the --output folder holds, as it recorded itself.
+    recorded = None
     if getattr(args, "config", None):
         config = load_config_file(args.config)
     else:
-        config = {}
+        recorded = _the_study_s_config(args)
+        config = recorded or {}
+
+    # The execution block, on the same terms: what the flag says beats what
+    # the file says, and an unset flag leaves the file alone.
+    scheduling = _harvest_phase_options(
+        args, _EXECUTION_OPTIONS, dest_prefix="execution")
+    if scheduling:
+        block = dict(config.get("execution") or {})
+        block.update(scheduling)
+        config["execution"] = block
 
     # Harvest per-phase option flags and merge them on top (flags win).
     for phase, (opts, _prefix) in _PHASE_SPEC.items():
         harvested = _harvest_phase_options(args, opts, dest_prefix=phase)
+        if phase == "analyze":
+            harvested = _normalize_analysis_options(harvested)
         if harvested:
             orch_phase = _PHASE_TO_ORCH[phase]
-            block = dict(config.get(orch_phase, {}))
-            block.update(harvested)
-            config[orch_phase] = block
+            config[orch_phase] = laid_over(dict(config.get(orch_phase) or {}), harvested)
 
     # The flat --simulate-plumed-script flag maps to the nested `plumed` dict.
     sim_block = config.get("simulation")
@@ -781,19 +1717,148 @@ def _build_explore_config(args: argparse.Namespace) -> dict[str, Any]:
 
     # -s/--system builds (or replaces) a one-element systems list.
     if args.system:
-        config["systems"] = [{"id": "s1", "system": args.system}]
+        from fastmdxplora.naming import default_system_id
+
+        config["systems"] = [{"id": default_system_id(0), "system": args.system}]
+    if getattr(args, "sweep", None):
+        config["sweep"] = {**(config.get("sweep") or {}), **_sweep_from_flags(args.sweep)}
 
     # Top-level scalars from flags.
     if args.output_dir:
         config["output"] = args.output_dir
     if getattr(args, "verbose", False):
         config["verbose"] = True
-    if args.include:
-        config["include"] = args.include
-    if args.exclude:
-        config["exclude"] = args.exclude
+    from fastmdxplora.config.loader import STUDY_LEVEL_KEYS
 
+    for name in STUDY_LEVEL_KEYS:
+        if getattr(args, name, None) is not None:
+            config[name] = getattr(args, name)
+
+    # The presenter exists before the arguments are read, so it is told
+    # afterwards. A config file's `explain` is honoured where the flag was
+    # not given.
+    from fastmdxplora.utils.presenter import set_explain
+
+    wanted = getattr(args, "explain", True)
+    if wanted and config.get("explain") is False:
+        wanted = False
+    set_explain(wanted)
+    # And into the study, as --verbose goes: the flag was acted on and then
+    # dropped, so a command written with --no-explain built a config that
+    # explained, and the resolved config recorded that it did.
+    if not wanted:
+        config["explain"] = False
+    # The phases named replace those the file or the study gave, whichever
+    # way it gave them: the two together are refused.
+    if args.include:
+        config["include_phase"] = args.include
+        config.pop("exclude_phase", None)
+    if args.exclude:
+        config["exclude_phase"] = args.exclude
+        config.pop("include_phase", None)
+    # An analysis of a trajectory from elsewhere names its topology, which
+    # is the system; asked for it as well, the command was refused.
+    topology = (config.get("analysis") or {}).get("topology")
+    if not config.get("systems") and topology:
+        from fastmdxplora.naming import default_system_id
+
+        config["systems"] = [{"id": default_system_id(0), "system": str(topology)}]
+
+    # Windows run again at a force constant of their own: the config's list
+    # of constants with those windows changed, so the study records what
+    # each window ran with and the next recombination reads the same.
+    held = getattr(args, "rerun_force_constant", None)
+    if held is not None:
+        if not getattr(args, "rerun_windows", None):
+            from fastmdxplora.refusals import StudyError
+
+            raise StudyError(
+                "--rerun-force-constant holds the windows --rerun-window names; "
+                "name them with --rerun-window.",
+                code="config.option.missing_companion")
+        from fastmdxplora.simulation.umbrella import windows_held_at
+
+        config = windows_held_at(config, args.rerun_windows, held)
+
+    # Your defaults fill what a new study leaves unset. Not a study's own
+    # record: it holds every value it ran with, and a phase run again runs
+    # with those.
+    if recorded is None and not getattr(args, "no_defaults", False):
+        config = _with_your_defaults(config, args)
     return config
+
+
+def _with_your_defaults(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    """The config with the nearest fastmdx-defaults.yml filling what it
+    leaves unset, said on the terminal setting by setting. Looked for from
+    the study's folder up, else from the config file's, else from here."""
+    from fastmdxplora.config.defaults_file import defaults_for, refused_with, with_defaults
+    from fastmdxplora.config.recorded import RECORDED
+
+    output = config.get("output") or getattr(args, "output_dir", None)
+    if output:
+        start = Path(str(output)).expanduser()
+    elif getattr(args, "config", None):
+        start = Path(args.config).expanduser().resolve().parent
+    else:
+        start = Path.cwd()
+    defaults = defaults_for(start)
+    if defaults is None:
+        return config
+    if output and (start / RECORDED).is_file():
+        # A study that has run, given a config for a phase run again: its
+        # record holds every value it ran with, and yours are not laid over.
+        print(f"Your defaults ({defaults.path}) are not filled in: {start} has run, "
+              f"and {RECORDED} holds the values it ran with.")
+        return config
+    filled_config, filled = with_defaults(config, defaults)
+    refusal = refused_with(config, filled_config, defaults)
+    if refusal is not None:
+        raise type(refusal)(f"{refusal} --no-defaults runs without them.",
+                            code=refusal.code, **refusal.refusal.details)
+    if filled:
+        values = dict(defaults.settings())
+        print(f"Your defaults ({defaults.path}) fill what the config leaves unset: "
+              + ", ".join(f"{name} {values[name]}" for name in filled)
+              + ". --no-defaults runs without them.")
+    return filled_config
+
+
+def _the_study_s_config(args: argparse.Namespace) -> dict[str, Any] | None:
+    """The config of the study the --output folder holds, where no system is
+    given: the one it recorded, or, for a study that recorded none, the
+    system its records name. None for a new folder or one given a system."""
+    output = getattr(args, "output_dir", None)
+    if getattr(args, "system", None) or not output:
+        return None
+    from fastmdxplora.config.recorded import RECORDED, study_config
+
+    study = Path(output).expanduser()
+    if (study / RECORDED).is_file():
+        config = study_config(study, getattr(args, "include", None))
+        if config is not None:
+            from fastmdxplora.config import ConfigError
+            from fastmdxplora.config.loader import validate_config
+
+            # Said as the record's, not as something typed: a record an
+            # older release wrote, or one edited by hand, is fixed there.
+            try:
+                validate_config(config, as_record=True)
+            except ConfigError as exc:
+                raise ConfigError(
+                    f"the settings {study / RECORDED} recorded cannot be used: {exc} "
+                    "Correct the record, or give the settings with -c FILE.",
+                    code=exc.code, **exc.refusal.details) from exc
+            # What the study runs, to put back once some of it ran again.
+            args.study_phases = (config.get("include_phase"),
+                                 config.get("exclude_phase"))
+            print(f"  From the study's record: {study / RECORDED}")
+            return config
+    inferred = _infer_system_from_output(output)
+    from fastmdxplora.naming import default_system_id
+
+    return ({"systems": [{"id": default_system_id(0), "system": inferred}]}
+            if inferred else None)
 
 
 def _dashboard_requested(args: argparse.Namespace) -> bool:
@@ -815,8 +1880,9 @@ def _resolve_dashboard_output_dir(args: argparse.Namespace, config: dict[str, An
     if not raw_output and config:
         raw_output = config.get("output")
     if not raw_output:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        raw_output = f"fastmdxplora_output_{timestamp}"
+        from fastmdxplora.naming import default_output_name, system_of
+
+        raw_output = default_output_name(system_of(config))
     return Path(raw_output).expanduser().resolve()
 
 
@@ -827,7 +1893,7 @@ def _start_dashboard_for_command(args: argparse.Namespace, output_dir: Path):
     os.environ["FASTMDX_DASHBOARD_ACTIVE"] = "1"
     os.environ["FASTMDX_DASHBOARD_OUTPUT"] = str(output_dir)
 
-    from fastmdxplora.live.server import (
+    from fastmdxplora.gui.server import (
         DashboardConfig,
         start_dashboard_session,
     )
@@ -838,7 +1904,7 @@ def _start_dashboard_for_command(args: argparse.Namespace, output_dir: Path):
             getattr(args, "dashboard_binding_pocket_cutoff_A", 5.0) or 5.0
         ),
         max_browser_frames=int(
-            getattr(args, "dashboard_max_playback_frames", 200) or 200
+            getattr(args, "dashboard_max_playback_frames", 2000) or 2000
         ),
         refresh_seconds=float(
             getattr(args, "dashboard_refresh_seconds", 3.0) or 3.0
@@ -850,7 +1916,7 @@ def _start_dashboard_for_command(args: argparse.Namespace, output_dir: Path):
         port=args.dashboard_port,
         config=config,
     )
-    print(f"Live dashboard running at: {session.url}")
+    print(f"FastMDXplora GUI running at: {session.url}")
     if session.port_was_changed:
         print(
             f"Requested port {session.requested_port} was busy, "
@@ -864,9 +1930,9 @@ def _start_dashboard_for_command(args: argparse.Namespace, output_dir: Path):
     print(f"Watching output folder: {output_dir}")
     print("Open this URL in your browser to monitor the run.")
     if args.dashboard_stop_on_complete:
-        print("Dashboard will stop automatically after the workflow completes.")
+        print("The GUI stops automatically when the exploration completes.")
     else:
-        print("Press Ctrl+C to stop the dashboard after the workflow completes.")
+        print("Press Ctrl+C to stop the GUI after the exploration completes.")
     print()
     return session
 
@@ -878,12 +1944,12 @@ def _finish_dashboard_for_command(session, args: argparse.Namespace) -> None:
         session.stop()
         return
     print()
-    print(f"Workflow complete. Live dashboard is still running at: {session.url}")
-    print("Press Ctrl+C to stop the dashboard.")
+    print(f"Exploration complete. The GUI is still running at: {session.url}")
+    print("Press Ctrl+C to stop the GUI.")
     try:
         session.wait_forever()
     except KeyboardInterrupt:
-        pass
+        print("\nGUI stopped.")
     finally:
         session.stop()
 
@@ -892,24 +1958,68 @@ def _cmd_explore(args: argparse.Namespace) -> int:
     from fastmdxplora import FastMDXplora
 
     if args.include and args.exclude:
-        print("fastmdx: --include and --exclude are mutually exclusive.", file=sys.stderr)
+        print("fastmdx: --include-phase and --exclude-phase are mutually "
+                  "exclusive.", file=sys.stderr)
         return 2
 
     config = _build_explore_config(args)
+
+    # `simulation.resume_from` naming a STUDY DIRECTORY is a continuation of
+    # that study: its next segment, the join, and the analyses over the
+    # joined trajectory. Naming a checkpoint file is the raw mechanism and
+    # runs as an ordinary simulation, which is what a segmented campaign
+    # wants. The study being continued supplies the systems and the phases,
+    # which is why the usual "explore requires a system" check comes after
+    # this rather than before it.
+    from fastmdxplora.simulation.resume import study_to_continue
+
+    simulation = config.get("simulation") or {}
+    resume_from = study_to_continue(config)
+    if resume_from is not None and not getattr(args, "dry_run", False):
+        from fastmdxplora.simulation.resume import extend_study
+
+        answer = extend_study(resume_from,
+                              total_ns=simulation.get("duration_ns"),
+                              more_ns=simulation.get("extra_ns"))
+        if not answer.get("ok"):
+            print(f"fastmdx: {answer.get('error')}", file=sys.stderr)
+            return 1
+        joined = answer.get("joined") or {}
+        print(f"Ran {Path(answer['segment']).name} and joined segments "
+              f"{joined.get('segments') or '?'}.")
+        if answer.get("analysed"):
+            print(f"Analyses and report rerun over {answer['trajectory']}.")
+        return 0
+
     if not config.get("systems"):
+        if "system" in config or getattr(args, "config", None):
+            print(_no_systems_in(config, getattr(args, "config", None)),
+                  file=sys.stderr)
+            return 2
         print(
-            "fastmdx: explore requires a system — pass -s/--system PATH or a "
-            "--config file with a `systems:` list.",
+            "fastmdx: explore requires a system — pass -s/--system PATH, a "
+            "--config file with a `systems:` list, --output naming a study "
+            "to run phases of again, or `simulation.resume_from` naming a "
+            "study to carry on from.",
             file=sys.stderr,
         )
         return 2
 
+    # What can be found wrong without building anything, refused before
+    # anything is written, a dry run and a run alike: a system setup could
+    # not read, and a selection MDTraj could not parse. Both were found only
+    # when setup or an analysis reached them. The paths are read from here,
+    # where the run starts.
+    from fastmdxplora.config.before_run import refuse_what_can_be_seen
+
+    refuse_what_can_be_seen(config, base=Path.cwd())
+
     # --no-report removes report from the plan via exclude (unless the user
     # already constrained phases with include).
-    if getattr(args, "no_report", False) and not config.get("include"):
-        existing = config.get("exclude") or []
+    if getattr(args, "no_report", False) and not config.get("include_phase"):
+        existing = config.get("exclude_phase") or []
         if "report" not in existing:
-            config["exclude"] = [*existing, "report"]
+            config["exclude_phase"] = [*existing, "report"]
 
     if _dashboard_requested(args):
         _enable_dashboard_telemetry(config, args)
@@ -917,6 +2027,33 @@ def _cmd_explore(args: argparse.Namespace) -> int:
     if _dashboard_requested(args):
         dashboard_output_dir = _resolve_dashboard_output_dir(args, config)
         config["output"] = str(dashboard_output_dir)
+
+    # A study carrying a budget runs in stages: setup, then a price, then
+    # the rest only if it fits. That is what `fastmdx agent --autonomous`
+    # does in-process; a config the GUI hands to `explore --config` had no
+    # way to ask for it until the budget became a config key. One reader
+    # for the ceiling, whichever door the study came through.
+    budget = config.get("budget_hours")
+    if budget is not None and not getattr(args, "dry_run", False):
+        from fastmdxplora.agent import run_in_stages
+
+        from fastmdxplora.naming import default_output_name, system_of
+
+        output = Path(config.get("output") or args.output_dir
+                      or default_output_name(system_of(config)))
+        staged = run_in_stages(config, output, budget_hours=float(budget))
+        for note in staged.notes:
+            print(f"  {note}")
+        if staged.refusal is not None:
+            print(f"\n  \u2717 {staged.refusal.message}")
+            if staged.setup_done:
+                print("\nSetup's output is kept, so a shorter study can reuse it.")
+            return 2
+        failed = _analyses_asked_for_that_failed(config, _runs_in(output))
+        if failed:
+            _say_failed(failed)
+            return 1
+        return 0
 
     fmdx = FastMDXplora(
         config_data=config,
@@ -927,7 +2064,15 @@ def _cmd_explore(args: argparse.Namespace) -> int:
     if _dashboard_requested(args) and not getattr(args, "dry_run", False):
         session = _start_dashboard_for_command(args, dashboard_output_dir)
     try:
-        results = fmdx.explore(dry_run=getattr(args, "dry_run", False))
+        results = fmdx.explore(
+            dry_run=getattr(args, "dry_run", False),
+            force=getattr(args, "force", False),
+            **({"keep_previous": True} if getattr(args, "rerun", False) else {}),
+            # Passed only when given, so an explore that takes no such
+            # argument is called as it always was.
+            **({"rerun_windows": args.rerun_windows}
+               if getattr(args, "rerun_windows", None) else {}),
+        )
     except KeyboardInterrupt:
         if session is not None:
             session.stop()
@@ -937,257 +2082,1237 @@ def _cmd_explore(args: argparse.Namespace) -> int:
             session.stop()
         raise
 
-    # Dry run: the plan was printed; nothing executed.
+    # Dry run: the plan was printed; nothing executed. What the GUI's Check
+    # it says is worth knowing is said here too.
     if getattr(args, "dry_run", False):
+        knowing = _worth_knowing(config)
+        if knowing:
+            print()
+            print("Worth knowing before it runs:")
+            for line in knowing:
+                print(f"  {line}")
         return 0
 
+    # Some of a study's phases ran again: its record still runs it whole.
+    kept = getattr(args, "study_phases", None)
+    if kept is not None and config.get("include_phase") != kept[0]:
+        from fastmdxplora.config.recorded import keep_the_study_s_phases
+
+        keep_the_study_s_phases(Path(fmdx.output_dir), *kept)
+
     # Single run -> flat layout; point at the project manifest.
+    rc = 0 if all(r.status == "ok" for r in results) else 1
+    if rc and _stopped_by_ctrl_c(results):
+        # Stopped at the terminal: the study wrote where it stopped and
+        # what carries it on, and the shell is told it was interrupted.
+        rc = 130
+    failed = _analyses_asked_for_that_failed(config, results)
+    if failed:
+        # The analysis phase finishes when one of its analyses fails, and
+        # the run did, with exit 0: a study whose RMSD selection could not be
+        # parsed said "analysis complete" and succeeded with no RMSD in it.
+        _say_failed(failed)
+        rc = rc or 1
     if len(results) == 1:
+        if rc and not results[0].phases and results[0].message:
+            # Stopped before any phase ran, which no phase has said.
+            said = results[0].message
+            prefix = f"{results[0].error_type}: "
+            print(f"fastmdx: {said.removeprefix(prefix)}", file=sys.stderr)
+        if rc:
+            # A study of several says this in its own summary.
+            from fastmdxplora.batch.explorer import _what_would_fix_it
+
+            fixes = _what_would_fix_it(fmdx.output_dir)
+            if fixes:
+                print()
+                print("\n".join(fixes))
         print()
         print(f"Project output: {fmdx.output_dir}")
         print(f"Manifest:       {fmdx.output_dir / 'manifest.json'}")
-    rc = 0 if all(r.status == "ok" for r in results) else 1
     _finish_dashboard_for_command(session, args)
     return rc
+
+
+def _worth_knowing(config: dict[str, Any]) -> list[str]:
+    """What the GUI's Check it says is worth knowing about a config, each
+    with what to do about it, read from the same function."""
+    from fastmdxplora.advisories import advise
+
+    holders = [config] + [e for e in config.get("systems") or [] if isinstance(e, dict)]
+    said: list[str] = []
+    for holder in holders:
+        settings: dict[str, Any] = {}
+        for source in (config, holder):
+            for phase in ("setup", "simulation"):
+                block = source.get(phase)
+                if isinstance(block, dict):
+                    settings.update(block)
+        try:
+            found = advise({}, settings)
+        except Exception:  # noqa: BLE001 - advice, never a verdict
+            continue
+        for advisory in found:
+            line = " ".join(str(part).strip() for part in
+                            (f"({advisory.setting})", advisory.summary, advisory.remedy)
+                            if part)
+            if line not in said:
+                said.append(line)
+    return said
+
+
+def _say_failed(failed: list[str]) -> None:
+    """Say the analyses the study asked for that failed."""
+    print("fastmdx: " + ("an analysis" if len(failed) == 1 else
+                         f"{len(failed)} analyses")
+          + " the study asked for failed: " + "; ".join(failed) + ".",
+          file=sys.stderr)
+
+
+def _runs_in(output: Path) -> list[Any]:
+    """The runs of a study written to ``output``, as results carry them for
+    :func:`_analyses_asked_for_that_failed`: one flat run, or each under
+    `runs/`."""
+    from types import SimpleNamespace
+
+    runs = sorted(p for p in (output / "runs").glob("*") if p.is_dir()) \
+        if (output / "runs").is_dir() else []
+    folders = runs or [output]
+    return [SimpleNamespace(output_dir=folder, run_id=folder.name) for folder in folders]
+
+
+#: What an analysis says when the run is too short for it (its refusal,
+#: `analysis.sampling.too_few_frames`, reaches its row as words only).
+_TOO_FEW_FRAMES = re.compile(
+    r"\bframes?\b.*\b(at least|needed|needs|required|only)\b"
+    r"|\b(at least|needs|only)\b.*\bframes?\b", re.IGNORECASE | re.DOTALL)
+
+
+def _analyses_asked_for_that_failed(config: dict[str, Any],
+                                    results: list[Any]) -> list[str]:
+    """Each analysis the study asked for that ran and failed, with why.
+
+    Asked for: named in `analysis.include` or given options in
+    `analysis.options`, in the study's own block or a system entry's. An
+    analysis of the default plan is said in its own row and is not a failure
+    of the run, and neither is one the run was too short for (too few frames
+    to cluster): the run did what it was asked, and a longer one would have
+    it.
+    """
+    import json
+
+    named: set[str] = set()
+    holders = [config] + [e for e in config.get("systems") or [] if isinstance(e, dict)]
+    for holder in holders:
+        analysis = holder.get("analysis")
+        if isinstance(analysis, dict):
+            named |= {str(n) for n in (analysis.get("include") or [])}
+            named |= {str(n) for n in (analysis.get("options") or {})}
+
+    failed: list[str] = []
+    for run in results:
+        folder = getattr(run, "output_dir", None)
+        if folder is None:
+            continue
+        try:
+            record = json.loads((Path(folder) / "analysis" / "analysis_manifest.json")
+                                .read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for name, result in (record.get("results") or {}).items():
+            if not isinstance(result, dict) or result.get("status") != "error":
+                continue
+            if name not in named:
+                continue
+            why = str(result.get("message") or "").removeprefix(f"{name}: ").strip()
+            if _TOO_FEW_FRAMES.search(why):
+                continue
+            where = f" in {run.run_id}" if len(results) > 1 else ""
+            failed.append(f"{name}{where} ({why})" if why else f"{name}{where}")
+    return failed
+
+
+def _stopped_by_ctrl_c(results: list[Any]) -> bool:
+    """Whether a study ended because Ctrl+C asked it to stop."""
+    from fastmdxplora.simulation.runner import STOPPED_CODE
+
+    for run in results:
+        for phase in getattr(run, "phases", None) or []:
+            refusal = getattr(phase, "refusal", None) or {}
+            details = refusal.get("details") or {}
+            # Raised with `details=` the particulars sit one level down.
+            details = details.get("details", details)
+            if refusal.get("code") == STOPPED_CODE and details.get("signal") == "SIGINT":
+                return True
+    return False
+
+
+def _share_args(parser: argparse.ArgumentParser) -> None:
+    """`fastmdx report --share`: the study packed as one file another
+    FastMDXplora opens (docs/sharing.md)."""
+    share = parser.add_argument_group(
+        "sharing the study",
+        "Pack the finished study in --output as one zip, an RO-Crate another "
+        "FastMDXplora opens with `fastmdx gui --open`. The report is not written "
+        "again. See docs/sharing.md.")
+    share.add_argument("--share", default=None, metavar="FILE",
+                       help="Write the study, as its pages show it, to FILE.")
+    share.add_argument("--share-all", action="store_true",
+                       help="With --share: every file of the study, not only what its "
+                            "pages read.")
+    share.add_argument("--share-license", default=None, metavar="ID",
+                       help="With --share: the licence it is shared under, as an SPDX "
+                            "identifier (default CC-BY-4.0).")
+    share.add_argument("--share-author", action="append", default=[], metavar="NAME",
+                       help="With --share: an author, given once for each; NAME;ORCID "
+                            "adds an ORCID. Default: the report's --author.")
+    share.add_argument("--share-to", default=None, choices=("zenodo", "zenodo-sandbox"),
+                       help="With --share: also make a draft of it on Zenodo (or Zenodo's "
+                            "sandbox), with the token in ZENODO_TOKEN (ZENODO_SANDBOX_TOKEN); "
+                            "you read the draft and publish it.")
+
+
+def _cmd_share(args: argparse.Namespace) -> int:
+    """`fastmdx report --output STUDY --share FILE`."""
+    import re
+
+    from fastmdxplora.refusals import CodedError
+    from fastmdxplora.sharing.pack import DEFAULT_LICENSE, share_study
+
+    if not getattr(args, "output_dir", None):
+        print("fastmdx report: --share packs the study in --output; name it.",
+              file=sys.stderr)
+        return 2
+    if not str(args.share).lower().endswith(".zip"):
+        print("fastmdx report: --share writes a zip; give its name ending in .zip.",
+              file=sys.stderr)
+        return 2
+    authors = []
+    for given in args.share_author or ([args.author] if getattr(args, "author", None) else []):
+        name, _, orcid = str(given).partition(";")
+        orcid = orcid.strip().removeprefix("https://orcid.org/")
+        if orcid and not re.fullmatch(r"\d{4}-\d{4}-\d{4}-\d{3}[\dX]", orcid):
+            print(f"fastmdx report: {orcid!r} is not an ORCID iD "
+                  "(four groups of four digits, the last may be X).", file=sys.stderr)
+            return 2
+        authors.append((name.strip(), orcid))
+    if not authors:
+        print("fastmdx report: --share needs an author: --share-author NAME, given once "
+              "for each.", file=sys.stderr)
+        return 2
+    licence = args.share_license or DEFAULT_LICENSE
+
+    def pack(identifier: str = "") -> dict:
+        return share_study(args.output_dir, args.share, everything=args.share_all,
+                           license_id=licence, authors=authors, identifier=identifier,
+                           said=print)
+
+    try:
+        if args.share_to:
+            from fastmdxplora.sharing.pack import finished_manifest
+            from fastmdxplora.sharing.zenodo import draft
+
+            study = Path(args.output_dir).expanduser()
+            # Refused before a draft is made for a study that cannot be shared.
+            manifest = finished_manifest(study)
+            draft(study, Path(args.share).expanduser(), site=args.share_to, pack=pack,
+                  authors=authors, license_id=licence,
+                  system=str(manifest.get("system") or ""), said=print)
+        else:
+            pack()
+    except CodedError as exc:
+        print(f"fastmdx report: {exc}", file=sys.stderr)
+        return 2
+    return 0
 
 
 def _cmd_phase(phase: str, args: argparse.Namespace) -> int:
-    fmdx = _make_orchestrator(args, phase=phase)
-    opts_list, _ = _PHASE_SPEC[phase]
-    kwargs = _harvest_phase_options(args, opts_list)
-    if _dashboard_requested(args) and phase == "simulate":
-        kwargs["live_telemetry"] = True
-        # Forward dashboard knobs when running live; ignored if the user
-        # did not opt in to live telemetry.
-        if getattr(args, "dashboard_frame_interval", None) is not None:
-            kwargs["telemetry_interval"] = int(args.dashboard_frame_interval)
-        if getattr(args, "dashboard_refresh_seconds", None) is not None:
-            # The same value is embedded into the served dashboard HTML.
-            print(
-                f"  dashboard polling: every {args.dashboard_refresh_seconds}s"
-            )
+    """`fastmdx <phase>`: `fastmdx explore --include-phase <phase>`, run
+    through it. The phase's flags are its own unprefixed; they are read as
+    explore's prefixed ones, so a phase run alone and in a whole study is
+    one code path with one set of rules: the study a folder holds read from
+    its record, a folder that holds the phase's output written into only
+    with --force-overwrite or --rerun."""
+    if phase == "report" and getattr(args, "share", None):
+        return _cmd_share(args)
+    explored = _build_parser().parse_args(["explore"])
+    for name, value in vars(args).items():
+        if hasattr(explored, name) and name not in ("command", "agent"):
+            setattr(explored, name, value)
+    opts, _ = _PHASE_SPEC[phase]
+    for _suffix, kwarg, _ in opts:
+        setattr(explored, f"{phase}__{kwarg}", getattr(args, kwarg, None))
+    explored.command = phase
+    explored.include = [_PHASE_TO_ORCH[phase]]
+    return _cmd_explore(explored)
 
-    method = {
-        "setup":    fmdx.setup,
-        "simulate": fmdx.simulate,
-        "analyze":  fmdx.analyze,
-        "report":   fmdx.report,
-    }[phase]
 
-    # Bracket the single-phase invocation with presenter output so the
-    # user sees the same visual structure as during `fastmdx explore`.
-    session = None
-    if _dashboard_requested(args):
-        output_dir = _resolve_dashboard_output_dir(args)
-        if not getattr(args, "output_dir", None):
-            output_dir = Path(fmdx.output_dir).expanduser().resolve()
-        session = _start_dashboard_for_command(args, output_dir)
+#: What each phase reaches for, and where to get it. Grouped because a
+#: missing backend matters only for what it is needed for: a trajectory
+#: analysis does not care that OpenMM is absent, and saying so unqualified
+#: reads as a broken install.
+_BACKENDS: tuple[tuple[str, tuple[tuple[str, str, str], ...]], ...] = (
+    ("to run a simulation", (
+        ("OpenMM", "openmm", "conda install -c conda-forge openmm"),
+        ("PDBFixer", "pdbfixer", "conda install -c conda-forge pdbfixer"),
+    )),
+    ("to prepare a ligand", (
+        # openff-toolkit has no PyPI distribution, so no pip command reaches
+        # it whatever extra is named. Saying "pip install the ligand extra"
+        # here sent people to something that could not work.
+        ("OpenFF toolkit", "openff.toolkit",
+         "conda install -c conda-forge openff-toolkit"),
+        ("OpenMM force fields", "openmmforcefields",
+         "conda install -c conda-forge openmmforcefields"),
+        ("RDKit", "rdkit", "conda install -c conda-forge rdkit"),
+        ("PROPKA", "propka", "conda install -c conda-forge propka"),
+        # A capability rather than a module, answered by _CAPABILITIES. The
+        # toolkit loads without anything to compute a ligand's AM1-BCC
+        # charges, and conda-forge's openff-toolkit does not bring
+        # AmberTools, so the row above being installed says nothing here.
+        ("AM1-BCC charges", "am1bcc",
+         "conda install -c conda-forge ambertools"),
+    )),
+    ("to write the report as a PDF", (
+        ("WeasyPrint", "weasyprint", "conda install -c conda-forge weasyprint"),
+    )),
+    ("to make a movie in the GUI", (
+        # A program rather than a module, answered by _CAPABILITIES: the
+        # ffmpeg the GUI would run, found as it finds it.
+        ("ffmpeg", "ffmpeg", "conda install -c conda-forge ffmpeg"),
+    )),
+    ("for optional extras", (
+        ("UMAP", "umap", "conda install -c conda-forge umap-learn"),
+        ("PLUMED", "openmmplumed", "conda install -c conda-forge openmm-plumed"),
+    )),
+)
+
+#: Rows of ``_BACKENDS`` that importing cannot answer, each with the function
+#: that can: it returns what provides the capability, or None where nothing
+#: does. Setup asks the same function before it prepares a ligand, so the two
+#: cannot disagree.
+_CAPABILITIES: dict[str, tuple[str, str]] = {
+    "am1bcc": ("fastmdxplora.setup.ligand", "am1bcc_provider"),
+    "ffmpeg": ("fastmdxplora.movies", "find_ffmpeg"),
+}
+
+
+def _probe_backends(import_names: tuple[str, ...]) -> dict[str, tuple[str, str]]:
+    """Whether each backend will load, tested in a process of its own.
+
+    Importing is the only honest test -- a package can be installed and still
+    fail to load -- but the failure is not always quiet or catchable. Importing
+    WeasyPrint without Pango raises from the dynamic loader, and prints five
+    lines about its installation guide on the way. Redirecting Python's stderr
+    did not stop them, and neither did redirecting the file descriptor: the
+    first attempt at this passed its test only because the test faked the
+    message with a print, which is the assumption being checked rather than
+    the behaviour.
+
+    A subprocess ends the argument. Its output is captured whatever writes it
+    and however far down, and a backend that fails hard cannot take this
+    command with it. One process probes them all, so the cost is a single
+    interpreter start rather than one per backend.
+
+    It reports as it goes: each name before it is imported, each answer
+    after. A backend that ends the interpreter -- a C extension built against
+    the wrong ABI segfaults on import -- is then known by name, reported as
+    broken with how the interpreter ended, and the names after it are probed
+    in a fresh process. The whole answer used to be written once at the end,
+    so a crash lost it, and the fallback then imported every backend in this
+    process: the one that had just killed an interpreter killed the command,
+    silently, with its own exit code. A hang is treated the same way.
+    Checking in this process is kept for when no subprocess can be started at
+    all, which is what it was written for.
+    """
+    import json
+    import subprocess
+    import sys
+    import tempfile
+
+    script = (
+        "import json, sys\n"
+        "checks = json.loads(sys.argv[3])\n"
+        "with open(sys.argv[2], 'a', encoding='utf-8') as out:\n"
+        "    for name in json.loads(sys.argv[1]):\n"
+        "        out.write(json.dumps({'trying': name}) + '\\n')\n"
+        "        out.flush()\n"
+        "        try:\n"
+        "            if name in checks:\n"
+        "                module, function = checks[name]\n"
+        "                got = getattr(__import__(module, fromlist=[function]), function)()\n"
+        "                row = [name, 'installed' if got else 'missing', str(got or '')]\n"
+        "            else:\n"
+        "                __import__(name)\n"
+        "                row = [name, 'installed', '']\n"
+        "        except ImportError:\n"
+        "            row = [name, 'missing', '']\n"
+        "        except BaseException as exc:\n"
+        "            row = [name, 'broken', str(exc).split(':')[0][:60]]\n"
+        "        out.write(json.dumps({'result': row}) + '\\n')\n"
+        "        out.flush()\n"
+    )
+    timeout_s = 120
+    found: dict[str, tuple[str, str]] = {}
+    remaining = list(import_names)
+    detail = ""
     try:
-        fmdx._presenter.phase_start(phase)  # noqa: SLF001 -- internal hook
-        result = method(**kwargs)
-        fmdx._presenter.phase_end(phase, status=result.status)
-        fmdx._write_manifest()  # noqa: SLF001 -- single-phase still records
-    except KeyboardInterrupt:
-        if session is not None:
-            session.stop()
-        return 130
-    except Exception:
-        if session is not None:
-            session.stop()
-        raise
-    print()
-    print(f"Project output: {fmdx.output_dir}")
-    rc = 0 if result.status == "ok" else 1
-    _finish_dashboard_for_command(session, args)
-    return rc
+        with tempfile.TemporaryDirectory() as work:
+            for attempt in range(len(import_names) + 1):
+                if not remaining:
+                    break
+                answer = Path(work) / f"backends-{attempt}.jsonl"
+                try:
+                    finished = subprocess.run(
+                        [sys.executable, "-c", script, json.dumps(remaining), str(answer),
+                         json.dumps(_CAPABILITIES)],
+                        capture_output=True, text=True, timeout=timeout_s, check=False,
+                    )
+                    ended = _how_the_probe_ended(finished.returncode)
+                except subprocess.TimeoutExpired:
+                    ended = f"did not finish loading within {timeout_s} s"
+                trying = None
+                lines = answer.read_text(encoding="utf-8").splitlines() if answer.is_file() else []
+                for line in lines:
+                    record = json.loads(line)
+                    if "trying" in record:
+                        trying = record["trying"]
+                    else:
+                        name, state, why = record["result"]
+                        found[name] = (state, why)
+                        trying = None
+                if trying is None:
+                    break
+                found[trying] = ("broken", ended)
+                remaining = [name for name in remaining if name not in found]
+        if found or not import_names:
+            # Anything a finished process never reached was not reached
+            # because an earlier backend ended it past recovery; say so
+            # rather than leave a gap the caller would read as a KeyError.
+            return {name: found.get(name, ("broken", "not reached by the check"))
+                    for name in import_names}
+        detail = "the check answered nothing"
+    except Exception as exc:  # noqa: BLE001
+        detail = f"{type(exc).__name__}: {exc}"[:80]
+    print(f"  (checked in this process: {detail})")
+    checked: dict[str, tuple[str, str]] = {}
+    for name in import_names:
+        try:
+            if name in _CAPABILITIES:
+                module, function = _CAPABILITIES[name]
+                got = getattr(__import__(module, fromlist=[function]), function)()
+                checked[name] = ("installed" if got else "missing", str(got or ""))
+                continue
+            __import__(name)
+            checked[name] = ("installed", "")
+        except ImportError:
+            checked[name] = ("missing", "")
+        except BaseException as exc:  # noqa: BLE001 - any load failure counts
+            checked[name] = ("broken", str(exc).split(":")[0][:60])
+    return checked
 
 
-def _cmd_info() -> int:
-    print(f"FastMDXplora {__version__}")
-    print(f"  {__expansion__}")
-    print(f"  Authors: {__author__}")
-    print(f"  DOI:     {__doi__}")
-    print()
-    print("Phases:")
+def _how_the_probe_ended(returncode: int) -> str:
+    """What a probe that stopped mid-import said on the way out."""
+    if returncode < 0:
+        import signal
+
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f"signal {-returncode}"
+        return f"crashed the interpreter on import ({name})"
+    return f"ended the interpreter on import (exit code {returncode})"
+
+
+#: What a phase cannot run without, and what it does less of without the rest.
+#: Named by the group in ``_BACKENDS`` that already says what those packages
+#: are for, so a backend added to a group is one the phases needing that group
+#: are reported as needing.
+#:
+#: The distinction matters: setup prepares a protein with OpenMM and PDBFixer
+#: alone, and only a *ligand* needs the chemistry stack. Reporting setup as
+#: unavailable there would send somebody installing four packages for a run
+#: that would have worked.
+_PHASE_NEEDS: dict[str, tuple[tuple[str, ...], tuple[tuple[str, str], ...]]] = {
+    "setup": (("to run a simulation",),
+              (("to prepare a ligand", "proteins only"),)),
+    "simulation": (("to run a simulation",), ()),
+    # Analysis runs on a PyPI install alone, which is what the PyPI package is
+    # for. The report does too; the PDF is one format of several.
+    "analysis": ((), ()),
+    "report": ((), (("to write the report as a PDF", "no PDF"),)),
+}
+
+
+def _backends_in(group_names: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    """The (display name, import name) of every backend in those groups."""
+    by_group = {group: backends for group, backends in _BACKENDS}
+    return tuple(
+        (display, import_name)
+        for group in group_names
+        for display, import_name, _hint in by_group.get(group, ())
+    )
+
+
+def _phase_status(phase: str, probed: dict[str, tuple[str, str]]) -> str:
+    """Whether the phase will run here, and what it will not do if it does."""
+    required, conditional = _PHASE_NEEDS[phase]
+
+    def absent(groups: tuple[str, ...]) -> list[str]:
+        # "installed" is the word the probe uses; comparing against any other
+        # reports every backend missing, which is the same contradiction
+        # pointing the other way.
+        return [display for display, import_name in _backends_in(groups)
+                if probed[import_name][0] != "installed"]
+
+    missing = absent(required)
+    if missing:
+        return "needs " + ", ".join(missing)
+    limits = [note for group, note in conditional if absent((group,))]
+    return "ready" + (f" ({', '.join(limits)})" if limits else "")
+
+
+def _cmd_scene(args: argparse.Namespace) -> int:
+    """A view of a study written as a MolViewSpec scene."""
+    import shutil
+
+    from fastmdxplora.gui.saved_views import views_of
+    from fastmdxplora.gui.viewer_selections import selections_of
+    from fastmdxplora.scenes import write_scene
+
+    study = Path(args.study)
+    if not study.is_dir():
+        print(f"fastmdx: {study} is not a study's folder.", file=sys.stderr)
+        return 2
+    view: dict = {}
+    if args.view:
+        found = [v for v in views_of(study)["views"] if v["name"] == args.view]
+        if not found:
+            names = ", ".join(v["name"] for v in views_of(study)["views"]) or "none"
+            print(f"fastmdx: no view named {args.view!r} (saved: {names}).", file=sys.stderr)
+            return 2
+        view = {k: v for k, v in found[0].items() if k != "name"}
+    if args.frame is not None:
+        view["frame"] = args.frame
+    name = args.name or args.view or "scene"
+    said = write_scene(study, name, view,
+                       selections=None if args.no_selections
+                       else selections_of(study)["selections"])
+    if not said.get("ok"):
+        print(f"fastmdx: {said.get('reason')}", file=sys.stderr)
+        return 1
+    print(f"Wrote {said['path']}" + (f" (frame {said['frame']})" if said.get("frame") is not None
+                                     else " (the structure)"))
+    for note in said.get("notes") or []:
+        print(f"  {note}")
+    if args.output:
+        shutil.copyfile(said["path"], args.output)
+        print(f"Copied to {args.output}")
+    return 0
+
+
+def _cmd_movie(args: argparse.Namespace) -> int:
+    """A movie of a study's frames, rendered by its Viewer."""
+    from fastmdxplora.movie_maker import make_movie
+
+    changes = {key: getattr(args, key) for key in ("representation", "colour", "superposed")
+               if getattr(args, key) is not None}
+    made = make_movie(args.study, name=args.name, view=args.view, changes=changes or None,
+                      first=args.first, last=args.last, every=args.every,
+                      between=args.between, fps=args.fps, size=args.size, turn=args.turn,
+                      time=not args.no_time, said=lambda text: print(text, flush=True))
+    if not made.get("ok"):
+        print(f"fastmdx: {made.get('reason')}", file=sys.stderr)
+        return 1
+    print(f"Made {made['path']}: {made['frames']} frames, {made['seconds']} s, "
+          f"{made['width']} x {made['height']}, {made['format'].upper()} ({made['codec']}), "
+          f"{made['bytes'] / 1e6:.1f} MB"
+          + (f", {made['between']} frame{'s' if made['between'] > 1 else ''} in between "
+             "each two played, interpolated"
+             if made.get("between") else "") + ".")
+    print(f"  Rendered by the Viewer in {made['browser']}; encoded as {made['encoder']}.")
+    return 0
+
+
+def _cmd_diff(args: argparse.Namespace) -> int:
+    """The settings two studies or Configs differ in."""
+    import json as _json
+
+    from fastmdxplora.config.diff import config_of, differences
+
+    first, first_file = config_of(args.first)
+    second, second_file = config_of(args.second)
+    found = differences(first, second)
+    asked = [d for d in found if not d.where_only]
+    if args.json:
+        print(_json.dumps({"first": str(first_file), "second": str(second_file),
+                           "differences": [d.as_record() | {"where_only": d.where_only}
+                                           for d in found]},
+                          indent=2, default=str))
+        return 1 if asked else 0
+
+    def said(value: object) -> str:
+        from fastmdxplora.config.diff import ABSENT
+
+        return "(not set)" if value is ABSENT else _json.dumps(value, default=str)
+
+    print(f"{args.first} ({first_file.name}) against {args.second} ({second_file.name})")
+    if (first_file.name == "resolved_config.yml") != (second_file.name == "resolved_config.yml"):
+        print("  One is a study and one a Config: what the software resolved when the study "
+              "ran (force field files, the water model) shows as a difference too.")
+    if not asked:
+        print("  They ask for the same study.")
+    else:
+        width = min(44, max(len(d.setting) for d in asked))
+        print(f"  {len(asked)} setting{'s' if len(asked) != 1 else ''} differ:")
+        for d in asked:
+            print(f"    {d.setting:<{width}}  {said(d.first)}  ->  {said(d.second)}")
+    where = [d.setting for d in found if d.where_only]
+    if where:
+        print(f"  Written differently only in: {', '.join(where)}")
+    return 1 if asked else 0
+
+
+def _cmd_select(args: argparse.Namespace) -> int:
+    """Show what a selection matches, before a run depends on it.
+
+    A selection that matches no atoms is refused when a study starts. A
+    selection that matches the *wrong* atoms is not an error and cannot be
+    made one -- `resid 189` and `resSeq 189` are both valid, both non-empty,
+    and name different residues in any structure that is not numbered from
+    one without gaps. This prints what the expression actually resolves to.
+    """
+    import mdtraj as md
+
+    structure = Path(args.structure)
+    if not structure.is_file():
+        print(f"fastmdx: no such structure: {structure}", file=sys.stderr)
+        return 2
+
+    try:
+        topology = md.load(str(structure)).topology
+    except Exception as exc:  # mdtraj raises a variety of types
+        print(f"fastmdx: could not read {structure}: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        indices = topology.select(args.expression)
+    except Exception as exc:
+        print(f"fastmdx: {args.expression!r} is not a valid selection: {exc}",
+              file=sys.stderr)
+        return 2
+
+    print(f"{args.expression!r} against {structure.name}")
+    print(f"  {len(indices)} of {topology.n_atoms} atoms")
+
+    if len(indices) == 0:
+        # Said here rather than left for the reader to infer, because an
+        # empty match is the one case where the next step is obvious.
+        print()
+        print("  Nothing matched. If you are naming residues from a paper, a")
+        print("  figure or a PDB entry, the number in them is `resSeq`;")
+        print("  `resid` counts residues from zero in file order.")
+        return 1
+
+    residues = []
+    for index in indices:
+        residue = topology.atom(int(index)).residue
+        if not residues or residues[-1] is not residue:
+            if residue not in residues:
+                residues.append(residue)
+
+    limit = None if args.limit == 0 else max(1, int(args.limit))
+    if args.atoms:
+        shown = [f"{topology.atom(int(i))}" for i in indices]
+        label = "atoms"
+    else:
+        shown = [f"{r.name}{r.resSeq}" for r in residues]
+        label = f"{len(residues)} residues"
+    print(f"  {label}: ", end="")
+    if limit is not None and len(shown) > limit:
+        print(", ".join(shown[:limit]) + f", ... ({len(shown) - limit} more)")
+    else:
+        print(", ".join(shown))
+    return 0
+
+
+def _info_record() -> dict[str, Any]:
+    """What `fastmdx info` reports, as data.
+
+    One collection behind both forms, so the text a person reads and the
+    JSON a program reads cannot disagree about what is installed.
+    """
+    import platform
+
+    from fastmdxplora.provenance import source_provenance
+
+    # A phase is not available because its module imports. It said so anyway:
+    # a pip install reported setup and simulation "available" three lines
+    # above OpenMM and PDBFixer "missing", which is the same screen
+    # contradicting itself -- and the same defect this command was fixed for
+    # one block down.
+    probed = _probe_backends(tuple(
+        import_name
+        for _group, backends in _BACKENDS
+        for _display, import_name, _hint in backends
+    ))
+    phases: dict[str, str] = {}
     for name in ("setup", "simulation", "analysis", "report"):
         try:
             module = __import__(f"fastmdxplora.{name}", fromlist=["run"])
-            run_fn = getattr(module, "run", None)
-            status = "available" if callable(run_fn) else "missing run()"
+            status = ("missing run()"
+                      if not callable(getattr(module, "run", None))
+                      else _phase_status(name, probed))
         except Exception as exc:  # noqa: BLE001
             status = f"import error: {exc}"
+        phases[name] = status
+    backends: dict[str, dict[str, str]] = {}
+    for group, members in _BACKENDS:
+        for display_name, import_name, install_hint in members:
+            state, detail = probed[import_name]
+            backends[import_name] = {
+                "name": display_name, "needed": group, "state": state,
+                "detail": detail, "install": install_hint,
+            }
+    return {
+        "version": __version__,
+        "source": source_provenance(),
+        "python": platform.python_version(),
+        "platform": _platform_record(),
+        "phases": phases,
+        "backends": backends,
+    }
+
+
+def _platform_record() -> dict[str, Any]:
+    """The operating system, and whether FastMDXplora supports it.
+
+    Linux and macOS. Windows is not supported, because AmberTools, which
+    gives every ligand its charges, has no Windows build. Nothing refuses to
+    run there; this is where it is said.
+    """
+    import platform
+
+    system = platform.system()
+    return {
+        "name": {"Darwin": "macOS"}.get(system, system),
+        "machine": platform.machine(),
+        "supported": sys.platform != "win32",
+    }
+
+
+def _cmd_info(args: argparse.Namespace | None = None) -> int:
+    record = _info_record()
+    if getattr(args, "json", False):
+        import json
+
+        print(json.dumps(record, indent=2))
+        return 0
+    print("FastMDXplora")
+    print(f"  version: {__version__}")
+    print(f"  Authors: {__author__}")
+    print(f"  DOI:     {__doi__}")
+    shown = record["platform"]
+    print(f"  Platform: {shown['name']} {shown['machine']}".rstrip())
+    if not shown["supported"]:
+        print("  Windows is not supported. FastMDXplora supports Linux and macOS.")
+    print()
+    print("Molecular Dynamics Phases:")
+    for name, status in record["phases"].items():
         print(f"  {name:<11} {status}")
     print()
-    print("Optional backends (real chemistry):")
-    for display_name, import_name, install_hint in (
-        ("PDBFixer", "pdbfixer",
-            "conda install -c conda-forge pdbfixer"),
-        ("OpenMM",   "openmm",
-            "conda install -c conda-forge openmm"),
-    ):
-        try:
-            __import__(import_name)
-            print(f"  {display_name:<10} installed")
-        except ImportError:
-            print(f"  {display_name:<10} not installed  ({install_hint})")
+    # Everything a phase reaches for at runtime, grouped by what it is for.
+    # This listed two of six, so a PyPI install reported both of them present
+    # and said nothing about the toolkit a protein-ligand setup needs -- which
+    # is the one question this command exists to answer.
+    print("Backends:")
+    for group, backends in _BACKENDS:
+        print(f"  {group}")
+        for display_name, import_name, _hint in backends:
+            entry = record["backends"][import_name]
+            remedy = {
+                "missing": entry["install"],
+                "broken": f"installed but will not load ({entry['detail']})",
+            }.get(entry["state"], entry["detail"])
+            print(f"    {display_name:<22} {entry['state']:<10} {remedy}".rstrip())
     print()
     print(f"Citation: {__citation__}")
     return 0
 
 
-def _cmd_init_config(args: argparse.Namespace) -> int:
+def _remote_machine(args: argparse.Namespace) -> str:
+    """The machine an action is about: named, or the only one there is."""
+    from fastmdxplora.remote import machine_names
+    from fastmdxplora.remote.machines import UnknownMachine
+
+    named = getattr(args, "action_machine", None) or args.machine
+    if named:
+        return named
+    known = machine_names()
+    if len(known) == 1:
+        return known[0]
+    raise UnknownMachine(
+        "Name the machine with --machine"
+        + (f": {', '.join(known)} have been inspected." if known
+           else ". None has been inspected yet: `fastmdx remote --machine <alias>`."),
+        given="", permitted=known)
+
+
+def _cmd_remote(args: argparse.Namespace) -> int:
+    """`fastmdx remote`: machines, and the studies sent to them."""
+    from fastmdxplora.remote import (
+        forget_machine,
+        inspect_machine,
+        load_machine,
+        machine_names,
+        machines_dir,
+        readiness,
+        this_code,
+    )
+    from fastmdxplora.remote.describe import (
+        describe_machine,
+        describe_plan,
+        describe_unloadable,
+        overview,
+        plan_for,
+    )
+
+    action = args.remote_action
+    if action == "forget":
+        forget_machine(args.forget_name)
+        print(f"  \u2713 Forgot {args.forget_name}. Nothing on the machine "
+              "was changed.")
+        return 0
+    if action == "install":
+        return _remote_install(_remote_machine(args))
+    if action == "send":
+        return _remote_send(args, _remote_machine(args))
+    if action in ("status", "fetch", "cancel"):
+        return _remote_job(args)
+
+    if args.machine:
+        code = this_code()
+        print(f"Inspecting {args.machine} over ssh...")
+        machine = inspect_machine(args.machine, code=code)
+        print()
+        for line in describe_machine(machine, code):
+            print(line)
+        print()
+        verdict = readiness(machine, code)
+        if verdict.ready:
+            print(f"  \u2713 Ready: {verdict.summary}.")
+        else:
+            print(f"  \u2717 Not ready: {verdict.summary}.")
+            print()
+            # An installation that holds the code and cannot load something
+            # needs that something, not a second installation beside it;
+            # plan_for makes that choice, and says it first.
+            plan = plan_for(machine, code)
+            for line in describe_unloadable(machine, verdict)[:-1]:
+                print(line)
+            for line in describe_plan(plan, machine.name):
+                print(line)
+            if plan.possible:
+                print("Or have FastMDXplora run them, after you confirm:")
+                print(f"  fastmdx remote install --machine {machine.name}")
+        print()
+        print(f"Recorded in {machines_dir() / (machine.name + '.json')}")
+        return 0
+
+    from fastmdxplora.remote.jobs import job_names, load_job
+    from fastmdxplora.remote.send import job_line
+
+    # A record that cannot be read is said, and the others are still listed.
+    from fastmdxplora.remote.describe import overview as said_of
+
+    machines, unread, code = [], [], this_code()
+    for name in machine_names():
+        try:
+            machine = load_machine(name)
+            said_of([machine], code)  # read as the listing reads it
+            machines.append(machine)
+        except (ValueError, TypeError, AttributeError, KeyError) as exc:
+            unread.append(f"The record for {name!r} could not be read ({exc}). "
+                          f"Inspect the machine again to rewrite it.")
+    for line in overview(machines, code):
+        print(line)
+    jobs = []
+    for name in job_names():
+        try:
+            jobs.append(load_job(name))
+        except ValueError as exc:
+            unread.append(str(exc))
+    if jobs:
+        print()
+        print("Jobs (as last checked; `fastmdx remote status` asks again)")
+        for job in jobs:
+            print(job_line(job))
+    for said in unread:
+        print(f"  ! {said}")
+    return 0
+
+
+def _remote_install(name: str) -> int:
+    from fastmdxplora.remote.describe import describe_plan
+    from fastmdxplora.remote.installer import ask_a_person, install
+
+    def confirm(plan) -> bool:
+        print()
+        for line in describe_plan(plan, name)[:-3]:
+            print(line)
+        return ask_a_person(plan)
+
+    print(f"Inspecting {name} over ssh...")
+    outcome = install(name, confirm=confirm)
+    if outcome.ran == 0 and outcome.verdict is not None and outcome.verdict.ready:
+        print(f"  \u2713 Already ready: {outcome.verdict.summary}.")
+        return 0
+    if outcome.failed_step:
+        print(f"\n  \u2717 Stopped at: {outcome.failed_step}")
+        print("  Steps before it were left as they are. See the output above.")
+        return 1
+    verdict = outcome.verdict
+    if verdict is not None and verdict.ready:
+        print(f"\n  \u2713 Ready: {verdict.summary}.")
+        return 0
+    print(f"\n  \u2717 Installed, and still not ready: "
+          f"{verdict.summary if verdict else 'not re-inspected'}.")
+    return 1
+
+
+def _remote_send(args: argparse.Namespace, name: str) -> int:
+    from fastmdxplora.remote.send import describe_sending, prepare, send
+
+    print(f"Checking the Config, and {name} over ssh...")
+    sending = prepare(args.config, name, output=args.output_dir,
+                      force=args.force, partition=args.partition,
+                      time_limit=args.time_limit)
+    print()
+    for line in describe_sending(sending):
+        print(line)
+    if args.dry_run:
+        print("\nDry run: nothing was sent.")
+        return 0
+    job = send(sending)
+    print(f"\n  \u2713 Started {job.name} on {job.machine} "
+          f"({'SLURM job' if job.scheduler == 'slurm' else 'process'} {job.handle}).")
+    print(f"  fastmdx remote status {job.name}")
+    print(f"  fastmdx remote fetch {job.name}")
+    return 0
+
+
+def _remote_job(args: argparse.Namespace) -> int:
+    from fastmdxplora.remote.jobs import FINISHED, job_names, load_job
+    from fastmdxplora.remote.send import (
+        LEFT_STOPPING_S,
+        cancel,
+        fetch,
+        job_line,
+        left_stop_done,
+        status,
+    )
+
+    action = args.remote_action
+    if action == "status":
+        unread = []
+
+        def going(name: str) -> bool:
+            try:
+                return load_job(name).state not in FINISHED
+            except ValueError as exc:
+                unread.append(str(exc))
+                return False
+
+        names = [args.job] if args.job else [n for n in job_names() if going(n)]
+        for said in unread:
+            print(f"  ! {said}")
+        if not names:
+            print("No jobs still running. `fastmdx remote` lists them all.")
+            return 0
+        for job_name in names:
+            job = status(job_name)
+            print(job_line(job))
+            for line in job.extra.get("log_tail", [])[-4:]:
+                print(f"      {line}")
+        return 0
+    if action == "cancel":
+        import time
+
+        asked_at = time.time()
+        job = cancel(args.job)
+        done = left_stop_done(job, asked_at)
+        what = ("what its run left going" if job.state != "abandoned"
+                else "what its run still had going")
+        said = {
+            "none": f"  {job.name} had ended ({job.state}); nothing of its run still works "
+                    f"on {job.machine}, so nothing was stopped.",
+            "stopping": f"  {job.name}: {what} on {job.machine} was asked to stop within "
+                        f"the last {LEFT_STOPPING_S // 60} minutes, and stops at its next "
+                        "frame; nothing more was sent.",
+            "now": f"  \u2713 {job.name}: {what} on {job.machine} was stopped at once, "
+                   "without a checkpoint.",
+            "sent": f"  \u2713 {job.name} had ended ({job.state}); {what} on {job.machine} "
+                    "was asked to stop, and stops at its next frame."
+            if job.state != "abandoned" else "",
+        }.get(done, "")
+        if said:
+            print(said + f" Its folder there is left at {job.remote_dir}.")
+            return 0
+        if job.state != "abandoned":
+            print(f"  {job.name} had ended already ({job.state}"
+                  + (f", {job.detail}" if job.detail else "")
+                  + "); nothing was stopped.")
+            return 0
+        print(f"  \u2713 {job.name}: {job.state}. Its folder on {job.machine} "
+              f"is left at {job.remote_dir}.")
+        return 0
+    job, warnings = fetch(args.job, with_trajectory=args.with_trajectory)
+    print(f"  \u2713 Fetched {job.name} to {job.local_output}")
+    for warning in warnings:
+        print(f"  {warning}")
+    print(f"  Open it with: fastmdx gui --output {job.local_output}")
+    return 0
+
+
+def _cmd_config(args: argparse.Namespace) -> int:
     from fastmdxplora.config import generate_template
 
-    out_path = Path(args.config_output)
+    out_path = Path(args.config_file)
     if out_path.exists() and not args.force:
         print(
-            f"fastmdx: {out_path} already exists. Use --force to overwrite, "
-            f"or -o to choose a different path.",
+            f"fastmdx: {out_path} already exists. Use --force-overwrite, "
+            f"or -f to choose a different file.",
             file=sys.stderr,
         )
         return 2
 
     text = generate_template(minimal=args.minimal)
-    out_path.write_text(text, encoding="utf-8")
+    try:
+        out_path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        # A folder that is not there, one that cannot be written, a name
+        # that is a folder: said in one line, as a file that exists is.
+        print(
+            f"fastmdx: cannot write {out_path}: {exc.strerror or type(exc).__name__}. "
+            f"Choose a file in a folder that exists with -f.",
+            file=sys.stderr,
+        )
+        return 2
     kind = "minimal" if args.minimal else "comprehensive"
     print(f"Wrote {kind} config template to {out_path}")
     print(f"Edit it, then run:  fastmdx explore --config {out_path}")
+    # Said here, since the template shows FastMDXplora's own defaults and the
+    # run fills yours where the config leaves a setting unset.
+    from fastmdxplora.config.defaults_file import defaults_for
+    from fastmdxplora.config.loader import ConfigError
+
+    try:
+        defaults = defaults_for(out_path.expanduser().resolve().parent)
+    except ConfigError as exc:
+        print(f"Your defaults cannot be used: {exc}")
+        return 0
+    if defaults is not None and defaults.values:
+        print(f"Your defaults ({defaults.path}) fill what it leaves unset when it runs: "
+              + ", ".join(f"{name} {value}" for name, value in defaults.settings()) + ".")
     return 0
 
 
-def _cmd_bootstrap(args: argparse.Namespace, *, editable: bool = False, package_name: str = "fastmdxplora") -> int:
-    from fastmdxplora.install import bootstrap_environment, BootstrapError
+def _cmd_gui(args: argparse.Namespace, *, panel: str = "") -> int:
+    """Serve the full GUI: study builder, exploration, telemetry, and viewer.
 
-    repo_root = Path.cwd()
-    repo_marker = (repo_root / "pyproject.toml").exists() and (repo_root / "src" / "fastmdxplora").exists()
-    resolved_package_name = "." if package_name == "." and repo_marker else package_name
-    resolved_editable = editable and repo_marker
-
-    try:
-        bootstrap_environment(
-            env_name=args.env_name,
-            python_version=args.python_version,
-            yes=args.yes,
-            force=args.force,
-            package_name=resolved_package_name,
-            editable=resolved_editable,
-        )
-        return 0
-    except BootstrapError as exc:
-        print(f"fastmdx: bootstrap failed: {exc}", file=sys.stderr)
-        return 1
-
-
-def _cmd_health(args: argparse.Namespace) -> int:
-    from health import main as health_main
-
-    argv: list[str] = []
-    if getattr(args, "no_fix", False):
-        argv.append("--no-fix")
-    if getattr(args, "yes", False):
-        argv.append("--yes")
-    return health_main(argv)
-
-
-# ---------------------------------------------------------------------------
-# Self-healing prologue
-# ---------------------------------------------------------------------------
-# `explore` / `xplore` / `setup` / `simulate` need OpenMM (and PDBFixer
-# for setup). Without the chemistry stack installed, the user would
-# otherwise get a long stack trace. Detect this here and offer a one-stop
-# install hint instead, while still letting `info` / `health` / etc.
-# proceed normally.
-_CHEMISTRY_PHASES = frozenset({"setup", "simulation"})
-
-
-def _needs_chemistry(args: argparse.Namespace) -> bool:
-    """Return True if this command will actually invoke a chemistry phase."""
-    cmd = getattr(args, "command", None)
-    if cmd in ("setup", "simulate"):
-        return True
-    if cmd in ("explore", "xplore"):
-        # Dry runs only print the plan; they must work without chemistry so
-        # users can use them as a teaching tool when explaining the install gap.
-        if getattr(args, "dry_run", False):
-            return False
-        include = getattr(args, "include", None)
-        exclude = set(getattr(args, "exclude", None) or ())
-        if include is not None:
-            return bool(set(include) & _CHEMISTRY_PHASES)
-        if exclude >= _CHEMISTRY_PHASES:
-            return False
-        return True  # default plan runs every phase
-    return False
-
-
-def _missing_chemistry_backends() -> list[str]:
-    """Return the chemistry backend modules that aren't importable here.
-
-    Probes the *actual* import shape used by setup and simulation
-    (e.g. ``from openmm.app import PDBFile``) so a broken partial install
-    fails fast here instead of mid-phase.
+    `panel` names where to land. `fastmdx agent` with no request passes
+    "agent" and gets the same server on the same port, opened at that
+    section -- a note in the URL fragment the page reads on load, not a
+    second application. Two commands that started two browsers would be two
+    things to learn for one thing to use.
     """
-    probes: tuple[tuple[str, str], ...] = (
-        ("openmm", None),                                # top-level package
-        ("openmm.app", "from openmm.app import PDBFile"),
-        ("openmm", "from openmm import unit"),
-        ("pdbfixer", "from pdbfixer import PDBFixer"),
-    )
-    failing: list[str] = []
-    for name, stmt in probes:
+    from fastmdxplora.gui.server import DashboardConfig, serve_dashboard
+
+    from fastmdxplora.gui.accents import ACCENT_ENV, ACCENTS
+
+    if getattr(args, "accent", None):
+        # For the page, and for the runs it starts, whose reports take it.
+        os.environ[ACCENT_ENV] = args.accent
+    if getattr(args, "open", None):
+        if getattr(args, "hosted", False) or getattr(args, "output", None) \
+                or getattr(args, "demo", None) is not None:
+            print("fastmdx gui: --open opens a shared study; it does not go with "
+                  "--output, --demo or --hosted.", file=sys.stderr)
+            return 2
+        from fastmdxplora.refusals import CodedError
+        from fastmdxplora.sharing.opening import MOST_BYTES, open_shared
+
+        most = (int(args.open_most_gb * 1024 ** 3) if args.open_most_gb else MOST_BYTES)
         try:
-            if stmt is None:
-                __import__(name)
-            else:
-                exec(stmt, {})  # noqa: S102 — string intentional, gated by probes tuple
-        except ImportError:
-            failing.append(name)
-    # Reduce to the *top-level* packages the user has to install, so the
-    # hint stays short and actionable.
-    return sorted({("openmm" if name.startswith("openmm") else name) for name in failing})
+            opened = open_shared(args.open, into=args.open_into, workspace=Path.cwd(),
+                                 most_bytes=most, said=print)
+        except CodedError as exc:
+            print(f"fastmdx gui: {exc}", file=sys.stderr)
+            return 2
+        args.output = str(opened)
+    if getattr(args, "demo", None) is not None:
+        if getattr(args, "hosted", False) or getattr(args, "output", None):
+            print("fastmdx gui: --demo opens the demo study; it does not go with "
+                  "--output or --hosted.", file=sys.stderr)
+            return 2
+        from fastmdxplora.demo import DemoMissing, copy_demo
 
+        try:
+            from fastmdxplora.demo import fetch_demo, packaged
 
-def _cmd_dashboard(args: argparse.Namespace) -> int:
-    if args.dashboard_command != "serve":
-        print("fastmdx: dashboard requires a subcommand, e.g. `dashboard serve`.", file=sys.stderr)
+            if packaged() is None:
+                fetch_demo(said=print)
+            copied = copy_demo(args.demo)
+        except DemoMissing as exc:
+            print(f"fastmdx gui: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"fastmdx gui: the demo study could not be copied: {exc}", file=sys.stderr)
+            return 2
+        print(f"The demo study is in {copied}.")
+        args.output = str(copied)
+    # Without --output there is no run to watch: the working directory is
+    # merely where the command was typed. Treating it as an active run made
+    # the GUI open on the overview of that run -- an overview of nothing.
+    watching_a_run = bool(getattr(args, "output", None))
+    output = Path(args.output) if watching_a_run else Path.cwd()
+    if watching_a_run:
+        from fastmdxplora.gui.browse import holds_no_study
+
+        if holds_no_study(output.expanduser().resolve()):
+            # A folder of other things named by mistake: opened as a study it
+            # showed an overview of nothing and listed its files as a run's.
+            print(f"{output} holds no FastMDXplora study; the GUI opens with no "
+                  "study, and lists any studies inside it under All studies.")
+            watching_a_run = False
+    hosting = None
+    if getattr(args, "hosted", False):
+        from fastmdxplora.gui.hosting import Hosting, HostingError
+
+        try:
+            hosting = Hosting.from_environment(
+                args.workspace or Path.cwd(), args.allowed_host,
+                getattr(args, "account_url", ""), getattr(args, "runs_url", ""),
+                getattr(args, "product_name", ""), getattr(args, "product_tagline", ""),
+                getattr(args, "product_logo", ""),
+                memory_dir=getattr(args, "memory_dir", ""),
+                memory_store=getattr(args, "memory_store", ""))
+        except HostingError as exc:
+            print(f"fastmdx gui: {exc}", file=sys.stderr)
+            return 2
+        # The workspace is where the person starts, with no study open, and
+        # there is no browser on this machine to open.
+        output = hosting.workspace
+        watching_a_run = False
+        args.no_browser = True
+    elif (getattr(args, "workspace", None) or getattr(args, "allowed_host", None)
+          or getattr(args, "account_url", None) or getattr(args, "runs_url", None)
+          or getattr(args, "product_name", None) or getattr(args, "product_tagline", None)
+          or getattr(args, "product_logo", None) or getattr(args, "memory_dir", None)
+          or getattr(args, "memory_store", None)):
+        print("fastmdx gui: --workspace, --allowed-host, --account-url, --product-name, "
+              "--product-tagline, --product-logo, --memory-dir, --memory-store and "
+              "--runs-url apply only with --hosted.",
+              file=sys.stderr)
         return 2
-    from fastmdxplora.live.server import DashboardConfig, serve_dashboard
-
+    # Said once the command is accepted, as the page opens in Cyan for it.
+    if os.environ.get(ACCENT_ENV, "").strip().lower() not in ("", *ACCENTS):
+        print(f"fastmdx: {ACCENT_ENV}={os.environ[ACCENT_ENV]!r} is not one of "
+              f"{', '.join(ACCENTS)}; the accent is cyan.", file=sys.stderr)
     config = DashboardConfig(
         ligand_resname=getattr(args, "ligand_resname", None),
         binding_pocket_cutoff_A=float(
             getattr(args, "binding_pocket_cutoff_A", 5.0) or 5.0
         ),
-        max_browser_frames=int(
-            getattr(args, "max_playback_frames", 200) or 200
-        ),
     )
+    # Open the browser only once the server answers. It was opened first,
+    # and on a completed-run folder -- more to read before the first
+    # response -- the browser reached the port before it was listening and
+    # showed "unable to connect" until a refresh. A short poll closes the
+    # race; the browser still opens best-effort.
+    on_ready = None
+    if not getattr(args, "no_browser", False):
+        import webbrowser
+
+        fragment = f"#{panel}" if panel else ""
+
+        def on_ready(url: str) -> None:
+            try:
+                webbrowser.open(f"{url}{fragment}", new=2)
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+
     serve_dashboard(
-        output=args.output,
+        output=output,
         host=args.host,
         port=args.port,
         config=config,
+        home_mode=not watching_a_run,
+        on_ready=on_ready,
+        hosting=hosting,
     )
-    if getattr(args, "open_browser", False):
-        import webbrowser
-        try:
-            webbrowser.open(f"http://{args.host}:{args.port}", new=2)
-        except Exception:
-            pass
     return 0
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+def _cmd_resume(args: argparse.Namespace) -> int:
+    """`fastmdx resume STUDY`: carry a stopped study on to its end."""
+    import json
+
+    from fastmdxplora.simulation.resume import resume_study
+
+    answer = resume_study(args.study)
+    if getattr(args, "json", False):
+        if not answer.get("ok"):
+            from fastmdxplora.remedies import remedies_of
+
+            try:
+                answer["remedies"] = [remedy.as_record() for remedy in
+                                      remedies_of(answer.get("study") or args.study)]
+            except Exception:  # noqa: BLE001 - advice, never the outcome
+                answer["remedies"] = []
+        print(json.dumps(answer, default=str))
+    elif answer.get("ok"):
+        said = {
+            "nothing": "Nothing to do: the study finished.",
+            "analysed": "Production was complete; the analyses and report were run.",
+            "continued": "Production was carried on from its last checkpoint, "
+                         "joined, and analysed.",
+            "restarted": "Production had not begun, so the study was run from its start.",
+            "runs": "Every run of the study was carried on or run, and the "
+                    "study's comparison across them rebuilt.",
+        }
+        print(said.get(answer.get("did"), "Done."))
+    else:
+        print(f"fastmdx: {answer.get('error')}", file=sys.stderr)
+        from fastmdxplora.batch.explorer import _what_would_fix_it
+
+        fixes = _what_would_fix_it(answer.get("study") or args.study)
+        if fixes:
+            print("\n".join(fixes), file=sys.stderr)
+    return 0 if answer.get("ok") else 1
+
+
+def _cmd_mcp(args: argparse.Namespace) -> int:
+    """`fastmdx mcp`: serve an AI app on standard input and output."""
+    from fastmdxplora.mcp import serve_stdio
+    from fastmdxplora.refusals import StudyError
+
+    try:
+        return serve_stdio(args.workspace or Path.cwd(), runs=not args.read_only)
+    except StudyError as exc:
+        print(f"fastmdx: {exc}", file=sys.stderr)
+        return 2
+
+
 def _startup_dashboard_details(argv: Sequence[str]) -> tuple[str, bool]:
-    """Resolve the dashboard address shown by the startup wordmark."""
+    """Resolve the GUI address shown by the startup wordmark."""
     host = "127.0.0.1"
     port = "8765"
     enabled = (
-        "--dashboard" in argv
+        "gui" in argv
+        or "--dashboard" in argv
         or "--live-dashboard" in argv
-        or ("dashboard" in argv and "serve" in argv)
         or os.getenv("FASTMDX_DASHBOARD_ACTIVE") == "1"
     )
 
@@ -1210,14 +3335,474 @@ def _startup_dashboard_details(argv: Sequence[str]) -> tuple[str, bool]:
 
 
 def _cmd_dashboard_home() -> int:
-    """Start the dashboard home screen for an empty CLI invocation."""
-    from fastmdxplora.live.server import serve_dashboard
+    """Start the dashboard home screen for an empty CLI invocation.
+
+    `fastmdx` alone opens the GUI on the folder it was typed in, as
+    `fastmdx gui` does: with no study open, the folder its workspace. It
+    opened that folder as the study, so a repository checkout was shown as
+    a study with no live record and its files listed as the run's."""
+    from fastmdxplora.gui.server import serve_dashboard
 
     serve_dashboard(
         output=Path.cwd(),
         host="127.0.0.1",
         port=8765,
+        home_mode=True,
     )
+    return 0
+
+
+def _learn_from(request: str, complete: Any, memory: Any) -> None:
+    """After a reply: the request read for the memory, where the person lets
+    it learn from chats, and each change said."""
+    from fastmdxplora.agent.memory import from_a_chat, worth_reading
+
+    if memory is None or not (memory.use and memory.from_chats) or memory.unreadable \
+            or not worth_reading(request):
+        return
+    try:
+        made = from_a_chat(request, complete)
+    except Exception:  # noqa: BLE001 - the memory never fails a reply given
+        return
+    for done in made:
+        print(f"  {done.said()} (`fastmdx agent memory` to see or change it)")
+
+
+def _agent_memory(args: Any) -> int:
+    """`fastmdx agent memory`: what the Agent remembers of the person, and
+    changing it."""
+    from fastmdxplora.agent import memory as kept
+
+    if args.memory_clear and not args.memory_yes and not sys.stdin.isatty():
+        # Checked before anything changes, so a command is done whole or not
+        # at all.
+        print("--clear asks first, in a terminal; from a script, add --yes.")
+        return 2
+    lines = kept.load_memory().lines
+
+    def numbered(given: Any) -> str | None:
+        # The number as the list showed it, checked before anything changes.
+        text = str(given).strip()
+        at = int(text) if text.isdigit() else 0
+        if not 1 <= at <= len(lines):
+            print(f"Give a line's number as `fastmdx agent memory` lists it: 1 to "
+                  f"{len(lines)}." if lines else "The memory holds no line to change.")
+            return None
+        return lines[at - 1].id
+
+    forgetting = changing = None
+    if args.memory_forget is not None:
+        forgetting = numbered(args.memory_forget)
+        if forgetting is None:
+            return 2
+    if args.memory_change is not None:
+        changing = numbered(args.memory_change[0])
+        if changing is None:
+            return 2
+    try:
+        if args.memory_undo:
+            last = next((c for c in reversed(kept.load_memory().changes) if not c.undone), None)
+            if last is None:
+                print("There is no change to undo.")
+                return 2
+            done = kept.undo(last.id)
+            print(f"Undone: {done.said()}")
+        if args.memory_add is not None:
+            print(kept.remember(args.memory_add).said())
+        if changing is not None:
+            print(kept.change(changing, args.memory_change[1]).said())
+        if forgetting is not None:
+            print(kept.forget(forgetting).said())
+        if args.memory_clear:
+            memory = kept.load_memory()
+            count = len(memory.lines) + len(memory.not_told)
+            if not count:
+                print("The memory holds nothing to clear.")
+            elif not args.memory_yes and input(
+                    f"Forget all {count} lines, told or not? [y/N] ").strip().lower() \
+                    not in ("y", "yes"):
+                print("Nothing forgotten.")
+                return 1
+            else:
+                print(f"Forgot {kept.forget_all()} lines.")
+        if args.memory_use is not None or args.memory_learn is not None:
+            kept.set_switches(
+                use=args.memory_use,
+                from_chats=None if args.memory_learn is None else args.memory_learn == "on")
+    except kept.MemoryRefused as exc:
+        print(str(exc))
+        return 2
+    except OSError as exc:
+        print(f"The memory could not be written: {exc}")
+        return 1
+    memory = kept.load_memory()
+    print(f"What the Agent remembers of you ({memory.where}):")
+    if memory.unreadable:
+        print(f"  It could not be read ({memory.unreadable}); nothing is changed until it "
+              "can be.")
+    heading = ""
+    for n, line in enumerate(memory.lines, 1):
+        if line.heading != heading:
+            heading = line.heading
+            if heading:
+                print(f"  {heading}")
+        came = "from a chat" if line.source == "chat" else "yours"
+        when = line.updated or line.added
+        print(f"  {n}. {line.text} ({came}{', ' + when[:10] if when else ''})")
+    if not memory.lines:
+        print("  Nothing yet.")
+    for item in memory.not_told:
+        print(f"  Not told: {kept.masked(item.text)} ({item.why})")
+    learns = "yes" if memory.use and memory.from_chats else \
+        "no (the memory is off)" if memory.from_chats else "no"
+    print(f"Told to the Agent: {'yes' if memory.use else 'no'}. Learns from chats: {learns}.")
+    if memory.changes and not memory.unreadable:
+        print("`fastmdx agent memory --undo` undoes the last change.")
+    return 0
+
+
+def _run_agent(args: Any) -> int:
+    """`fastmdx agent` -- choose an AI model, or write a study from a sentence."""
+    from pathlib import Path as _Path
+
+    from fastmdxplora.agent import (
+        completion_for, describe_choice, propose_config,
+    )
+    from fastmdxplora.refusals import StudyError, refusal_of
+
+    request = args.request
+
+    if request == "model":
+        return _choose_model()
+    for name, default in (("memory_add", None), ("memory_forget", None),
+                          ("memory_change", None), ("memory_undo", False),
+                          ("memory_clear", False), ("memory_yes", False),
+                          ("memory_use", None), ("memory_learn", None)):
+        # Arguments built by hand (a caller of `_run_agent`) carry none.
+        if not hasattr(args, name):
+            setattr(args, name, default)
+    memory_flags = [flag for flag, given in (
+        ("--add", args.memory_add is not None), ("--forget", args.memory_forget is not None),
+        ("--change", args.memory_change is not None), ("--undo", args.memory_undo),
+        ("--clear", args.memory_clear), ("--yes", args.memory_yes),
+        ("--on/--off", args.memory_use is not None),
+        ("--learn-from-chats", args.memory_learn is not None)) if given]
+    if request == "memory":
+        return _agent_memory(args)
+    if memory_flags:
+        print(f"{', '.join(memory_flags)} go with `fastmdx agent memory`.")
+        return 2
+    if request == "set":
+        # The old name chose an AI model too. It stops rather than writes a
+        # study from the word "set", and says where the choosing went.
+        print("`fastmdx agent set` is now `fastmdx agent model`.")
+        return 2
+
+    if args.request_file:
+        try:
+            request = _Path(args.request_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            print(f"Could not read {args.request_file}: {exc}")
+            return 1
+
+    if not request:
+        # No request is an invitation to converse, and conversing wants a
+        # window. The same server `fastmdx gui` starts, landing on the
+        # agent panel.
+        print(describe_choice())
+        print("\nOpening the agent panel. Ctrl-C to stop the server.")
+        gui_args = argparse.Namespace(
+            output=getattr(args, "agent_output", None),
+            host=args.host,
+            port=args.port,
+            no_browser=args.no_browser,
+            ligand_resname=None,
+            binding_pocket_cutoff_A=5.0,
+        )
+        # Through the module attribute rather than the local name, so a
+        # test can substitute it. `_cmd_gui` serves until interrupted, and
+        # a test that called it for real would hang rather than fail.
+        import sys as _sys
+
+        return _sys.modules[__name__]._cmd_gui(gui_args, panel="agent")
+
+    try:
+        complete = completion_for()
+    except StudyError as exc:
+        print(refusal_of(exc).message)
+        return 1
+
+    if args.agent_mode == "unvalidated":
+        # The mode itself -- an agent writing code outside the schema --
+        # is still to come. What exists now is the marking that makes it
+        # safe to offer, so the config records it and every figure from an
+        # unchecked phase carries it. Writing a config in this mode is
+        # therefore honest: it says what the study will be, and the
+        # marking will hold whatever produces the output.
+        print(
+            "Writing a config marked `unvalidated`. Work in this mode goes "
+            "outside the schema, so nothing checks the method and every "
+            "figure from an unchecked phase is stamped. The agent cannot "
+            "yet write code itself; the mode is recorded, and the marking "
+            "holds for anything run under it."
+        )
+
+    from fastmdxplora.agent.propose import DEFAULT_ATTEMPTS
+
+    from fastmdxplora.agent.tools import Toolbox
+    from fastmdxplora.workspace_studies import folder_of_studies
+
+    # Your defaults, from where the config will be written (or here): the
+    # Agent is told them, and the config it writes has them filled in.
+    from fastmdxplora.config.defaults_file import defaults_for
+    from fastmdxplora.config.loader import ConfigError
+
+    try:
+        defaults = defaults_for(_Path(args.agent_output).expanduser().resolve().parent
+                                if args.agent_output else _Path.cwd())
+    except ConfigError as exc:
+        print(str(exc))
+        return 1
+    # What the Agent remembers of the person, as the GUI's Agent is told it.
+    from fastmdxplora.agent.memory import load_memory
+
+    try:
+        memory = load_memory()
+    except Exception:  # noqa: BLE001 - the memory never stops a request
+        memory = None
+    # Not "Writing a config": the reply may be an answer, a question or an
+    # action, and which is known only once it comes.
+    # Said as the Agent: its AI model is named only by `fastmdx agent model`.
+    print("Thinking...")
+    try:
+        proposal = propose_config(
+            request, complete,
+            phases=[p.strip() for p in args.phases.split(",") if p.strip()],
+            max_cycles=(DEFAULT_ATTEMPTS if args.attempts is None
+                        else int(args.attempts)),
+            tools=Toolbox(workspace=folder_of_studies(_Path.cwd())), defaults=defaults,
+            memory=memory)
+    except StudyError as exc:
+        print(refusal_of(exc).message)
+        return 1
+    code = _said_reply(args, proposal)
+    # After the reply is said, and only from words typed: a request read
+    # from a file is a file, which the memory never reads.
+    if not args.request_file:
+        _learn_from(request, complete, memory)
+    return code
+
+
+def _said_reply(args: Any, proposal: Any) -> int:
+    """The Agent's reply, said; the command's exit code."""
+    from pathlib import Path as _Path
+
+    # What it looked at with the software's own tools, in the page's words,
+    # and what each found.
+    for look in proposal.looks:
+        record = look.as_record()
+        print(f"  {record['label']}: {record['found']}")
+
+    # The corrections, shown rather than hidden. They are the only visible
+    # sign that anything checked the config, and the count is worth seeing.
+    for attempt in proposal.attempts:
+        if attempt.refusal is not None:
+            print(f"  ✗ {attempt.refusal.message}")
+    # What the AI model's calls cost, where the provider said.
+    if proposal.usage:
+        from fastmdxplora.agent.turns import Usage
+
+        print(f"  Used: {Usage(**proposal.usage).said()}")
+
+    if proposal.answer:
+        # A question was asked rather than a study: the answer is the reply.
+        print(f"\n{_in_plain_text(proposal.answer)}")
+        return 0
+    if proposal.action:
+        # The command line writes studies; it carries out nothing it is told.
+        print(f"\n  The Agent read this as an instruction ({proposal.action}). The "
+              "command line writes a config; run, stop and the rest are done in "
+              "`fastmdx gui` or with their own commands.")
+        return 2
+    if proposal.question:
+        # Not a failure. The request is short of something only the person
+        # can supply -- a structure, most often -- and guessing one would
+        # produce a study of the wrong molecule that validates perfectly.
+        print(f"\n  ? {_in_plain_text(proposal.question)}")
+        for choice in proposal.choices:
+            print(f"      - {choice}")
+        print("\nAdd that to the request and try again.")
+        return 2
+    if not proposal.accepted:
+        print(f"\nGave up after {proposal.cycles} attempt"
+              f"{'' if proposal.cycles == 1 else 's'}. The last refusal is above.")
+        return 1
+
+    import yaml
+
+    config = dict(proposal.config)
+    config["agent"] = args.agent_mode
+    # And which AI model, not only that one was used. `agent: assisted` says an
+    # AI model was involved; this says which, so the record identifies the
+    # software rather than the category.
+    from fastmdxplora.agent import load_choice
+
+    chosen = load_choice()
+    if chosen is not None:
+        config["agent_model"] = f"{chosen.provider}/{chosen.model}"
+    text = yaml.safe_dump(config, sort_keys=False)
+    # As the page says it, so the two read alike.
+    print("  ✓ Accepted first time.\n" if proposal.cycles == 1
+          else f"  ✓ Accepted after {proposal.cycles} attempts.\n")
+    if proposal.note:
+        print(f"  {_in_plain_text(proposal.note)}\n")
+    print(text)
+    if args.agent_mode == "autonomous":
+        if args.budget_hours is None:
+            print(
+                "\n`--autonomous` runs the study without showing it to "
+                "you, so a budget is the only thing left that can stop "
+                "it. Give one with --budget-hours."
+            )
+            return 1
+        return _run_staged(args, config)
+
+    if args.agent_output:
+        _Path(args.agent_output).write_text(text, encoding="utf-8")
+        print(f"Written to {args.agent_output}")
+        print(f"Run it with: fastmdx explore -config {args.agent_output}")
+    else:
+        print("Save it with -o FILE, then run "
+              "`fastmdx explore -config FILE`.")
+    return 0
+
+
+
+_EMPHASIS = re.compile(
+    r"(?<![\w*])\*\*(?=\S)(.+?)(?<=\S)\*\*(?![\w*])"
+    r"|(?<![\w_])__(?=\S)(.+?)(?<=\S)__(?![\w_])"
+    r"|(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])")
+_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
+_CODE = re.compile(r"(`+)[^`\n]*?\1")
+
+
+def _in_plain_text(text: str) -> str:
+    """A reply written for the page, as a terminal shows it: emphasis
+    without its asterisks, a link as its words and address. Code in
+    backticks is kept as written, since it is what to type (`*.pdb`,
+    `src/__init__.py`), and so is a name with underscores in it."""
+    out, at = [], 0
+    for code in _CODE.finditer(text or ""):
+        out.append(_plain(text[at:code.start()]))
+        out.append(code.group(0))
+        at = code.end()
+    out.append(_plain((text or "")[at:]))
+    return "".join(out)
+
+
+def _plain(text: str) -> str:
+    text = _LINK.sub(lambda m: f"{m.group(1)} ({m.group(2)})", text)
+    return _EMPHASIS.sub(lambda m: next(g for g in m.groups() if g is not None), text)
+
+
+def _run_staged(args: Any, config: dict) -> int:
+    """`--autonomous`: setup, price it, then the rest if it fits."""
+    from pathlib import Path as _Path
+
+    from fastmdxplora.agent import run_in_stages
+
+    from fastmdxplora.naming import default_output_name
+
+    output = _Path(args.agent_output or default_output_name())
+    print(f"\nRunning setup, which determines the particle count "
+          f"({output})...")
+    staged = run_in_stages(config, output,
+                           budget_hours=float(args.budget_hours))
+
+    for note in staged.notes:
+        print(f"  {note}")
+
+    if staged.refusal is not None:
+        print(f"\n  ✗ {staged.refusal.message}")
+        if staged.setup_done:
+            print("\nSetup's output is kept, so a shorter study can reuse "
+                  "it with `setup_from`.")
+        return 1
+
+    print("\n  ✓ Ran within the budget.")
+    return 0
+
+
+def _choose_model() -> int:
+    """`fastmdx agent model` -- pick a provider and, optionally, store a key."""
+    from fastmdxplora.agent import (
+        PROVIDERS, ModelChoice, describe_choice, load_choice, save_choice,
+    )
+    from fastmdxplora.agent.models import default_model, list_models, save_cache_for
+
+    # What is in use first, so a look at the choice is not a change to it:
+    # nothing is saved unless an AI model is picked below.
+    if load_choice() is None:
+        print("No AI model chosen yet.\n")
+    else:
+        print("In use: " + describe_choice() + "\n")
+    names = list(PROVIDERS)
+    print("AI model:")
+    for index, name in enumerate(names, 1):
+        print(f"  [{index}] {PROVIDERS[name]['label']}")
+    try:
+        picked = names[int(input("> ").strip()) - 1]
+    except (ValueError, IndexError, EOFError, KeyboardInterrupt):
+        print("Nothing chosen.")
+        return 1
+
+    base_url = ""
+    if picked == "compatible":
+        print("\nAnything speaking the OpenAI chat shape. For example:")
+        for label, url, model in PROVIDERS[picked].get("examples", ()):
+            print(f"  {label:<16} {url:<34} AI model: {model}")
+        base_url = input("\nBase URL: ").strip()
+        if not base_url:
+            print("A base URL is needed for an OpenAI-compatible server.")
+            return 1
+
+    # The newest of the default's family the provider offers, where there
+    # is a key in the environment to ask it with; the written one otherwise.
+    try:
+        offered = list_models(ModelChoice(picked, "", base_url))
+    except Exception:  # noqa: BLE001 - the written default still works
+        offered = ()
+    suggested = default_model(picked, offered)
+    prompt = (f"AI model [{suggested}]: " if suggested else "AI model: ")
+    model = input(prompt).strip() or suggested
+    if not model:
+        print("An AI model name is needed.")
+        return 1
+
+    env_name = str(PROVIDERS[picked]["env"])
+    print(f"API key (leave blank to read {env_name} from the environment "
+          "instead):")
+    key = input("> ").strip()
+
+    cache = "auto"
+    if picked == "anthropic":
+        print("Keep the instructions in Anthropic's cache for [auto]: auto (an hour on "
+              "the Agent page, five minutes here), 1h or 5m. An hour costs twice the "
+              "input price to write instead of 1.25 times, and a reply after a pause "
+              "still reads them at a tenth.")
+        cache = input("> ").strip().lower() or "auto"
+        if cache not in ("auto", "1h", "5m"):
+            print(f"{cache!r} is not auto, 1h or 5m.")
+            return 1
+
+    where = save_choice(ModelChoice(picked, model, base_url), key=key)
+    save_cache_for(cache)
+    print(f"\n  ✓ Saved to {where}")
+    if key:
+        print("  ✓ Key stored there, readable only by you. It is never "
+              "written into a study.")
+    else:
+        print(f"  ✓ No key stored; {env_name} will be read at call time.")
     return 0
 
 
@@ -1236,16 +3821,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Initialize console logging on every CLI invocation. setup_console() is
     # idempotent (no duplicate handlers) and honors FASTMDX_LOG_STYLE /
     # FASTMDX_LOGLEVEL / NO_COLOR.
-    from fastmdxplora.utils.logging import setup_console
+    from fastmdxplora.utils.logging import own_the_console, setup_console
 
     setup_console()
+    # The CLI owns the terminal, so records are printed once by FastMDXplora's handler
+    # rather than also by whatever the root logger has. This used to happen
+    # inside setup_console, which meant the library path did it too and
+    # cut a caller's logging off from FastMDXplora for the rest of the session.
+    own_the_console()
 
     raw_argv = list(sys.argv[1:] if argv is None else argv)
 
     # Show the FastMDXplora identity as soon as the CLI starts. Keep version
     # and citation output machine-friendly; help and an empty invocation are
     # intentionally branded.
-    if not any(flag in raw_argv for flag in ("--version", "-V", "--cite")):
+    # Nor for `mcp`, whose standard output is the protocol's alone.
+    if (not any(flag in raw_argv for flag in ("--version", "-V", "--cite", "--json"))
+            and raw_argv[:1] != ["mcp"]):
         from fastmdxplora.utils.presenter import get_presenter
 
         dashboard_url, dashboard_enabled = _startup_dashboard_details(raw_argv)
@@ -1253,6 +3845,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             dashboard_url=dashboard_url,
             dashboard_enabled=dashboard_enabled,
         )
+
+    if raw_argv[:1] == ["init-config"]:
+        # The old name wrote a template too. It stops rather than guesses
+        # what its -o meant now, and says where the command went.
+        print("fastmdx: `fastmdx init-config` is now `fastmdx config` "
+              "(`-o FILE` is now `-f FILE`).", file=sys.stderr)
+        return 2
 
     parser = _build_parser()
     args = parser.parse_args(raw_argv)
@@ -1267,25 +3866,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command is None:
         return _cmd_dashboard_home()
 
-    # Setup and simulation phases already handle missing optional chemistry
-    # dependencies gracefully by recording the skipped work in their manifests.
-    # Do not abort the CLI here: doing so prevents setup-only/config workflows
-    # and the test matrix from exercising that documented fallback behavior.
+    # No chemistry preflight here, deliberately. Setup and simulation handle
+    # missing optional dependencies by recording the skipped work in their
+    # manifests, and aborting here would prevent setup-only and config-only
+    # workflows -- and stop the test matrix exercising that fallback at all.
+    #
+    # Two functions used to sit further down this file implementing the other
+    # policy, `_needs_chemistry` and `_missing_chemistry_backends`. They had
+    # no caller once this decision was taken, `_needs_chemistry` referenced a
+    # `_CHEMISTRY_PHASES` that was never defined -- so calling it raised
+    # NameError -- and `tests/conftest.py` carried an autouse fixture
+    # neutralising the second of them for all 3,171 tests. All three are
+    # removed. The decision is here, in one place, and nothing half-implements
+    # its opposite. If the fail-fast policy is wanted instead, it is a change
+    # to this comment and a call on the next line, not a resurrection.
 
-    if args.command == "init-config":
-        return _cmd_init_config(args)
-    if args.command == "dashboard":
-        return _cmd_dashboard(args)
+    if args.command == "agent":
+        return _run_agent(args)
 
-    if args.command == "health":
-        return _cmd_health(args)
-
-    if args.command == "install":
-        return _cmd_bootstrap(args, editable=False, package_name=".")
-    if args.command == "bootstrap":
-        return _cmd_bootstrap(args, editable=False, package_name=".")
-    if args.command == "install-e":
-        return _cmd_bootstrap(args, editable=True, package_name=".")
+    if args.command == "config":
+        return _cmd_config(args)
+    if args.command == "gui":
+        return _cmd_gui(args)
+    if args.command == "resume":
+        return _cmd_resume(args)
+    if args.command == "mcp":
+        return _cmd_mcp(args)
 
     # Commands that build an orchestrator can hit config-file errors;
     # surface those cleanly rather than as a traceback.
@@ -1297,9 +3903,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command in ("setup", "simulate", "analyze", "report"):
             return _cmd_phase(args.command, args)
         if args.command == "info":
-            return _cmd_info()
+            return _cmd_info(args)
+        if args.command == "select":
+            return _cmd_select(args)
+        if args.command == "diff":
+            return _cmd_diff(args)
+        if args.command == "scene":
+            return _cmd_scene(args)
+        if args.command == "movie":
+            return _cmd_movie(args)
+        if args.command == "remote":
+            return _cmd_remote(args)
     except ConfigError as exc:
         print(f"fastmdx: config error: {exc}", file=sys.stderr)
+        return 2
+    except (RuntimeError, ValueError) as exc:
+        # A study that stops before it starts says so once. These carry a
+        # written explanation -- a selection matching no atoms, a system that
+        # could not be prepared -- and the stack behind them names batch and
+        # setup internals, which is forty lines telling the reader nothing
+        # they can act on. The traceback is still available by raising the
+        # logging level; what a user needs is the sentence.
+        print(f"fastmdx: {exc}", file=sys.stderr)
+        logger.debug("stopping after %s", type(exc).__name__, exc_info=True)
+        return 1
+    except FileExistsError as exc:
+        # Refusing to overwrite a previous run is a decision, not a crash:
+        # said plainly, with what to do about it, and no traceback.
+        print(f"fastmdx: {exc}", file=sys.stderr)
         return 2
 
     parser.print_help()

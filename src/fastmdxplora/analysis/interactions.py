@@ -1,0 +1,1338 @@
+"""What holds a ligand in place, one interaction type at a time.
+
+Counting contacts says how much of the protein the ligand touches. It does not
+say what is holding it: a salt bridge that a charge change would destroy, or
+hydrophobic packing that tolerates one. That difference is what a medicinal
+chemist is asking, and it is the difference between counting and describing.
+
+Each rule here is implemented against a published criterion, named in its own
+docstring, and the thresholds are settings rather than constants -- because the
+published values disagree, and a reader should be able to see which was used.
+Where a widely-used tool departs from the literature, the departure is recorded
+rather than quietly adopted.
+
+Geometry only. Which atoms can take part is chemistry, and that is settled
+before this runs: see ``ligand_chemistry``, which also records how confidently.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+from fastmdxplora.refusals import StudyError
+
+__all__ = [
+    "Contact",
+    "HBOND_LIGAND_DONOR",
+    "HBOND_PROTEIN_DONOR",
+    "hydrogen_bonds",
+    "hydrophobic_contacts",
+    "salt_bridges",
+    "donors_and_acceptors",
+    "hydrophobic_atoms",
+    "protein_charged_groups",
+    "ligand_charged_groups",
+    "pi_stacking",
+    "pi_cation",
+    "protein_aromatic_rings",
+    "ligand_aromatic_rings",
+    "halogen_bonds",
+    "metal_coordination",
+    "metal_ions",
+    "water_bridges",
+    "residues_not_covered",
+]
+
+
+#: The hydrogen-bond criterion :func:`hydrogen_bonds` applies, by name.
+HBOND_CRITERION = ("donor-acceptor distance < 3.5 A and D-H...A angle > 120 deg "
+                   "(a common heavy-atom criterion, with ProLIF's distance)")
+
+#: The two directions of a hydrogen bond, as the kind of its contact.
+HBOND_LIGAND_DONOR = "hydrogen_bond_ligand_donor"
+HBOND_PROTEIN_DONOR = "hydrogen_bond_protein_donor"
+
+
+#: Halogens with a positive sigma-hole when bound to carbon, which is what
+#: makes a halogen bond possible.
+#:
+#: Fluorine is left out, and this is a place where two widely used tools
+#: disagree. PLIP counts "all fluorine, chlorine, bromide or iodine atoms
+#: connected to a carbon atom" as donors; ProLIF's pattern admits only Cl, Br,
+#: I and At. The literature is with ProLIF for the case that matters here:
+#: Politzer and co-workers attribute fluorine's "failure to halogen bond" to
+#: its high electronegativity and sp hybridisation, which neutralise the
+#: sigma-hole, and organic fluorine bound to carbon "typically has negative
+#: sigma-holes and is unlikely to participate".
+#:
+#: Fluorine can halogen bond when attached to something strongly
+#: electron-withdrawing -- F2, ClF, FCN -- but that is not a C-F in a drug
+#: molecule. Set ``include_fluorine`` to count it and match PLIP.
+_HALOGENS = ("Cl", "Br", "I")
+
+#: Metals PLIP considers, which is the union of what turns up in deposited
+#: structures. Kept as a set rather than "anything not organic", because a
+#: silicon or a selenium is not a metal centre and would be coordinated by
+#: nothing.
+_METALS = frozenset({
+    "LI", "NA", "K", "RB", "CS", "MG", "CA", "SR", "BA", "SC", "TI", "V",
+    "CR", "MN", "FE", "CO", "NI", "CU", "ZN", "Y", "ZR", "NB", "MO", "TC",
+    "RU", "RH", "PD", "AG", "CD", "LA", "HF", "TA", "W", "RE", "OS", "IR",
+    "PT", "AU", "HG", "AL", "GA", "IN", "SN", "TL", "PB", "BI", "CE", "PR",
+    "ND", "SM", "EU", "GD", "TB", "DY", "HO", "ER", "TM", "YB", "LU", "U",
+})
+
+
+#: Aromatic side chains, by the atoms of each ring. Known, like the charges:
+#: a phenylalanine's ring is a phenylalanine's ring. Tryptophan has two, fused,
+#: and they are kept apart because a stacking partner sits over one or the
+#: other and the centre of the pair is over neither.
+#: An imidazole is aromatic whatever the force field calls the residue.
+#: AMBER writes HIE/HID/HIP and CHARMM writes HSE/HSD/HSP for the same ring,
+#: with the same heavy-atom names, and keying on "HIS" alone meant a
+#: prepared system lost every histidine ring it had -- silently, because the
+#: variants were also on the "nothing to contribute" list below.
+_IMIDAZOLE = (("CG", "ND1", "CD2", "CE1", "NE2"),)
+_HISTIDINES = ("HIS", "HIE", "HID", "HIP", "HSD", "HSE", "HSP")
+
+_AROMATIC_RINGS = {
+    "PHE": (("CG", "CD1", "CD2", "CE1", "CE2", "CZ"),),
+    "TYR": (("CG", "CD1", "CD2", "CE1", "CE2", "CZ"),),
+    "TRP": (("CG", "CD1", "CD2", "NE1", "CE2"),
+            ("CD2", "CE2", "CE3", "CZ2", "CZ3", "CH2")),
+    **{name: _IMIDAZOLE for name in _HISTIDINES},
+}
+
+
+#: Charged side chains, by the atoms that carry the charge, keyed by the
+#: residue family rather than by one residue name.
+#:
+#: The name does not say the charge. OpenMM and PDBFixer write every
+#: protonation variant under its parent's name: a histidine with both HD1
+#: and HE2 is still HIS, an aspartate carrying HD2 is still ASP, and a
+#: lysine with two hydrogens on NZ is still LYS. Keyed on the name, a
+#: doubly protonated histidine was never a cation, a neutral lysine was
+#: always one, and a protonated aspartate was an anion. Which hydrogens
+#: are present is the decision the setup phase made at the simulated pH,
+#: so that is what is read; see :func:`_charge_from_hydrogens`.
+_CHARGE_FAMILIES: dict[str, str] = {
+    **{name: "HIS" for name in ("HIS", "HIE", "HID", "HIP", "HSD", "HSE",
+                                "HSP", "HISD", "HISE", "HISH", "HSH")},
+    **{name: "ASP" for name in ("ASP", "ASH", "ASPH", "ASPP")},
+    **{name: "GLU" for name in ("GLU", "GLH", "GLUH", "GLUP")},
+    **{name: "LYS" for name in ("LYS", "LYN", "LSN", "LYSN")},
+    **{name: "ARG" for name in ("ARG", "ARN")},
+}
+
+#: The atoms each family's charge sits on, and its sign when charged.
+_CHARGED_ATOMS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "ARG": ("+", ("NH1", "NH2", "NE")),
+    "LYS": ("+", ("NZ",)),
+    "HIS": ("+", ("ND1", "NE2")),
+    "ASP": ("-", ("OD1", "OD2")),
+    "GLU": ("-", ("OE1", "OE2")),
+}
+
+#: For a residue that carries no hydrogens at all, the name is all there
+#: is, and the names that state a charge are these.
+_CHARGED_BY_NAME = frozenset({
+    "ARG", "LYS", "HIP", "HSP", "HISH", "HSH", "ASP", "GLU",
+})
+
+
+def _charge_from_hydrogens(family: str, hydrogens: set[str]) -> bool:
+    """Whether a residue of ``family`` is charged, from its hydrogen names.
+
+    Histidine is a cation only with both HD1 and HE2; aspartate an anion
+    only with neither HD1 nor HD2 on its carboxylate, glutamate only with
+    neither HE1 nor HE2; lysine a cation only with all of HZ1, HZ2 and HZ3;
+    arginine a cation unless one of HE, HH11, HH12, HH21, HH22 is missing,
+    which is how a neutral arginine (ARN) is written.
+    """
+    if family == "HIS":
+        return {"HD1", "HE2"} <= hydrogens
+    if family == "ASP":
+        return not hydrogens & {"HD1", "HD2"}
+    if family == "GLU":
+        return not hydrogens & {"HE1", "HE2"}
+    if family == "LYS":
+        return {"HZ1", "HZ2", "HZ3"} <= hydrogens
+    if family == "ARG":
+        return {"HE", "HH11", "HH12", "HH21", "HH22"} <= hydrogens
+    return False
+
+
+#: Elements that donate and accept hydrogen bonds. Carbon is excluded: C-H
+#: donors exist and are real, but they are weak enough that including them
+#: swamps the count, which is the same reason every tool surveyed leaves them
+#: out.
+_POLAR = frozenset({"N", "O", "S"})
+
+#: Protein nitrogens whose lone pair is in an amide or a conjugated cation,
+#: by residue family and atom name, so they are not acceptors whether or not
+#: the topology carries their hydrogens. The backbone N is every residue's.
+_NOT_ACCEPTING_N = {
+    "ASN": {"ND2"}, "GLN": {"NE2"}, "TRP": {"NE1"},
+    "ARG": {"NE", "NH1", "NH2"}, "ARN": {"NE", "NH1", "NH2"},
+}
+
+
+@dataclass(frozen=True)
+class Contact:
+    """One interaction, in one frame."""
+
+    kind: str
+    frame: int
+    #: Atom indices into the trajectory, ligand side first.
+    ligand_atom: int
+    protein_atom: int
+    distance_nm: float
+    #: Set where the rule has one; None where it does not.
+    angle_deg: float | None = None
+
+
+def _accepts(atom: Any, neighbours: list[Any], degree: dict[int, int],
+             positive: set[int]) -> bool:
+    """Whether a nitrogen, oxygen or sulphur has a lone pair free to accept.
+
+    Oxygen always does. Sulphur does when it has at most two heavy
+    neighbours and no hydrogen: Met SD and a disulfide or thiolate Cys SG
+    accept weakly, a sulfoxide, sulfone or sulfonamide S does not, and
+    neither does a thiol. A nitrogen accepts when its lone pair is neither
+    bonded nor delocalised:
+
+    * not with four bonds (ammonium, quaternary N, N-oxide), and not in a
+      charged protein group (Lys NZ, Arg, a doubly protonated His);
+    * not the protein backbone N, nor Asn ND2, Gln NE2, Trp NE1 or the
+      arginine nitrogens, which are amides or conjugated;
+    * with three neighbours, only as an amine: every heavy neighbour an sp3
+      carbon (four bonds). That keeps a neutral lysine's NZ and a
+      morpholine N and leaves out amide, aniline, pyrrole, amidinium,
+      sulfonamide and nitro nitrogens, which is ProLIF's acceptor
+      definition for nitrogen read from bonds rather than bond orders.
+
+    One or two neighbours (a nitrile, a pyridine or imine N, a deprotonated
+    imidazole N) accepts.
+    """
+    element = atom.element.symbol
+    if element == "O":
+        return True
+    heavy = [n for n in neighbours if n.element is None or n.element.symbol != "H"]
+    hydrogens = len(neighbours) - len(heavy)
+    if element == "S":
+        return len(heavy) <= 2 and hydrogens == 0
+    # Nitrogen.
+    if len(neighbours) >= 4 or atom.index in positive:
+        return False
+    residue = atom.residue
+    if residue.is_protein:
+        if atom.name == "N":
+            return False
+        family = _CHARGE_FAMILIES.get(residue.name.upper(), residue.name.upper())
+        if atom.name in _NOT_ACCEPTING_N.get(family, ()):
+            return False
+    if len(neighbours) <= 2:
+        return True
+    return all(n.element is not None and n.element.symbol == "C"
+               and degree.get(n.index, 0) >= 4 for n in heavy)
+
+
+def donors_and_acceptors(
+    topology: Any, atom_indices: Any
+) -> tuple[list[tuple[int, int]], list[int]]:
+    """Which atoms can donate a hydrogen bond, and which can accept one.
+
+    A donor is a nitrogen, oxygen or sulphur with a hydrogen bonded to it,
+    which with explicit hydrogens present needs no perception: the hydrogen
+    is either bonded to the nitrogen or it is not.
+
+    An acceptor is an oxygen, or a nitrogen or sulphur with a lone pair free
+    to accept, decided from the bonds as :func:`_accepts` sets out. Every N
+    and S used to be taken, so an ammonium nitrogen, a lysine NZ with three
+    hydrogens and every backbone amide N were acceptors, and a ligand NH3+
+    pointed at a lysine NZ was reported as a hydrogen bond between two
+    cations.
+
+    Returns donors as ``(heavy, hydrogen)`` pairs, because the angle is
+    measured at the hydrogen and a nitrogen with two hydrogens can donate
+    twice.
+    """
+    wanted = set(int(i) for i in atom_indices)
+    atoms = list(topology.atoms)
+
+    attached: dict[int, list[int]] = {}
+    neighbours: dict[int, list[Any]] = {}
+    for bond in topology.bonds:
+        first, second = bond[0], bond[1]
+        neighbours.setdefault(first.index, []).append(second)
+        neighbours.setdefault(second.index, []).append(first)
+        for heavy, light in ((first, second), (second, first)):
+            if light.element is not None and light.element.symbol == "H":
+                attached.setdefault(heavy.index, []).append(light.index)
+    degree = {index: len(around) for index, around in neighbours.items()}
+    positive = {i for group in protein_charged_groups(topology, wanted)[0]
+                for i in group}
+
+    # A hydrogen bonded to nothing is the signal that connectivity is missing.
+    # A hydrogen bonded to a carbon is not: that is an ordinary non-polar
+    # hydrogen, and a selection made only of those legitimately cannot donate.
+    donors: list[tuple[int, int]] = []
+    acceptors: list[int] = []
+    orphan_hydrogens = 0
+    for atom in atoms:
+        if atom.index not in wanted:
+            continue
+        element = atom.element.symbol if atom.element is not None else ""
+        if element == "H":
+            if atom.index not in neighbours:
+                orphan_hydrogens += 1
+            continue
+        if element not in _POLAR:
+            continue
+        if _accepts(atom, neighbours.get(atom.index, []), degree, positive):
+            acceptors.append(atom.index)
+        for hydrogen in attached.get(atom.index, ()):
+            donors.append((atom.index, hydrogen))
+
+    # A selection whose hydrogens are bonded to nothing cannot be seen to
+    # donate, only to accept, and the count would report one direction as
+    # though it were both. This is not hypothetical: renaming a residue in a
+    # PDB is enough to lose its standard bonds, and a ligand deposited without
+    # CONECT records arrives the same way. Saying so beats returning zero.
+    if orphan_hydrogens:
+        raise StudyError(
+            f"{orphan_hydrogens} hydrogen(s) in this selection are bonded to "
+            "nothing, so it cannot be seen to donate a hydrogen bond -- only "
+            "to accept one. "
+            "Counting under those conditions would report one direction as "
+            "though it were both. Give a topology that carries the "
+            "connectivity: a PDB with CONECT records, or the topology the "
+            "setup phase writes."
+        , code="analysis.system.inapplicable")
+    return donors, acceptors
+
+
+def hydrophobic_atoms(topology: Any, atom_indices: Any) -> list[int]:
+    """Carbons whose only neighbours are carbon or hydrogen.
+
+    The criterion PLIP states and ProLIF's SMARTS encodes. A carbon bonded to
+    nitrogen, oxygen or fluorine is polarised enough that treating it as
+    hydrophobic would count a polar contact twice -- once here and once as a
+    hydrogen bond.
+    """
+    wanted = set(int(i) for i in atom_indices)
+    neighbours: dict[int, set[str]] = {}
+    for bond in topology.bonds:
+        first, second = bond[0], bond[1]
+        for atom, other in ((first, second), (second, first)):
+            symbol = other.element.symbol if other.element is not None else ""
+            neighbours.setdefault(atom.index, set()).add(symbol)
+
+    found = []
+    for atom in topology.atoms:
+        if atom.index not in wanted:
+            continue
+        if atom.element is None or atom.element.symbol != "C":
+            continue
+        around = neighbours.get(atom.index, set())
+        if around and around <= {"C", "H"}:
+            found.append(atom.index)
+    return found
+
+
+def _angles(traj: Any, triples: Any, periodic: bool) -> np.ndarray:
+    import mdtraj as md
+
+    if len(triples) == 0:
+        return np.zeros((traj.n_frames, 0))
+    return np.rad2deg(md.compute_angles(traj, triples, periodic=periodic))
+
+
+def _distances(traj: Any, pairs: Any, periodic: bool) -> np.ndarray:
+    import mdtraj as md
+
+    if len(pairs) == 0:
+        return np.zeros((traj.n_frames, 0))
+    return md.compute_distances(traj, pairs, periodic=periodic)
+
+
+def hydrogen_bonds(
+    traj: Any,
+    ligand_indices: Any,
+    protein_indices: Any,
+    *,
+    distance_nm: float = 0.35,
+    angle_deg: float = 120.0,
+    periodic: bool = True,
+) -> list[Contact]:
+    """Hydrogen bonds between ligand and protein, in every frame.
+
+    The criterion: donor heavy atom to acceptor within 3.5 A, and the
+    donor-hydrogen-acceptor angle above 120 degrees: a common heavy-atom
+    criterion, with ProLIF's distance. It is not McDonald and Thornton's
+    HBPLUS (J Mol Biol 238:777, 1994), whose limits are wider (D-A 3.9 A,
+    H-A 2.5 A, angles above 90 degrees), and an earlier version attributed
+    it to them. Nor is it Baker and Hubbard's (Prog Biophys Mol Biol 44:97,
+    1984), which bounds the hydrogen to acceptor distance at 2.5 A; that is
+    the ``hbonds`` analysis's default. ``pl_hbonds`` uses a third,
+    Wernet-Nilsson's angle-dependent distance. The three are recorded by
+    name in each analysis's options, because they do not count the same
+    bonds: an O-H...O at 3.3 A between the oxygens and 180 degrees is a bond
+    here and not under Wernet-Nilsson.
+
+    PLIP uses 4.1 A and 100 degrees, which it says is deliberate -- refined
+    against low-resolution crystal structures where hydrogen positions are not
+    known. That reasoning does not apply here: these frames have hydrogens
+    placed by the force field, so the angle is measured rather than inferred,
+    and the stricter criterion is the one the measurement supports. PLIP's
+    values remain reachable by setting them.
+
+    Both directions are found: the ligand donating to the protein and the
+    protein donating to the ligand are different interactions, and a ligand
+    that can only accept is a fact about the ligand worth seeing. So the
+    direction is in the kind, ``hydrogen_bond_ligand_donor`` or
+    ``hydrogen_bond_protein_donor``: with one kind for both, a ligand O-H
+    donating to a serine OG and the serine's OG-H donating back joined the
+    same two heavy atoms and were one row present in both frames, which
+    reported a bond held throughout where its direction had reversed.
+    """
+    ligand_donors, ligand_acceptors = donors_and_acceptors(
+        traj.topology, ligand_indices)
+    protein_donors, protein_acceptors = donors_and_acceptors(
+        traj.topology, protein_indices)
+
+    triples: list[tuple[int, int, int]] = []
+    pairs: list[tuple[int, int]] = []
+    sides: list[tuple[int, int]] = []      # (ligand atom, protein atom)
+    kinds: list[str] = []
+    for heavy, hydrogen in ligand_donors:
+        for acceptor in protein_acceptors:
+            triples.append((heavy, hydrogen, acceptor))
+            pairs.append((heavy, acceptor))
+            sides.append((heavy, acceptor))
+            kinds.append(HBOND_LIGAND_DONOR)
+    for heavy, hydrogen in protein_donors:
+        for acceptor in ligand_acceptors:
+            triples.append((heavy, hydrogen, acceptor))
+            pairs.append((heavy, acceptor))
+            sides.append((acceptor, heavy))
+            kinds.append(HBOND_PROTEIN_DONOR)
+
+    if not triples:
+        return []
+
+    separations = _distances(traj, np.array(pairs), periodic)
+    openings = _angles(traj, np.array(triples), periodic)
+    close_enough = separations < distance_nm
+    straight_enough = openings > angle_deg
+
+    found: list[Contact] = []
+    for frame, column in zip(*np.where(close_enough & straight_enough)):
+        ligand_atom, protein_atom = sides[column]
+        found.append(Contact(
+            kind=kinds[column],
+            frame=int(frame),
+            ligand_atom=int(ligand_atom),
+            protein_atom=int(protein_atom),
+            distance_nm=float(separations[frame, column]),
+            angle_deg=float(openings[frame, column]),
+        ))
+    return found
+
+
+def hydrophobic_contacts(
+    traj: Any,
+    ligand_indices: Any,
+    protein_indices: Any,
+    *,
+    distance_nm: float = 0.40,
+    periodic: bool = True,
+) -> list[Contact]:
+    """Hydrophobic contacts between ligand and protein, in every frame.
+
+    A pair of hydrophobic carbons within 4.0 A, which is PLIP's threshold;
+    ProLIF uses 4.5 A. There is no angle: hydrophobic association is entropic
+    rather than directional, so there is no geometry to require, which is why
+    every tool uses a distance alone and a generous one.
+
+    The count is large by nature -- PLIP notes it can exceed every other type
+    combined -- so it is reported per atom pair and left to the caller to
+    reduce. Reducing here would bake in one view of which contact represents a
+    residue, and the reduction PLIP applies is one choice among several.
+    """
+    ligand_carbons = hydrophobic_atoms(traj.topology, ligand_indices)
+    protein_carbons = hydrophobic_atoms(traj.topology, protein_indices)
+    if not ligand_carbons or not protein_carbons:
+        return []
+
+    pairs = [(a, b) for a in ligand_carbons for b in protein_carbons]
+    separations = _distances(traj, np.array(pairs), periodic)
+
+    found: list[Contact] = []
+    for frame, column in zip(*np.where(separations < distance_nm)):
+        ligand_atom, protein_atom = pairs[column]
+        found.append(Contact(
+            kind="hydrophobic",
+            frame=int(frame),
+            ligand_atom=int(ligand_atom),
+            protein_atom=int(protein_atom),
+            distance_nm=float(separations[frame, column]),
+        ))
+    return found
+
+
+def protein_charged_groups(
+    topology: Any, atom_indices: Any
+) -> tuple[list[list[int]], list[list[int]]]:
+    """Charged side chains, as groups of atoms rather than single atoms.
+
+    A carboxylate's charge is shared between two oxygens and a guanidinium's
+    across three nitrogens, so the distance that matters is to the group's
+    centre, not to whichever atom happens to be nearest. Measuring to the
+    nearest atom would make the same salt bridge look shorter from one side
+    than the other.
+
+    Whether a residue is charged is read from the hydrogens it carries,
+    because the residue name does not say it (see ``_CHARGE_FAMILIES``).
+    Only a residue with no hydrogens at all falls back to its name: ARG,
+    LYS, HIP, HSP, ASP and GLU are charged, ASH, GLH, LYN and HID are not.
+    """
+    wanted = set(int(i) for i in atom_indices)
+    positive: list[list[int]] = []
+    negative: list[list[int]] = []
+
+    for residue in topology.residues:
+        names = {a.name: a.index for a in residue.atoms if a.index in wanted}
+        if not names:
+            continue
+        family = _CHARGE_FAMILIES.get(residue.name.upper())
+        if family is None:
+            continue
+        # The whole residue's hydrogens, not only those selected: the charge
+        # is a property of the residue, and a heavy-atom selection should
+        # not turn every histidine into one carrying no protons.
+        hydrogens = {a.name.upper() for a in residue.atoms
+                     if a.element is not None and a.element.symbol == "H"}
+        charged = (_charge_from_hydrogens(family, hydrogens) if hydrogens
+                   else residue.name.upper() in _CHARGED_BY_NAME)
+        if not charged:
+            continue
+        sign, wanted_names = _CHARGED_ATOMS[family]
+        group = [names[n] for n in wanted_names if n in names]
+        # A side chain missing half its charged atoms is a truncated
+        # residue, and its centre would be somewhere the charge is not.
+        if len(group) == len(wanted_names):
+            (positive if sign == "+" else negative).append(group)
+    return positive, negative
+
+
+def ligand_charged_groups(
+    chemistry: Any, atom_indices: Any
+) -> tuple[list[list[int]], list[list[int]]]:
+    """Charged groups on the ligand, from its resolved chemistry.
+
+    Formal charges come from the chemistry, not from the coordinates, which is
+    why it has to be resolved first. A carboxylate carries -1 across two
+    oxygens whichever one the file happens to mark, so the charge is spread
+    over the group it is delocalised across.
+
+    A group is charged only where its atoms carry a net formal charge of its
+    sign. The guanidine pattern also matches cyanoguanidine (the cimetidine
+    core) and an acylguanidine as written neutral, and both were cations. A
+    formal charge on one atom bonded to an atom of the opposite charge is a
+    way of writing a neutral group, not an ion: nitro N+ and O-, an N-oxide,
+    an azide. Those pairs are left out, where each half had been a charged
+    group of its own and a nitrobenzene formed salt bridges from both ends.
+    """
+    from rdkit import Chem
+
+    mol = chemistry.mol
+    order = list(int(i) for i in atom_indices)
+
+    positive: list[list[int]] = []
+    negative: list[list[int]] = []
+
+    #: Delocalised groups, so the centre is the group's rather than one atom's.
+    #: The atoms kept are the ones the charge is on, not every atom the
+    #: pattern matched: a carboxylate's charge sits across its two oxygens and
+    #: not on the carbon between them, and including the carbon would put the
+    #: centre a third of a bond length off in the direction of the molecule.
+    patterns = (
+        ("-", Chem.MolFromSmarts("C(=[OX1])[OX1H0-]"), ("O",)),
+        ("-", Chem.MolFromSmarts("[PX4,SX4](=[OX1])[OX1H0-]"), ("O",)),
+        ("+", Chem.MolFromSmarts("[NX3][CX3](=[NX2,NX3+])[NX3]"), ("N",)),
+        ("+", Chem.MolFromSmarts("[NX3][CX3]=[NX3+]"), ("N",)),
+    )
+    claimed: set[int] = set()
+    for sign, pattern, elements in patterns:
+        if pattern is None:
+            continue
+        for match in mol.GetSubstructMatches(pattern):
+            net = sum(mol.GetAtomWithIdx(i).GetFormalCharge() for i in match)
+            if (net > 0) != (sign == "+") or net == 0:
+                continue
+            group = [
+                order[i] for i in match
+                if i < len(order) and mol.GetAtomWithIdx(i).GetSymbol() in elements
+            ]
+            if not group or claimed.intersection(group):
+                continue
+            claimed.update(group)
+            (positive if sign == "+" else negative).append(group)
+
+    # Anything left carrying a formal charge stands on its own.
+    for atom in mol.GetAtoms():
+        index = atom.GetIdx()
+        if index >= len(order) or index in claimed:
+            continue
+        charge = atom.GetFormalCharge()
+        if charge and any(neighbour.GetFormalCharge() * charge < 0
+                          for neighbour in atom.GetNeighbors()):
+            continue
+        if charge > 0:
+            positive.append([order[index]])
+        elif charge < 0:
+            negative.append([order[index]])
+    return positive, negative
+
+
+def _has_box(traj: Any) -> bool:
+    return getattr(traj, "unitcell_vectors", None) is not None
+
+
+def _group_centres(traj: Any, groups: Any, periodic: bool = True) -> np.ndarray:
+    """One position per charged group, per frame, with the group made whole.
+
+    A group straddling a periodic face has atoms a box length apart in the
+    stored coordinates, so their mean lands in the middle of the box where no
+    atom is. Rebuilt around the group's first atom using minimum-image
+    displacements, which mdtraj computes correctly for triclinic cells --
+    hand-rolled fractional rounding does not, as the ligand_rmsd work found
+    the expensive way.
+    """
+    if not groups:
+        return np.zeros((traj.n_frames, 0, 3))
+    if not periodic or not _has_box(traj):
+        return np.stack(
+            [traj.xyz[:, np.array(group), :].mean(axis=1) for group in groups],
+            axis=1,
+        )
+    import mdtraj as md
+
+    centres = []
+    for group in groups:
+        members = np.asarray(group, dtype=int)
+        anchor = int(members[0])
+        pairs = np.column_stack(
+            [np.full(len(members), anchor, dtype=int), members])
+        offsets = md.compute_displacements(traj, pairs, periodic=True)
+        centres.append(traj.xyz[:, anchor, :] + offsets.mean(axis=1))
+    return np.stack(centres, axis=1)
+
+
+def _between(
+    traj: Any,
+    from_groups: Any,
+    from_centres: np.ndarray,
+    to_groups: Any,
+    to_centres: np.ndarray,
+    periodic: bool = True,
+) -> np.ndarray:
+    """Minimum-image vector from each `from` centre to each `to` centre.
+
+    Shape ``(n_frames, n_from, n_to, 3)``.
+
+    A centre is not an atom, so mdtraj cannot image it directly. Each centre
+    does sit a short way from its own group's anchor atom, and mdtraj images
+    anchor to anchor exactly, triclinic cells included; adding the two small
+    within-group offsets to that exact vector gives the separation under the
+    minimum image. Valid whenever the true separation is well inside half the
+    box, which every criterion in this module is at 3 to 6 A.
+
+    Without this, six of the eight rules measured raw Cartesian separation:
+    a ligand and a residue 1.5 A apart through a box face read as the width
+    of the box, and the contact was silently absent from the table.
+    """
+    if (not periodic or not _has_box(traj)
+            or not len(from_groups) or not len(to_groups)):
+        return to_centres[:, None, :, :] - from_centres[:, :, None, :]
+
+    import mdtraj as md
+
+    from_anchor = np.array([int(g[0]) for g in from_groups], dtype=int)
+    to_anchor = np.array([int(g[0]) for g in to_groups], dtype=int)
+    pairs = np.array(
+        [[i, j] for i in from_anchor for j in to_anchor], dtype=int)
+    imaged = md.compute_displacements(traj, pairs, periodic=True).reshape(
+        traj.n_frames, len(from_anchor), len(to_anchor), 3)
+
+    from_offset = from_centres - traj.xyz[:, from_anchor, :]
+    to_offset = to_centres - traj.xyz[:, to_anchor, :]
+    return imaged + to_offset[:, None, :, :] - from_offset[:, :, None, :]
+
+
+def salt_bridges(
+    traj: Any,
+    chemistry: Any,
+    ligand_indices: Any,
+    protein_indices: Any,
+    *,
+    distance_nm: float = 0.45,
+    allow_ambiguous_charge: bool = False,
+    periodic: bool = True,
+) -> list[Contact]:
+    """Salt bridges between ligand and protein, in every frame.
+
+    Opposite charges within 4.5 A, which is ProLIF's threshold; PLIP uses
+    5.5 A. There is no angle: the interaction is electrostatic and has no
+    preferred direction, which is why every tool surveyed uses a distance
+    alone.
+
+    Refuses where the ligand's charge was not determined. A salt bridge is a
+    claim about charge, and the charge is exactly what perception from
+    coordinates is worst at: guanidinium is +1, and -1 also balances, so a
+    guessed charge can make a cation look like an anion and invent the bridge
+    it was supposed to detect. Where the chemistry was resolved rather than
+    perceived this does not arise; where it was not, state the charge or pass
+    ``allow_ambiguous_charge`` knowing what it means.
+    """
+    if getattr(chemistry, "charge_was_ambiguous", False) and not allow_ambiguous_charge:
+        raise StudyError(
+            f"The net charge of {chemistry.resname!r} was not determined -- "
+            f"{chemistry.detail}. A salt bridge is a claim about charge, and "
+            "reporting one computed from a charge that was guessed would be "
+            "asserting more than is known. State the ligand's net charge, or "
+            "supply its chemistry as an SDF."
+        , code="setup.chemistry.charge_undetermined")
+
+    ligand_positive, ligand_negative = ligand_charged_groups(
+        chemistry, ligand_indices)
+    protein_positive, protein_negative = protein_charged_groups(
+        traj.topology, protein_indices)
+
+    found: list[Contact] = []
+    for ligand_groups, protein_groups in ((ligand_positive, protein_negative),
+                                          (ligand_negative, protein_positive)):
+        if not ligand_groups or not protein_groups:
+            continue
+        ligand_centres = _group_centres(traj, ligand_groups, periodic)
+        protein_centres = _group_centres(traj, protein_groups, periodic)
+        separations = np.linalg.norm(
+            _between(traj, ligand_groups, ligand_centres,
+                     protein_groups, protein_centres, periodic),
+            axis=-1,
+        )
+        for frame, first, second in zip(*np.where(separations < distance_nm)):
+            found.append(Contact(
+                kind="salt_bridge",
+                frame=int(frame),
+                ligand_atom=int(ligand_groups[first][0]),
+                protein_atom=int(protein_groups[second][0]),
+                distance_nm=float(separations[frame, first, second]),
+            ))
+    return found
+
+
+def protein_aromatic_rings(
+    topology: Any, atom_indices: Any
+) -> list[list[int]]:
+    """Aromatic rings in the protein, from the residues that have them."""
+    wanted = set(int(i) for i in atom_indices)
+    rings: list[list[int]] = []
+    for residue in topology.residues:
+        for names in _AROMATIC_RINGS.get(residue.name, ()):
+            found = {a.name: a.index for a in residue.atoms if a.index in wanted}
+            ring = [found[n] for n in names if n in found]
+            # A ring missing an atom has no well-defined plane, and fitting one
+            # to what is left would put the normal somewhere the ring is not.
+            if len(ring) == len(names):
+                rings.append(ring)
+    return rings
+
+
+def ligand_aromatic_rings(chemistry: Any, atom_indices: Any) -> list[list[int]]:
+    """Aromatic rings in the ligand, from its resolved chemistry.
+
+    Aromaticity is a chemical fact rather than a geometric one -- a flat ring
+    of carbons is not necessarily aromatic -- so it comes from the chemistry,
+    which is why that has to be resolved first.
+    """
+    order = list(int(i) for i in atom_indices)
+    mol = chemistry.mol
+    rings: list[list[int]] = []
+    for ring in mol.GetRingInfo().AtomRings():
+        if all(mol.GetAtomWithIdx(i).GetIsAromatic() for i in ring):
+            mapped = [order[i] for i in ring if i < len(order)]
+            if len(mapped) == len(ring):
+                rings.append(mapped)
+    return rings
+
+
+def _ring_geometry(
+    traj: Any, rings: Any, periodic: bool = True
+) -> tuple[np.ndarray, np.ndarray]:
+    """Each ring's centre and the unit normal to its plane, per frame.
+
+    Made whole across the box first, for the reason `_group_centres` gives:
+    a ring split across a face has no meaningful centroid, and its fitted
+    plane is a plane through two clusters of atoms a box length apart.
+    """
+    if not rings:
+        empty = np.zeros((traj.n_frames, 0, 3))
+        return empty, empty
+    whole = periodic and _has_box(traj)
+    if whole:
+        import mdtraj as md
+    centres, normals = [], []
+    for ring in rings:
+        members = np.asarray(ring, dtype=int)
+        if whole:
+            anchor = int(members[0])
+            pairs = np.column_stack(
+                [np.full(len(members), anchor, dtype=int), members])
+            offsets = md.compute_displacements(traj, pairs, periodic=True)
+            points = traj.xyz[:, anchor, None, :] + offsets
+        else:
+            points = traj.xyz[:, members, :]
+        centre = points.mean(axis=1)
+        # The plane is fitted rather than taken from three atoms: a ring puckers,
+        # and three atoms of a puckered ring give a normal that swings with
+        # whichever three were chosen.
+        centred = points - centre[:, None, :]
+        _u, _s, vh = np.linalg.svd(centred, full_matrices=False)
+        normal = vh[:, 2, :]
+        normals.append(normal / np.linalg.norm(normal, axis=-1, keepdims=True))
+        centres.append(centre)
+    return np.stack(centres, axis=1), np.stack(normals, axis=1)
+
+
+def _plane_angle(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    """Angle between two planes, in degrees, folded into 0-90.
+
+    A normal has no preferred direction, so 170 degrees between normals is the
+    same arrangement as 10. Folding keeps parallel at 0 and perpendicular at 90
+    whichever way the normals happen to point.
+    """
+    cosine = np.abs(np.einsum("...i,...i->...", first, second)).clip(0.0, 1.0)
+    return np.rad2deg(np.arccos(cosine))
+
+
+def _offsets(between: np.ndarray, normals_a: np.ndarray) -> np.ndarray:
+    """How far one ring centre sits from the other's axis.
+
+    Two rings can be the right distance apart and side by side rather than
+    stacked. The offset is what tells those apart: it is the distance from one
+    centre to the line through the other along its normal.
+
+    Takes the separation vector rather than the two centres, so that the
+    vector `_between` imaged is the one projected here. Building it again
+    from raw centres would put the minimum image back only in the distance
+    and leave the offset measured across the box.
+    """
+    along = np.einsum("...i,...i->...", between, normals_a[:, :, None, :])
+    perpendicular = between - along[..., None] * normals_a[:, :, None, :]
+    return np.linalg.norm(perpendicular, axis=-1)
+
+
+def pi_stacking(
+    traj: Any,
+    chemistry: Any,
+    ligand_indices: Any,
+    protein_indices: Any,
+    *,
+    distance_nm: float = 0.55,
+    angle_tolerance_deg: float = 30.0,
+    offset_nm: float = 0.20,
+    periodic: bool = True,
+) -> list[Contact]:
+    """Aromatic rings stacked on each other, in every frame.
+
+    PLIP's criterion: ring centres within 5.5 A, the angle between the planes
+    within 30 degrees of parallel or of perpendicular, and the offset between
+    the centres below 2.0 A -- about the radius of benzene plus a little.
+
+    Both arrangements are reported and named. Parallel stacking and the
+    T-shaped, edge-to-face arrangement are different interactions with
+    different geometries, and a ligand that stacks one way and not the other is
+    telling you something about the pocket.
+    """
+    ligand_rings = ligand_aromatic_rings(chemistry, ligand_indices)
+    protein_rings = protein_aromatic_rings(traj.topology, protein_indices)
+    if not ligand_rings or not protein_rings:
+        return []
+
+    lig_centres, lig_normals = _ring_geometry(traj, ligand_rings, periodic)
+    pro_centres, pro_normals = _ring_geometry(traj, protein_rings, periodic)
+
+    between = _between(traj, ligand_rings, lig_centres,
+                       protein_rings, pro_centres, periodic)
+    separations = np.linalg.norm(between, axis=-1)
+    angles = _plane_angle(lig_normals[:, :, None, :], pro_normals[:, None, :, :])
+    # Measured from both rings: side by side looks stacked from one of them
+    # only when the other is ignored. The reverse direction is the same
+    # imaged vector negated and transposed -- recomputing it from the raw
+    # centres would leave this half measured across the box.
+    reverse = -between.transpose(0, 2, 1, 3)
+    offset = np.minimum(_offsets(between, lig_normals),
+                        _offsets(reverse, pro_normals).transpose(0, 2, 1))
+
+    parallel = angles < angle_tolerance_deg
+    perpendicular = angles > (90.0 - angle_tolerance_deg)
+    close = (separations < distance_nm) & (offset < offset_nm)
+
+    found: list[Contact] = []
+    for arrangement, mask in (("face_to_face", parallel), ("edge_to_face", perpendicular)):
+        for frame, first, second in zip(*np.where(close & mask)):
+            found.append(Contact(
+                kind=f"pi_stacking_{arrangement}",
+                frame=int(frame),
+                ligand_atom=int(ligand_rings[first][0]),
+                protein_atom=int(protein_rings[second][0]),
+                distance_nm=float(separations[frame, first, second]),
+                angle_deg=float(angles[frame, first, second]),
+            ))
+    return found
+
+
+def pi_cation(
+    traj: Any,
+    chemistry: Any,
+    ligand_indices: Any,
+    protein_indices: Any,
+    *,
+    distance_nm: float = 0.60,
+    offset_nm: float = 0.20,
+    allow_ambiguous_charge: bool = False,
+    periodic: bool = True,
+) -> list[Contact]:
+    """A positive charge sitting over an aromatic ring, in every frame.
+
+    PLIP's criterion: the charge within 6.0 A of the ring centre, and the
+    offset from the ring's axis below 2.0 A. The offset matters more here than
+    the distance: a cation beside a ring at 5 A is not interacting with its
+    face, and distance alone cannot tell the two apart.
+
+    Refuses on an undetermined ligand charge for the same reason a salt bridge
+    does -- it is a claim about charge.
+    """
+    if getattr(chemistry, "charge_was_ambiguous", False) and not allow_ambiguous_charge:
+        raise StudyError(
+            f"The net charge of {chemistry.resname!r} was not determined -- "
+            f"{chemistry.detail}. A pi-cation interaction is a claim about "
+            "charge. State the ligand's net charge, or supply its chemistry "
+            "as an SDF."
+        , code="setup.chemistry.charge_undetermined")
+
+    ligand_positive, _ligand_negative = ligand_charged_groups(
+        chemistry, ligand_indices)
+    protein_positive, _protein_negative = protein_charged_groups(
+        traj.topology, protein_indices)
+    ligand_rings = ligand_aromatic_rings(chemistry, ligand_indices)
+    protein_rings = protein_aromatic_rings(traj.topology, protein_indices)
+
+    found: list[Contact] = []
+    for cations, rings, cation_is_ligand in (
+        (ligand_positive, protein_rings, True),
+        (protein_positive, ligand_rings, False),
+    ):
+        if not cations or not rings:
+            continue
+        charge_centres = _group_centres(traj, cations, periodic)
+        ring_centres, ring_normals = _ring_geometry(traj, rings, periodic)
+        between = _between(traj, cations, charge_centres,
+                           rings, ring_centres, periodic)
+        separations = np.linalg.norm(between, axis=-1)
+        # Projected on the ring's normal, so the vector runs ring -> cation.
+        offset = _offsets(-between.transpose(0, 2, 1, 3),
+                          ring_normals).transpose(0, 2, 1)
+
+        for frame, cation, ring in zip(
+            *np.where((separations < distance_nm) & (offset < offset_nm))
+        ):
+            ligand_atom = (cations[cation][0] if cation_is_ligand
+                           else rings[ring][0])
+            protein_atom = (rings[ring][0] if cation_is_ligand
+                            else cations[cation][0])
+            found.append(Contact(
+                kind="pi_cation",
+                frame=int(frame),
+                ligand_atom=int(ligand_atom),
+                protein_atom=int(protein_atom),
+                distance_nm=float(separations[frame, cation, ring]),
+            ))
+    return found
+
+
+def halogen_bonds(
+    traj: Any,
+    chemistry: Any,
+    ligand_indices: Any,
+    protein_indices: Any,
+    *,
+    distance_nm: float = 0.35,
+    donor_angle_deg: tuple[float, float] = (130.0, 180.0),
+    acceptor_angle_deg: tuple[float, float] = (80.0, 140.0),
+    include_fluorine: bool = False,
+    periodic: bool = True,
+) -> list[Contact]:
+    """A halogen on the ligand donating to an acceptor on the protein.
+
+    The halogen's sigma-hole points along the C-X axis, so the interaction is
+    directional: the carbon-halogen-acceptor angle has to be near straight.
+    ProLIF requires 130 to 180 degrees within 3.5 A; PLIP uses 165 plus or
+    minus 30 within 4.0 A. The narrower distance is used because it is the one
+    the sigma-hole picture supports, and both are settings.
+
+    The acceptor side is directional too: the halogen approaches the
+    acceptor's lone pair, off its R-A axis, so the angle X...A-R at the
+    acceptor, with R a heavy atom bonded to it, has to lie between 80 and
+    140 degrees (ProLIF's XAR angle, after Auffinger et al., PNAS 101:16789,
+    2004; PLIP uses 90 to 150). Without it a chlorine aimed along a carbonyl's
+    C=O axis from beyond the oxygen, X...O=C at 180 degrees, was a halogen
+    bond. Where the acceptor has several heavy neighbours any one inside the
+    window suffices, as ProLIF's matching of every R allows; an acceptor with
+    no heavy neighbour has no axis and is not taken.
+
+    Fluorine is not counted unless asked for. See ``_HALOGENS`` for why, and
+    for which tool disagrees.
+
+    Only the ligand donates. Proteins carry no halogens unless somebody has
+    modified them, and a modified residue is something to say so about rather
+    than to guess at.
+    """
+    order = list(int(i) for i in ligand_indices)
+    mol = chemistry.mol
+    wanted = set(_HALOGENS) | ({"F"} if include_fluorine else set())
+
+    donors: list[tuple[int, int]] = []      # (carbon, halogen)
+    for atom in mol.GetAtoms():
+        if atom.GetSymbol() not in wanted or atom.GetIdx() >= len(order):
+            continue
+        for neighbour in atom.GetNeighbors():
+            if neighbour.GetSymbol() == "C" and neighbour.GetIdx() < len(order):
+                donors.append((order[neighbour.GetIdx()], order[atom.GetIdx()]))
+
+    _protein_donors, acceptors = donors_and_acceptors(
+        traj.topology, protein_indices)
+    if not donors or not acceptors:
+        return []
+
+    heavy_neighbours: dict[int, list[int]] = {}
+    for bond in traj.topology.bonds:
+        for one, other in ((bond[0], bond[1]), (bond[1], bond[0])):
+            if other.element is not None and other.element.symbol != "H":
+                heavy_neighbours.setdefault(one.index, []).append(other.index)
+    acceptors = [a for a in acceptors if heavy_neighbours.get(a)]
+    if not acceptors:
+        return []
+
+    triples = [(carbon, halogen, acceptor)
+               for carbon, halogen in donors for acceptor in acceptors]
+    pairs = [(halogen, acceptor) for _c, halogen in donors for acceptor in acceptors]
+
+    separations = _distances(traj, np.array(pairs), periodic)
+    angles = _angles(traj, np.array(triples), periodic)
+    low, high = donor_angle_deg
+
+    # X...A-R for every heavy neighbour R of each acceptor; a column is
+    # inside the window where any of its R is.
+    far_side = [(halogen, acceptor, r) for halogen, acceptor in pairs
+                for r in heavy_neighbours[acceptor]]
+    owner = np.array([column for column, (halogen, acceptor) in enumerate(pairs)
+                      for _r in heavy_neighbours[acceptor]])
+    at_acceptor = _angles(traj, np.array(far_side), periodic)
+    a_low, a_high = acceptor_angle_deg
+    inside = (at_acceptor >= a_low) & (at_acceptor <= a_high)
+    acceptor_ok = np.zeros_like(separations, dtype=bool)
+    for column in range(len(pairs)):
+        acceptor_ok[:, column] = inside[:, owner == column].any(axis=1)
+
+    found: list[Contact] = []
+    for frame, column in zip(*np.where(
+        (separations < distance_nm) & (angles > low) & (angles <= high)
+        & acceptor_ok
+    )):
+        halogen, acceptor = pairs[column]
+        found.append(Contact(
+            kind="halogen_bond",
+            frame=int(frame),
+            ligand_atom=int(halogen),
+            protein_atom=int(acceptor),
+            distance_nm=float(separations[frame, column]),
+            angle_deg=float(angles[frame, column]),
+        ))
+    return found
+
+
+def metal_ions(topology: Any, exclude: Any = ()) -> list[int]:
+    """Metal ions in the topology: single-atom residues of a metal element.
+
+    An ion is neither protein nor ligand, so neither selection holds it, and
+    a coordination search given only those two never saw a zinc between a
+    histidine and a ligand oxygen. These are the atoms to pass as the metal
+    side. Atoms in ``exclude`` (the ligand, where it is itself an ion) are
+    left out.
+    """
+    skip = set(int(i) for i in exclude)
+    found = []
+    for atom in topology.atoms:
+        if atom.index in skip or atom.residue.n_atoms != 1:
+            continue
+        symbol = (atom.element.symbol if atom.element is not None else "").upper()
+        if symbol in _METALS:
+            found.append(atom.index)
+    return found
+
+
+def metal_coordination(
+    traj: Any,
+    ligand_indices: Any,
+    protein_indices: Any,
+    *,
+    distance_nm: float = 0.30,
+    periodic: bool = True,
+) -> list[Contact]:
+    """A metal ion coordinated by the ligand, or coordinating it.
+
+    A donor atom within 3.0 A of the metal, which is PLIP's threshold. No
+    angle: the geometry of a metal centre is a property of the whole
+    coordination shell rather than of any one contact, and PLIP fits the shell
+    to known geometries afterwards. That fitting is not done here, because
+    which targets are superfluous to a coordination number is a judgement, and
+    reporting each contact leaves it visible.
+
+    The metal may be on either side. An ion in the structure is often neither
+    protein nor ligand in the way a selection divides them, so both directions
+    are searched.
+    """
+    topology = traj.topology
+
+    def split(indices):
+        wanted = set(int(i) for i in indices)
+        metals, donors = [], []
+        for atom in topology.atoms:
+            if atom.index not in wanted:
+                continue
+            symbol = (atom.element.symbol if atom.element is not None else "").upper()
+            # The element, never the atom name. Every amino acid has an atom
+            # called CA -- its alpha carbon -- and CA is also calcium, so
+            # matching names turns every residue in the protein into a metal
+            # centre. The same trap catches CD, HG, NA and IN.
+            if symbol in _METALS:
+                # And a metal ion sits alone: an ion is its own residue, so a
+                # symbol that matches inside a larger residue is a
+                # misassignment rather than an ion.
+                if atom.residue.n_atoms == 1:
+                    metals.append(atom.index)
+            elif symbol in {"N", "O", "S"}:
+                donors.append(atom.index)
+        return metals, donors
+
+    ligand_metals, ligand_donors = split(ligand_indices)
+    protein_metals, protein_donors = split(protein_indices)
+
+    found: list[Contact] = []
+    for metals, partners, metal_is_ligand in (
+        (ligand_metals, protein_donors, True),
+        (protein_metals, ligand_donors, False),
+    ):
+        if not metals or not partners:
+            continue
+        pairs = [(m, p) for m in metals for p in partners]
+        separations = _distances(traj, np.array(pairs), periodic)
+        for frame, column in zip(*np.where(separations < distance_nm)):
+            metal, partner = pairs[column]
+            found.append(Contact(
+                kind="metal_coordination",
+                frame=int(frame),
+                ligand_atom=int(metal if metal_is_ligand else partner),
+                protein_atom=int(partner if metal_is_ligand else metal),
+                distance_nm=float(separations[frame, column]),
+            ))
+    return found
+
+
+def water_bridges(
+    traj: Any,
+    ligand_indices: Any,
+    protein_indices: Any,
+    water_indices: Any,
+    *,
+    min_distance_nm: float = 0.25,
+    max_distance_nm: float = 0.41,
+    omega_deg: tuple[float, float] = (71.0, 140.0),
+    theta_deg: float = 100.0,
+    periodic: bool = True,
+) -> list[Contact]:
+    """A water hydrogen-bonded to an acceptor on one side and a donor on the
+    other, PLIP's first-degree water bridge (Salentin et al., Nucleic Acids
+    Res 43:W443, 2015; thresholds from Jiang et al., Proteins 60:367, 2005).
+
+    For one water oxygen W, an acceptor A and a donor D-H on opposite sides:
+
+    * A to W between 2.5 and 4.1 A, both included;
+    * D to W between 2.5 and 4.1 A, both included, and the angle theta
+      D-H...W at the hydrogen above 100 degrees, so the hydrogen points at
+      the water;
+    * the angle omega A...W...H at the water oxygen, between the acceptor and
+      the donor's hydrogen, strictly between 71 and 140 degrees.
+
+    PLIP's own values (its ``WATER_BRIDGE_*`` settings), including omega's
+    lower bound of 71: Jiang's 80 less 9. Both pairings are searched, ligand
+    acceptor with protein donor and protein acceptor with ligand donor; two
+    acceptors with a water between them are not a bridge by this criterion,
+    and neither is a donor whose hydrogen points away. The rule here before
+    took any two polar atoms and the angle between them at the oxygen, which
+    is not PLIP's: a protonated amide N whose hydrogen pointed away from the
+    water bridged to a ligand carbonyl.
+
+    The contact reports the ligand and protein atoms the water joins, their
+    separation, and omega.
+
+    Only single-water bridges are found. Two waters can bridge a gap, and
+    three, and at some chain length the claim stops meaning anything about
+    binding; PLIP stops at one and so does this.
+
+    Waters have to be given. Which oxygens count as solvent is a selection, and
+    a run that stripped its waters has none to offer -- an empty result there
+    means the trajectory holds no water, not that no bridges formed. Only the
+    waters within reach of the ligand in each frame are examined, found by a
+    neighbour search, so a solvated box costs what its first shell costs.
+    """
+    import mdtraj as md
+
+    topology = traj.topology
+    oxygens = np.array([
+        int(index) for index in water_indices
+        if (topology.atom(int(index)).element is not None
+            and topology.atom(int(index)).element.symbol == "O")
+    ], dtype=int)
+    if oxygens.size == 0:
+        return []
+
+    ligand_donors, ligand_acceptors = donors_and_acceptors(topology, ligand_indices)
+    protein_donors, protein_acceptors = donors_and_acceptors(topology, protein_indices)
+    if not ((ligand_acceptors and protein_donors)
+            or (protein_acceptors and ligand_donors)):
+        return []
+
+    ligand_polar = np.array(sorted(set(ligand_acceptors)
+                                   | {d for d, _h in ligand_donors}), dtype=int)
+    protein_polar = np.array(sorted(set(protein_acceptors)
+                                    | {d for d, _h in protein_donors}), dtype=int)
+    # Searched a hair wider than the bound, which is inclusive, so a leg at
+    # exactly 4.1 A is not lost to the search's strict inequality.
+    reach = max_distance_nm * (1.0 + 1e-6)
+    near_ligand = md.compute_neighbors(
+        traj, reach, ligand_polar, haystack_indices=oxygens, periodic=periodic)
+
+    def leg(separation: float) -> bool:
+        return min_distance_nm <= separation <= max_distance_nm
+
+    low, high = omega_deg
+    found: list[Contact] = []
+    for frame in range(traj.n_frames):
+        waters = np.asarray(near_ligand[frame], dtype=int)
+        if waters.size == 0:
+            continue
+        one = traj[frame]
+        partners = set(int(i) for i in md.compute_neighbors(
+            one, reach, waters, haystack_indices=protein_polar,
+            periodic=periodic)[0])
+        if not partners:
+            continue
+
+        # Each leg once per water: (water, acceptor) and (water, donor, H).
+        sides = (
+            (ligand_acceptors, [p for p in protein_donors if p[0] in partners], True),
+            ([a for a in protein_acceptors if a in partners], ligand_donors, False),
+        )
+        for acceptors, donors, acceptor_is_ligand in sides:
+            if not acceptors or not donors:
+                continue
+            acc_pairs = np.array([(w, a) for w in waters for a in acceptors])
+            don_pairs = np.array([(w, d) for w in waters for d, _h in donors])
+            don_theta = np.array([(d, h, w) for w in waters for d, h in donors])
+            acc_ok = _distances(one, acc_pairs, periodic)[0]
+            don_ok = _distances(one, don_pairs, periodic)[0]
+            theta = _angles(one, don_theta, periodic)[0]
+            triples, described = [], []
+            for at, water in enumerate(waters):
+                accepting = [acceptors[k] for k in range(len(acceptors))
+                             if leg(acc_ok[at * len(acceptors) + k])]
+                if not accepting:
+                    continue
+                donating = [donors[k] for k in range(len(donors))
+                            if leg(don_ok[at * len(donors) + k])
+                            and theta[at * len(donors) + k] > theta_deg]
+                for acceptor in accepting:
+                    for heavy, hydrogen in donating:
+                        triples.append((acceptor, int(water), hydrogen))
+                        described.append((acceptor, heavy))
+            if not triples:
+                continue
+            omega = _angles(one, np.array(triples), periodic)[0]
+            for (acceptor, heavy), opening in zip(described, omega):
+                if not (low < opening < high):
+                    continue
+                ligand_atom, protein_atom = ((acceptor, heavy) if acceptor_is_ligand
+                                             else (heavy, acceptor))
+                # The ligand-to-protein span, under the same convention the
+                # legs were computed with. Taken raw it could exceed the box
+                # on a bridge whose ends sit either side of a face.
+                separation = float(_distances(
+                    one, np.array([[ligand_atom, protein_atom]]), periodic)[0, 0])
+                found.append(Contact(
+                    kind="water_bridge",
+                    frame=frame,
+                    ligand_atom=int(ligand_atom),
+                    protein_atom=int(protein_atom),
+                    distance_nm=separation,
+                    angle_deg=float(opening),
+                ))
+    return found
+
+
+def residues_not_covered(topology: Any, atom_indices: Any) -> dict[str, int]:
+    """Residues in a selection that the charge and ring tables do not know.
+
+    Those tables are the twenty standard amino acids, which is why they need
+    no perception. The cost is that anything else falls through them silently:
+    point this at DNA and the hydrogen bonds come out right, because they are
+    found from elements and bonds, while the salt bridges and the stacking
+    come out as zero -- though a phosphate is charged and a nucleobase is
+    aromatic.
+
+    Zero is an answer. "These residues were not examined for charge or
+    aromaticity" is a different one, and the true one.
+
+    Returned as a count per residue name so the caller can report it rather
+    than deciding on its own whether it matters: a single modified residue in
+    a large protein is a footnote, and a selection made entirely of nucleotides
+    is not.
+    """
+    known = set(_CHARGE_FAMILIES) | set(_AROMATIC_RINGS)
+    #: Residues with neither a charge nor a ring, which the tables leave out
+    #: because they have nothing to contribute rather than because they are
+    #: unknown.
+    known |= {
+        "ALA", "GLY", "VAL", "LEU", "ILE", "PRO", "MET", "SER", "THR", "CYS",
+        "ASN", "GLN", "CYX", "ASH", "GLH", "LYN",
+    }
+    # HIE, HID, HIP, HSD, HSE and HSP used to be on that list, which said they
+    # had nothing to contribute. An imidazole is aromatic and HIP is +1, so it
+    # was wrong twice over -- and because it was a claim of coverage rather
+    # than an omission, the residues did not appear here either. They are in
+    # the ring table now, so `known` picks them up above and nothing needs to
+    # be said twice.
+    wanted = set(int(i) for i in atom_indices)
+    unknown: dict[str, int] = {}
+    for residue in topology.residues:
+        if not any(atom.index in wanted for atom in residue.atoms):
+            continue
+        if residue.name.upper() in known:
+            continue
+        unknown[residue.name] = unknown.get(residue.name, 0) + 1
+    return unknown

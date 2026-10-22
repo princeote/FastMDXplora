@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import dataclasses
+
 import pytest
 
 from fastmdxplora.setup.forcefields import (
@@ -51,11 +53,15 @@ def stub_orchestrator(tmp_path: Path):
 # Resolver
 # ---------------------------------------------------------------------------
 class TestResolveForceField:
-    def test_default_is_charmm36(self):
-        assert DEFAULT_FORCEFIELD == "charmm36"
+    def test_the_default_is_chosen_rather_than_named(self):
+        """Unspecified means auto, which picks a ligand-capable stack."""
+        assert DEFAULT_FORCEFIELD == "auto"
 
     def test_none_resolves_to_default(self):
-        assert resolve_forcefield(None).name == "charmm36"
+        from fastmdxplora.setup.forcefields import AUTO_FORCEFIELD
+
+        assert resolve_forcefield(None).name == AUTO_FORCEFIELD
+        assert resolve_forcefield("auto").name == AUTO_FORCEFIELD
 
     def test_charmm36_xmls(self):
         c = resolve_forcefield("charmm36")
@@ -68,8 +74,10 @@ class TestResolveForceField:
         assert c.water_model == "tip3p"
 
     def test_amber_fb15_xmls(self):
+        """With TIP3P-FB, the water it was developed with."""
         c = resolve_forcefield("amber-fb15")
-        assert c.xmls == ("amberfb15.xml", "tip3p.xml")
+        assert c.xmls == ("amberfb15.xml", "tip3pfb.xml")
+        assert c.water_model == "tip3p" and c.water_name == "TIP3P-FB"
 
     def test_case_insensitive(self):
         assert resolve_forcefield("CHARMM36").name == "charmm36"
@@ -90,8 +98,12 @@ class TestResolveForceField:
     def test_returns_frozen_choice(self):
         c = resolve_forcefield("charmm36")
         assert isinstance(c, ForceFieldChoice)
-        with pytest.raises(Exception):
-            c.name = "other"  # frozen dataclass
+        # `dataclasses.FrozenInstanceError`, named rather than caught blind:
+        # `pytest.raises(Exception)` here would have passed on an
+        # AttributeError from a typo in the attribute name, which is the
+        # opposite of what this asserts.
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            c.name = "other"
 
 
 # ---------------------------------------------------------------------------
@@ -106,8 +118,35 @@ class TestForceFieldPlumbing:
                 orchestrator=stub_orchestrator,
                 output_dir=out_dir,
                 forcefield="charmm36",
-                force_field=["charmm36.xml", "charmm36/water.xml"],
+                force_field=["amber14-all.xml", "amber14/tip3p.xml"],
             )
+
+    def test_an_unknown_name_is_not_its_list(self):
+        from fastmdxplora.setup.pipeline import _the_list_is_the_name
+
+        assert not _the_list_is_the_name("bogus-ff", ["amber14-all.xml"])
+        assert not _the_list_is_the_name("charmm36", ["amber14-all.xml", "amber14/tip3p.xml"])
+
+    @pytest.mark.parametrize("name", ["auto", "amber14"])
+    def test_a_list_that_is_the_name_resolved_is_read_as_the_name(
+            self, stub_orchestrator, name):
+        """What a resolved_config.yml records: the name asked for and the
+        files it became. Fed back, it was refused, so the file that says it
+        reproduces a study could not be run, and neither could a resume
+        that had to start a run again."""
+        out_dir = stub_orchestrator.output_dir / "setup"
+        out_dir.mkdir()
+        from fastmdxplora.setup import prepare as _prepare_mod
+        with patch.object(_prepare_mod, "prepare_system", return_value={}) as prepared:
+            setup_run(
+                orchestrator=stub_orchestrator,
+                output_dir=out_dir,
+                forcefield=name,
+                force_field=["amber14-all.xml", "amber14/tip3p.xml"],
+            )
+        if prepared.called:  # not reached without PDBFixer
+            assert prepared.call_args.kwargs["forcefield"] == name
+            assert prepared.call_args.kwargs["force_field"] is None
 
     def test_unknown_named_ff_raises(self, stub_orchestrator):
         out_dir = stub_orchestrator.output_dir / "setup"
@@ -166,13 +205,17 @@ class TestForceFieldSchemaAndCLI:
         setup = PHASE_SCHEMAS["setup"]
         f = setup.get("forcefield")
         assert f is not None
-        assert f.default == "charmm36"
+        assert f.default == "auto"
 
     def test_cli_has_setup_forcefield_flag(self):
-        from fastmdxplora.cli.main import _SETUP_OPTIONS
+        from fastmdxplora.cli.main import _SETUP_OPTIONS, _build_parser
+
         flags = {flag for flag, _kw, _opts in _SETUP_OPTIONS}
         assert "forcefield" in flags
-        # choices are constrained to the registered names
-        for flag, _kw, opts in _SETUP_OPTIONS:
-            if flag == "forcefield":
-                assert {"charmm36", "amber14", "amber-fb15"} <= set(opts["choices"])
+        # The accepted names are asked of the parser rather than the option
+        # table: the table no longer carries them, because the schema declares
+        # them once and the parser reads them from there. What a user meets is
+        # the parser, so that is what is checked.
+        setup = _build_parser()._subparsers._group_actions[0].choices["setup"]
+        choices = next(a.choices for a in setup._actions if a.dest == "forcefield")
+        assert {"charmm36", "amber14", "amber-fb15"} <= set(choices)

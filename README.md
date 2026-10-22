@@ -1,427 +1,164 @@
+<div align="center">
+
 # FastMDXplora
 
-> **F**ully **A**utomated **Sy**s**T**em for **M**olecular **D**ynamics e**Xplora**tion
+**Molecular dynamics from a PDB code to a finished study — in one command.**
 
-[![DOI](https://img.shields.io/badge/DOI-10.1002%2Fjcc.70350-blue)](https://doi.org/10.1002/jcc.70350)
-[![PyPI version](https://img.shields.io/pypi/v/fastmdxplora)](https://pypi.org/project/fastmdxplora/)
-[![Python versions](https://img.shields.io/pypi/pyversions/fastmdxplora)](https://pypi.org/project/fastmdxplora/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://github.com/aai-research-lab/FastMDXplora/actions/workflows/tests.yml/badge.svg)](https://github.com/aai-research-lab/FastMDXplora/actions/workflows/tests.yml)
-[![codecov](https://codecov.io/gh/aai-research-lab/FastMDXplora/branch/main/graph/badge.svg)](https://codecov.io/gh/aai-research-lab/FastMDXplora)
+[![DOI](https://img.shields.io/badge/DOI-10.1002%2Fjcc.70350-blue?labelColor=black)](https://doi.org/10.1002/jcc.70350)
+[![PyPI](https://img.shields.io/pypi/v/fastmdxplora?label=pypi&labelColor=black)](https://pypi.org/project/fastmdxplora/)
+[![conda-forge](https://img.shields.io/conda/vn/conda-forge/fastmdxplora?label=conda-forge&color=44A833&labelColor=black)](https://anaconda.org/conda-forge/fastmdxplora)
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/fastmdxplora?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/fastmdxplora)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue?labelColor=black)](https://pypi.org/project/fastmdxplora/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?labelColor=black)](https://opensource.org/licenses/MIT)
+
+[![Tests](https://img.shields.io/github/actions/workflow/status/aai-research-lab/FastMDXplora/tests.yml?branch=main&label=tests&labelColor=black)](https://github.com/aai-research-lab/FastMDXplora/actions/workflows/tests.yml)
+[![codecov](https://img.shields.io/codecov/c/github/aai-research-lab/FastMDXplora/main?labelColor=black)](https://codecov.io/gh/aai-research-lab/FastMDXplora)
+[![Docs](https://img.shields.io/readthedocs/fastmdxplora?label=docs&labelColor=black)](https://fastmdxplora.readthedocs.io)
+
+[**Quick start**](https://fastmdxplora.readthedocs.io/en/stable/first_study.html) ·
+[**Agent**](https://fastmdxplora.readthedocs.io/en/stable/agent.html) ·
+[**Cite**](#citation)
+
+</div>
 
 ---
 
-**FastMDXplora** explores a protein's behavior end to end from a single command. Given a structure (or just a PDB ID) it performs molecular dynamics exploration all the way through setup, simulation, analysis, and reporting, then hands back publication-ready results:
-
-```
-  setup  →  simulation  →  analysis  →  report
+```bash
+fastmdx explore --system 181L
 ```
 
-## Highlights
+```
+setup  →  simulation  →  analysis  →  report
+```
 
-- Explore a protein's full dynamics with a single command, covering setup, simulation, analysis, and reporting
-- Probe protein-ligand binding automatically with analyses for pose stability, contacts, and protein-ligand hydrogen bonds
-- Reach beyond plain MD with built-in PLUMED enhanced sampling (metadynamics, umbrella sampling, steered MD) and a full analysis suite that turns trajectories into slide-ready, publication-quality figures
-- Highlight user-defined residue regions on RMSF report figures for loops, helices, active-site neighborhoods, or other known intervals
-- Scale from a quick single-protein exploration to large-scale parallel campaigns, driven the same way from the CLI or the Python API
+Four characters of PDB ID as input. FastMDXplora fetches T4 lysozyme,
+parameterises the benzene bound in its cavity, runs the dynamics, analyses the
+trajectory, works out which residues hold the ligand in place, and writes the
+whole study up as a PDF.
 
-## Phases of FastMDXplora
-
-| Phase | What it does |
-|---|---|
-| **setup** | Cleans up your structure and builds a simulation-ready system: fixes missing atoms, adds hydrogens, solvates, and adds ions. |
-| **simulation** | Runs the molecular dynamics (energy minimization, equilibration, and production), with optional enhanced sampling. |
-| **analysis** | Computes the standard structural and dynamic metrics (and protein-ligand metrics when a ligand is present), with figures ready to use. |
-| **report** | Packages everything into a slide deck, a written report, and a self-contained bundle you can share. |
-
-## Installation
-
-FastMDXplora runs on **Linux, macOS, and Windows** with the same three commands — no per-OS scripts and no manual environment wrangling. **Miniforge is auto-installed** when no conda is on PATH, so a brand-new user on a fresh machine is enough.
-
-### Quick install (any OS)
+Or configure the whole MD study in the GUI:
 
 ```bash
-git clone https://github.com/aai-research-lab/FastMDXplora.git   # 1
-cd FastMDXplora                                                  # 2
-python fastmdx install                                           # 3
+fastmdx gui
 ```
 
-The third command:
-
-- detects whether conda/mamba is already installed; if not, downloads and installs **Miniforge** for your platform automatically
-- creates a `fastmdxplora` conda environment with Python 3.10
-- installs **OpenMM** and **PDBFixer** (the only heavy chemistry dependencies)
-- installs FastMDXplora itself
-- runs `fastmdx info` as a smoke test to confirm everything works
-
-> Why the `python fastmdx …` prefix? The repo includes a tiny `fastmdx` shim at its root so the CLI can run before any `pip install` step. See [`docs/installation.md § Why python fastmdx`](docs/installation.md#why-python-fastmdx) for the full behavior and the canonical `python -m fastmdxplora.cli.main …` fallback.
-
-Then activate and run your first simulation:
+## Install
 
 ```bash
+conda create -n fastmdxplora -c conda-forge fastmdxplora
 conda activate fastmdxplora
-fastmdx explore --system 1L2Y
 ```
 
-`1L2Y` is a small trp-cage PDB that exercises every phase on a fast turnaround. Replace it with any 4-character PDB ID or with the path to a local `.pdb` / `.cif` file.
+`fastmdx info` lists every backend and how to get anything missing:
 
-### Three scenarios, two install paths
+```bash
+fastmdx info
+```
 
-| Starting point | What you run |
+## What you can study
+
+| | |
 |---|---|
-| **Fresh machine, nothing installed** (cold start) | The 3 commands below. Miniforge is downloaded and installed automatically. No prior Python needed. |
-| **You already have conda or mamba** | The same 3 commands. Miniforge download is skipped; the `fastmdxplora` environment is created directly. |
-| **You only want analysis + reports, no MD** | Skip the `install` step. Just `pip install fastmdxplora` then `fastmdx explore --system 1L2Y --include analyze report` (2 commands, no conda env required). To upgrade later to the full chemistry stack, see [Install from PyPI](#install-from-pypi-no-git-clone) below. |
+| **A protein on its own** | Fold, flexibility, secondary structure, native contacts, conformational clustering — from a PDB code. Fluctuations can be set against the crystal's own B-factors, and backbone order parameters against what NMR relaxation measures. |
+| **A protein with a ligand** | The ligand is found, its chemistry resolved, its protonation determined in the binding site. Eight interaction types against published criteria tell you what *holds* it, not just what it touches. |
+| **A membrane protein** | Embedded in one of seven bilayers, oriented by a fit checked against OPM, with pressure coupling that suits a lipid system and the bilayer's area, thickness and chain order analysed. |
+| **Free energy along a coordinate** | Umbrella sampling, metadynamics and steered MD from a named collective variable — nine of them, one or two at a time — without writing PLUMED input. Each says what its output is and is not: a surface if the bias converged, a pathway and the work along it, a potential of mean force if the windows overlap. |
+| **A trajectory from another engine** | Skip the simulation and analyse what you already have — GROMACS `.xtc` and `.trr`, Amber `.nc`, NAMD and CHARMM `.dcd`, LAMMPS `.lammpstrj`, or `.pdb`, `.cif` and `.h5` that carry their own topology. |
+| **Many systems at once** | Mutants against wild type — named as `L99A`, and checked against the residue actually there — a sweep across a setting, runs pinned one per GPU, and a comparison report across all of them. Where the members differ only by seed, the spread of their means is set against the error each run claimed for itself. |
 
-### Install from PyPI (no git clone)
+**It refuses rather than guesses.** An ambiguous ligand charge, a protein
+backwards in its membrane, a free-energy surface that never converged — each
+stops the run and is named, not papered over. Biased averages are corrected
+to equilibrium where the bias allows and labelled where it does not. Every
+step explains itself and cites the paper worth reading. What comes out, you
+can defend; what you cannot is marked.
 
-If you don't want to clone the repository — for example, you only need FastMDXplora as a library to call from a script — install the published version straight from PyPI. FastMDXplora is published under two names that resolve to the same package: `fastmdxplora` (canonical) and `fastmdx` (a one-line alias). Either command installs the same software:
+## The config is the study
 
-```bash
-pip install fastmdxplora       # canonical name
-pip install fastmdx            # shorter alias; same install underneath
-```
-
-The CLI is exposed by either install as a real platform-native `fastmdx` console script on `PATH` (declared by `[project.scripts]` in `pyproject.toml`), so it behaves identically on Linux / macOS / Windows — no App Execution Aliases trap, no per-OS wrapper script.
-
-After install:
-
-- **Analysis + reports** (no MD): all four pip deps (MDTraj, matplotlib, scikit-learn, python-pptx) are present out of the box. Run `fastmdx explore --system 1L2Y --include analyze report`.
-- **Setup + simulation** (full chemistry stack): OpenMM and PDBFixer are **not** installed by plain pip because PDBFixer wheels aren't reliable across all platforms. Run `fastmdx install` after the pip install to drop them into the `fastmdxplora` conda env (auto-installs Miniforge if needed, same flow as the git-clone path).
-
-To upgrade a pip-only install to the full chemistry stack on any OS:
-
-```bash
-pip install fastmdxplora                                      # 1
-fastmdx install                                               # 2 — creates the conda env, auto-installs Miniforge if needed
-conda activate fastmdxplora                                   # 3
-fastmdx explore --system 1L2Y                                 # 4 — first full sim
-```
-
-Miniforge is auto-installed on a fresh machine, OpenMM + PDBFixer drop into the `fastmdxplora` conda env, and `fastmdx info` is used as a smoke test — same flow as the git-clone path.
-
-On Windows PowerShell, use the Python launcher and the virtual environment's
-activation script:
-
-```powershell
-cd C:\Users\User\OneDrive\Documents\GitHub\FastMDXplora
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -e ".[test]"
-python -m fastmdxplora.cli.main --version
-python -m fastmdxplora.cli.main info
-```
-
-If PowerShell blocks activation, allow local scripts for your user account:
-
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
-
-You can also skip activation and call the environment's Python directly:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[test]"
-.\.venv\Scripts\python.exe -m fastmdxplora.cli.main --version
-```
-
-### Verify
-
-```bash
-fastmdx --version    # reports the installed FastMDXplora version
-fastmdx info         # version + detected backends (OpenMM, PDBFixer, ...)
-```
-
-If `fastmdx` is not on PATH, these module commands are the safest fallback:
-
-```bash
-python -m fastmdxplora.cli.main --version
-python -m fastmdxplora.cli.main info
-```
-
-Check which OpenMM platforms are available (CPU/CUDA/OpenCL):
-
-```bash
-python - <<'PY'
-import openmm as mm
-plats = [mm.Platform.getPlatform(i).getName() for i in range(mm.Platform.getNumPlatforms())]
-print("Available platforms:", plats)
-print("CUDA available" if "CUDA" in plats else "CPU-only: simulations will run on CPU")
-PY
-```
-
-### Where to go next
-
-- **Need the full walkthrough, GPU notes, or troubleshooting?** See [`docs/installation.md`](docs/installation.md).
-- **Already installed and ready to run?** Skip to [Examples](#examples).
-- **Want to contribute?** See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-### Troubleshooting: `fastmdx` is not recognized
-
-On Windows, especially with Microsoft Store Python or PowerShell, you may see:
-
-```text
-fastmdx : The term 'fastmdx' is not recognized as the name of a cmdlet, function, script file, or operable program.
-```
-
-First check which Python installed FastMDXplora and where console scripts are
-written:
-
-```powershell
-python -m pip show fastmdxplora
-python -c "import sys; print(sys.executable)"
-python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
-python -m fastmdxplora.cli.main --version
-```
-
-If `import fastmdxplora` works but `fastmdx` is missing, the console-script
-directory is not on PATH. Use `python -m fastmdxplora.cli.main ...` as the
-portable fallback, or reinstall from the same Python to recreate the script:
-
-```powershell
-python -m pip install -e .
-python -m fastmdxplora.cli.main info
-```
-
-Avoid mixing multiple Python installs in the same terminal. The Python used for
-`python -m pip install ...` should be the same one used for
-`python -m fastmdxplora.cli.main ...`.
-
-## Examples
-
-### Command line
-
-**Run the full pipeline** (setup → simulate → analyze → report):
-```bash
-fastmdx explore --system protein.pdb
-```
-**Fetch a structure from the PDB by ID** (auto-detected, fetched from RCSB):
-```bash
-fastmdx explore --system 1L2Y
-```
-**Tune per-phase options** (flags are namespaced by phase):
-```bash
-fastmdx explore -s protein.pdb --setup-ph 7.4 --simulate-duration-ns 100 --simulate-platform CUDA
-```
-For a short local smoke test before a longer production run, use the gentle preset:
-```bash
-fastmdx explore -s protein.pdb --include setup simulation --simulate-preset gentle --simulate-platform CPU
-```
-**Run only specific phases**:
-```bash
-fastmdx explore -s protein.pdb --include setup simulation
-```
-**Run a single phase** (bare flags, no phase prefix):
-```bash
-fastmdx setup -s protein.pdb --ph 6.5
-fastmdx simulate -s protein.pdb --output run_001 --duration-ns 50 --platform CUDA
-fastmdx analyze --output run_001 --analyses rmsd rmsf rg
-fastmdx report --output run_001 --no-slides
-```
-**Drive a whole study from a config file** (`-c` and `-config` also work):
-```bash
-fastmdx explore --config study.yml
-```
-**Generate a commented config template to edit**:
-```bash
-fastmdx init-config -o study.yml
-```
-
-The `-s`, `-system`, and `--system` forms are equivalent; `xplore` is an alias of `explore`.
-
-### Python API
-
-**Run the full pipeline**:
-```python
-from fastmdxplora import FastMDXplora
-
-fmdx = FastMDXplora(system="protein.pdb")
-fmdx.explore()
-```
-**Specify options and select phases**:
-```python
-fmdx = FastMDXplora(system="1L2Y")          # PDB ID, fetched from RCSB
-results = fmdx.explore(
-    include=["setup", "simulation", "analysis"],
-    options={
-        "simulation": {"duration_ns": 100, "temperature_K": 310, "platform": "CUDA"},
-        "analysis":   {"include": ["rmsd", "rg", "cluster"]},
-    },
-)
-# explore() always returns a list of runs (a single study is a list of one)
-for run in results:
-    print(run.run_id, run.status)
-    for phase in run.phases:
-        print("  ", phase.name, phase.status)
-```
-**Run a config file** (one system, many systems, or a parameter sweep, all the same way):
-```python
-fmdx = FastMDXplora(config="study.yml")
-fmdx.explore()
-```
-**Preview a run without executing** (CLI `--dry-run`, or `dry_run=True`):
-```python
-FastMDXplora(config="campaign.yml").explore(dry_run=True)
-```
-
-> Recommended alias: `import fastmdxplora as fastmdx`.
-
-See [Configuration files](#configuration-files) and [Many systems and parameter sweeps](#many-systems-and-parameter-sweeps) for the YAML format, batches, sweeps, and parallel execution.
-
-## Configuration files
-
-For anything beyond a quick run, capture the whole study in a single YAML file instead of a long flag list. The same file drives both the CLI and the Python API. Input is always given as a `systems:` list (even for a single system), so the file looks the same whether you study one protein or a dozen.
-
-Generate a commented template to start from:
-
-```bash
-fastmdx init-config                    # writes fastmdxplora.yml (comprehensive)
-fastmdx init-config --minimal -o study.yml   # short starter
-```
-
-A `study.yml` looks like:
+A FastMDXplora config is the whole description of a molecular dynamics study:
+the system, how it is prepared, how it is simulated, how it is analysed, and how
+it is written up. Capture that, and the four phases — setup, simulation,
+analysis, report — run themselves.
 
 ```yaml
 systems:
-  - id: protein1
-    system: protein.pdb        # PDB/CIF path, 4-char PDB ID, or sequence
-
-output: ./my_study
-include: [setup, simulation, analysis, report]
-
-setup:
-  ph: 7.4
-  ion_concentration_M: 0.15
-
+  - system: 181L
 simulation:
-  duration_ns: 100.0         # production length (equilibration is separate)
-  temperature_K: 310.0
-  platform: CUDA
-
-analysis:
-  include: [rmsd, rmsf, rg, cluster]
-  selection: "name CA"
-  options:
-    cluster:
-      methods: [kmeans, hierarchical]
-      n_clusters: 5
-
-report:
-  title: "My MD Study"
+  duration_ns: 100
 ```
 
-Run it from the CLI or the API:
+That is a complete study. Everything unnamed takes a documented default, and
+every run writes `resolved_config.yml` — the file, the command line and the
+API arguments merged — so the exact study can be run again by anyone holding
+that one file.
 
-```bash
-fastmdx explore --config study.yml     # also: -c, -config
-```
+**Three ways to build a config**, and each of them also runs all four phases:
 
-```python
-from fastmdxplora import FastMDXplora
-FastMDXplora(config="study.yml").explore()
-```
-
-With a single system and no sweep, the output uses the familiar flat layout (`my_study/setup/`, `my_study/simulation/`, …) with the usual `manifest.json` and `resolved_config.yml`. Three things make this robust:
-
-- **Flags override the file.** `fastmdx explore --config study.yml --simulate-duration-ns 50` keeps everything in the file but runs 50 ns. Precedence is: command-line flags / API kwargs > config file > built-in defaults.
-- **Strict validation.** A typo like `pH:` (wrong case) or `simulaton:` is rejected with a did-you-mean suggestion, so a misspelled key never silently runs with the default.
-- **Reproducibility.** Every run writes `resolved_config.yml`, the fully-merged configuration that actually ran (defaults + file + overrides). Feed it straight back to `--config` to reproduce the study exactly.
-
-For a quick command-line one-off, `-s/--system` is shorthand that builds a one-element `systems` list for you:
-
-```bash
-fastmdx explore -s protein.pdb --simulate-duration-ns 50
-```
-
-## Many systems and parameter sweeps
-
-Because input is always a `systems:` list, studying several systems is just adding entries. Add a `sweep:` block to vary parameters, and FastMDXplora runs the full cross-product, each as a complete, self-contained study.
-
-```yaml
-output: ./trpcage_campaign
-include: [setup, simulation, analysis, report]
-
-systems:
-  - id: trpcage1
-    system: trpcage.pdb
-  - id: trpcage2
-    system: trpcage.pdb
-    setup: { ph: 6.5 }                 # optional per-system overrides
-
-sweep:
-  simulation.temperature_K: [300, 310, 320]   # dotted phase.option → values
-  simulation.pressure_bar: [1.0, 1.2]          # multiple axes → cross-product
-```
-
-That config produces 2 systems × 3 temperatures × 2 pressures = **12 runs**. When there is more than one run, each goes in its own `runs/<id>/` subdirectory, indexed by a top-level `batch_manifest.json`, with a cross-run `comparison/` report:
-
-```
-trpcage_campaign/
-  batch_manifest.json
-  comparison/                                        (cross-run report)
-  runs/
-    trpcage1__temperature_K-300__pressure_bar-1.0/   (a full study)
-    trpcage1__temperature_K-300__pressure_bar-1.2/
-    ...
-```
-
-Run it exactly as any other config:
-
-```bash
-fastmdx explore --config campaign.yml
-```
-
-```python
-from fastmdxplora import FastMDXplora
-FastMDXplora(config="campaign.yml").explore()
-```
-
-Each run is identical in structure to a single study (its own `manifest.json`, `resolved_config.yml`, and phase directories), so existing analysis tooling works per-run unchanged. Option precedence within a run is base config < per-system overrides < swept value. Typo'd sweep axes are rejected with the valid-option list, and a failed run is recorded while the others continue.
-
-### Cross-run comparison report
-
-After a multi-run study, FastMDXplora automatically builds a `comparison/` report at the batch root that turns a directory of runs into a single analysis:
-
-- **Overlays:** every run's per-frame trace (RMSD, Rg, Q-value, total SASA) drawn on one set of axes, labelled by its swept value, so divergence across the sweep is visible at a glance.
-- **Trends:** each run reduced to a summary scalar (e.g. mean RMSD over the trajectory) and plotted against the swept parameter, giving a structure-property relationship.
-- **`comparison_summary.csv`:** one row per run with the summary scalars, ready for further analysis.
-- **`comparison_report.md`:** a written report tying the figures together, with a one-line quantitative takeaway per property (e.g. *"across temperature_K 300 → 320, mean RMSD increases 0.21 → 0.23 nm"*).
-
-It degrades gracefully (errored runs and missing analyses are skipped) and can be turned off with `report: { comparison: false }`.
-
-### Parallel execution
-
-By default runs execute sequentially. An optional `execution:` block runs several at once:
-
-```yaml
-execution:
-  mode: parallel          # sequential (default) | parallel
-  workers: 2              # how many runs at once
-  devices: [0, 1]         # GPU indices: one run pinned per device
-  continue_on_error: true
-```
-
-Parallelism is process-based (each run is a subprocess, required because OpenMM contexts and the GIL don't share across threads). On GPU, the safe pattern is **one run per GPU**: list your `devices` and each worker is pinned to a distinct index round-robin. Oversubscribing a single GPU is slower than running sequentially, so `workers` should not exceed the number of devices on GPU. When `workers` is unset it defaults to one per device (GPU) or the CPU count capped at the run count (CPU).
-
-## Outputs by phase
-
-Each phase writes to a dedicated subdirectory under the project output root, with a structured parameters manifest so every artifact is traceable to the options that produced it.
-
-| Phase | Key outputs |
+| | |
 |---|---|
-| `setup` | `prepared.pdb`, `solvated.pdb`, `setup_parameters.json` |
-| `simulation` | `production.dcd`, `topology.pdb`, `simulation_parameters.json` |
-| `analysis` | `<analysis>/*.dat`, `<analysis>/*.png`, `analysis_manifest.json` |
-| `report` | `report.md`, `dashboard.html`, `slides.pptx`, `project_bundle.zip` |
+| **The GUI** | `fastmdx gui`. A form generated from the schema, so every setting is reachable. Worth using even for a command-line or Python workflow: build the study where the options are visible and explained, then take the file away. |
+| **The CLI** | `fastmdx explore --config study.yml`, or `fastmdx config` for a commented template, or a flag for any setting. |
+| **The Python API** | `FastMDXplora(config="study.yml").explore()`, or the same blocks passed as options. |
+
+None of these is the primary interface and none is a subset of another —
+form, flags and API are generated from one declaration — and a study designed
+in the GUI on a laptop runs unchanged on a cluster, because what travels is
+the config.
+
+**And a fourth, in place of a person.** The FastMDXplora Agent writes a config
+from a sentence, and is reachable through all three of the above:
+
+```bash
+fastmdx agent "simulate trypsin with benzamidine bound at pH 6.5 for 100 ns"
+```
+
+It gets no special treatment. What it writes goes through exactly the same
+validator, by the same code, with the same refusals, as a config typed by hand
+— and a proposal that did not validate carries no config at all.
+
+An AI app that speaks the Model Context Protocol reaches the same checks with
+`fastmdx mcp`: the AI app's model writes a study and the same validator judges
+it, it reads and compares studies, and it starts one only from a checked file,
+with your go-ahead.
+
+## The manifest is the result
+
+What a config is to a study, `manifest.json` is to its result: every phase that
+ran, every artifact it produced, every setting it used, and the exact software
+stack it ran on — including which package versions were loaded, because those
+decide numbers. A run directory is readable by somebody who was not there.
 
 ## Documentation
 
-Documentation is available at [fastmdxplora.readthedocs.io](https://fastmdxplora.readthedocs.io) and is actively expanding.
+**Start here** — [Install](https://fastmdxplora.readthedocs.io/en/stable/installation.html) ·
+[Your first study](https://fastmdxplora.readthedocs.io/en/stable/first_study.html) ·
+[How FastMDXplora works](https://fastmdxplora.readthedocs.io/en/stable/how_it_works.html)
+
+**The Config** — [The FastMDXplora Config](https://fastmdxplora.readthedocs.io/en/stable/config.html) ·
+[Config reference](https://fastmdxplora.readthedocs.io/en/stable/config_reference.html) ·
+[Selections](https://fastmdxplora.readthedocs.io/en/stable/selections.html) ·
+[Examples](https://fastmdxplora.readthedocs.io/en/stable/examples.html)
+
+**Writing a Config** — [GUI](https://fastmdxplora.readthedocs.io/en/stable/gui.html) ·
+[CLI](https://fastmdxplora.readthedocs.io/en/stable/cli.html) ·
+[API](https://fastmdxplora.readthedocs.io/en/stable/api.html) ·
+[Agent](https://fastmdxplora.readthedocs.io/en/stable/agent.html) ·
+[From your AI app](https://fastmdxplora.readthedocs.io/en/stable/mcp.html)
+
+**Going further** — [Restraints, membranes, enhanced sampling](https://fastmdxplora.readthedocs.io/en/stable/studies.html) ·
+[Production and GPUs](https://fastmdxplora.readthedocs.io/en/stable/production.html) ·
+[Running elsewhere](https://fastmdxplora.readthedocs.io/en/stable/clusters.html)
+
+**Results** — [The FastMDXplora Manifest](https://fastmdxplora.readthedocs.io/en/stable/manifest.html) ·
+[Reading the results](https://fastmdxplora.readthedocs.io/en/stable/results.html) ·
+[The analyses](https://fastmdxplora.readthedocs.io/en/stable/analyses.html) ·
+[Protein-ligand interactions](https://fastmdxplora.readthedocs.io/en/stable/interactions.html) ·
+[Refusals](https://fastmdxplora.readthedocs.io/en/stable/refusals.html)
+
+**For developers** — [Developing FastMDXplora](https://fastmdxplora.readthedocs.io/en/stable/developers.html) ·
+[How it is validated](https://fastmdxplora.readthedocs.io/en/stable/validation.html)
 
 ## Citation
-
-If you use FastMDXplora in your work, please cite:
 
 > Aina, A.; Kwan, D. *FastMDAnalysis: Software for Automated Analysis of Molecular Dynamics Trajectories.* J. Comput. Chem. **2026**, 47, e70350. DOI: [10.1002/jcc.70350](https://doi.org/10.1002/jcc.70350)
 
@@ -440,12 +177,22 @@ If you use FastMDXplora in your work, please cite:
 
 ## Contributing
 
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). FastMDXplora follows the [Contributor Covenant](CODE_OF_CONDUCT.md).
+Contributions welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Each
+contributor signs the [Contributor License Agreement](CLA.md) once. FastMDXplora
+follows the [Contributor Covenant](CODE_OF_CONDUCT.md).
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+FastMDXplora is released under the MIT License. See [LICENSE](LICENSE).
 
-## Acknowledgements
+---
 
-FastMDXplora is developed in the [AAI Research Lab](https://aai-research-lab.github.io) at California State University Dominguez Hills. It builds on a deep ecosystem of open-source scientific Python: MDTraj, OpenMM, PDBFixer, NumPy, SciPy, scikit-learn, Matplotlib, python-pptx, and many others.
+<div align="center">
+
+Built in the [AAI Research Lab](https://aai-research-lab.github.io) on MDTraj,
+OpenMM, PDBFixer, OpenFF, RDKit, NumPy, SciPy, scikit-learn, Matplotlib and
+Mol\*.
+
+© Copyright 2026, Adekunle Aina, Derrick Kwan, and FastMDXplora contributors.
+
+</div>

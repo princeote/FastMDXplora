@@ -1,0 +1,412 @@
+"""Simulated fluctuations against crystallographic B-factors.
+
+The oldest comparison between a trajectory and an experiment, and the one
+most often quoted without its caveats. A refined B-factor and a simulated
+RMSF are related through
+
+    B = (8 pi^2 / 3) <u^2>,
+
+so a per-residue B converts to the fluctuation amplitude a crystal implies,
+in the same units the trajectory reports. What comes out is a correlation,
+and this analysis reports it with the reasons it is not an accuracy.
+
+**A crystallographic B is not only motion.** It absorbs static disorder
+across the molecules in the lattice, the refinement's own restraints, and
+whatever TLS or occupancy model was used; and the lattice itself damps the
+loop excursions a solution trajectory is free to make. The result is that
+B-factors bound loop amplitudes from below, so a simulation that agrees
+everywhere may be reporting a protein held too tightly, and one that
+exceeds them in loops may be right. The correlation is worth having and a
+regression slope is not, which is why only the first is reported.
+
+**mdtraj does not carry B-factors**, so they are read from the deposited
+file rather than from the trajectory's topology. That also keeps the
+comparison against the structure as deposited rather than against the
+prepared system, whose B column is whatever the preparation left there.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import matplotlib.pyplot as plt
+import mdtraj as md
+import numpy as np
+
+from fastmdxplora.protein_names import ALPHA_CARBONS
+from fastmdxplora.analysis.base import Analysis, superposed
+from fastmdxplora.analysis.orchestrator import register_analysis
+from fastmdxplora.refusals import StudyError
+from fastmdxplora.refusals import MissingResultError
+
+#: B = (8 pi^2 / 3) <u^2>, so <u^2> = 3B / (8 pi^2), in the file's units of
+#: square Angstroms.
+B_TO_MSF = 3.0 / (8.0 * np.pi ** 2)
+
+
+def bfactors_from_pdb(path: str | Path) -> dict[tuple[str, int, str], float]:
+    """Per-residue CA B-factors, keyed by (chain ID, residue number, insertion
+    code), in the order the file gives them.
+
+    Read by column rather than by splitting on whitespace, because the PDB
+    format is fixed-width and a five-figure atom serial or a four-character
+    residue name runs its fields together: split on spaces and the B column
+    becomes whatever happened to be next to it.
+
+    The insertion code is part of the key because it is part of the residue's
+    name: trypsin's GLY 184A (B 9.49) and TYR 184 (B 20.72) are two residues,
+    and keyed by number alone the second overwrote the first. The chain ID
+    is part of it because it names the chain: setup writes the IDs it read,
+    and a run of chain B alone is compared with chain B.
+    """
+    out: dict[tuple[str, int, str], float] = {}
+    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.startswith("ATOM"):
+            continue
+        if line[12:16].strip() != "CA":
+            continue
+        altloc = line[16]
+        if altloc not in (" ", "A"):
+            continue
+        try:
+            resseq = int(line[22:26])
+            value = float(line[60:66])
+        except ValueError:
+            continue
+        out[(line[21:22].strip(), resseq, line[26:27].strip())] = value
+    return out
+
+
+def _deposited_chains(crystal: dict[tuple[str, int, str], float]) -> list[str]:
+    """The deposited chain IDs, in the order the file gives them."""
+    return list(dict.fromkeys(chain for chain, _number, _code in crystal))
+
+
+def has_crystallographic_bfactors(path: str | Path) -> bool:
+    """Whether a file carries B-factors that mean anything.
+
+    A minimised or generated structure writes zeros, and a comparison
+    against a column of zeros is not a comparison. One non-zero value is
+    not enough either: a file where a handful of atoms carry a placeholder
+    would pass, so this asks that most of them do.
+    """
+    try:
+        values = list(bfactors_from_pdb(path).values())
+    except OSError:
+        return False
+    if len(values) < 3:
+        return False
+    return float(np.mean(np.array(values) > 0.0)) > 0.5
+
+
+class BFactorComparison(Analysis):
+    """Per-residue RMSF against the fluctuations a crystal implies.
+
+    Parameters
+    ----------
+    structure : str, optional
+        The deposited file to read B-factors from. Discovered from the run
+        directory when not given.
+    align_selection : str, default "protein and name CA"
+        Atoms used to remove rigid-body motion before fluctuations are
+        measured, as in the RMSF analysis.
+    start : float or "equilibrated", default "equilibrated"
+        The first frame the fluctuations are taken over, as the RMSF
+        analysis takes it: every frame read the relaxation from the starting
+        structure into the fluctuation, so the comparison and ``rmsf.dat``
+        disagreed (a relaxing loop 57% high).
+    **kwargs
+        Standard base-class options.
+
+    Output
+    ------
+    ``bfactor_comparison.dat`` -- residue number, simulated RMSF in nm, and
+    the RMSF implied by the deposited B-factor.
+    """
+
+    #: As for every analysis that superposes: three atoms is the fewest
+    #: that define a frame, and declaring it lets the orchestrator leave
+    #: this out of a molecule too small rather than run it to failure.
+    min_atoms_to_align = 3
+
+    #: Only where a deposited structure with real B-factors was found. A
+    #: run built from a generated or minimised coordinate file poses no
+    #: question here rather than failing to answer one.
+    requires_crystallographic_bfactors = True
+
+    name = "bfactor_comparison"
+    description = "Simulated RMSF against crystallographic B-factors"
+    default_selection = "protein"
+    time_series = False
+
+    def __init__(
+        self,
+        *,
+        structure: str | None = None,
+        align_selection: str = ALPHA_CARBONS,
+        start: float | str = "equilibrated",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        from fastmdxplora.analysis.starting_frame import start_as_given
+
+        self.structure = structure
+        self.align_selection = str(align_selection)
+        self.start: float | str | None = start_as_given(start)
+        self.options.update(
+            structure=self.structure,
+            align_selection=self.align_selection,
+            start=self.start if self.start is not None else 0,
+            conversion="B = (8 pi^2 / 3) <u^2>, isotropic",
+        )
+
+    def _structure_path(self) -> Path | None:
+        if self.structure:
+            path = Path(self.structure)
+            return path if path.is_file() else None
+        here = Path(self.output_dir)
+        for parent in (here.parent.parent, here.parent, here):
+            for candidate in (
+                parent / "setup" / "input.pdb",
+                parent / "setup" / "structure.pdb",
+                parent / "input.pdb",
+            ):
+                if candidate.is_file() and has_crystallographic_bfactors(
+                        candidate):
+                    return candidate
+        return None
+
+    def _match_chains(self, traj: md.Trajectory, alpha: np.ndarray,
+                      crystal: dict[tuple[str, int, str], float]) -> dict[int, str]:
+        """Each trajectory chain's deposited chain ID: its own ID where it
+        carries one the file has, else its place among the chains, said.
+
+        Matched by place, a run of 1HHO's chain B alone was compared with
+        chain A's B-factors (VAL 1: 70.91 against chain B's 25.93). MDTraj
+        before 1.11 drops chain IDs when it slices or copies a trajectory,
+        and place is then all there is; the finding says so.
+        """
+        deposited = _deposited_chains(crystal)
+        chains = list(dict.fromkeys(
+            traj.topology.atom(int(i)).residue.chain for i in alpha))
+        given = {c.index: str(getattr(c, "chain_id", "") or "").strip() for c in chains}
+        if all(given[c.index] in deposited for c in chains):
+            return {c.index: given[c.index] for c in chains}
+        why = ("carries no chain IDs" if not any(given.values())
+               else "carries chain IDs the deposited file does not have ("
+               + ", ".join(sorted({v for v in given.values() if v and v not in deposited}))
+               + ")")
+        matched = {c.index: deposited[k] for k, c in enumerate(chains) if k < len(deposited)}
+        self.findings["chains_matched_by_order"] = (
+            f"The trajectory {why}, so its {len(chains)} chain(s) were matched "
+            f"to the deposited file's chains by order: "
+            + ", ".join(f"chain {k + 1} to {matched[c.index]}"
+                        for k, c in enumerate(chains) if c.index in matched)
+            + ". If the run kept only some of the deposited chains, or "
+            "reordered them, the B-factors compared are another chain's. "
+            "MDTraj before 1.11 drops chain IDs when it slices a trajectory."
+        )
+        return matched
+
+    def compute(self, traj: md.Trajectory) -> np.ndarray:
+        path = self._structure_path()
+        if path is None:
+            raise MissingResultError(
+                "No deposited structure with B-factors was found beside this "
+                "run, so there is nothing to compare fluctuations against. "
+                "Give `structure` pointing at the file the study started "
+                "from. A prepared or minimised coordinate file will not do: "
+                "its B column is whatever the preparation wrote there."
+            , code="analysis.data.absent")
+
+        crystal = bfactors_from_pdb(path)
+        align_idx = traj.topology.select(self.align_selection)
+        if len(align_idx) < 3:
+            raise StudyError(
+                f"The alignment selection {self.align_selection!r} matched "
+                f"{len(align_idx)} atoms, and removing rigid-body motion "
+                "needs at least three."
+            , code="analysis.selection.arity", expression=self.align_selection)
+
+        from fastmdxplora.analysis.starting_frame import first_frame, too_few_frames
+
+        too_few_frames(traj.n_frames)
+        first, record = first_frame(traj, align_idx, self.start, 0)
+        if first > traj.n_frames - 2:
+            raise StudyError(
+                f"`start` leaves {traj.n_frames - first} of {traj.n_frames} "
+                "frames, and a fluctuation needs at least two.",
+                code="analysis.option.out_of_range")
+        self.findings["frames"] = record
+        # Onto frame 0 of the whole trajectory, as the RMSF fits, so the two
+        # columns are one number with the default selection.
+        aligned = superposed(traj[first:], frame=0, atom_indices=align_idx,
+                             reference=traj)
+        # Alpha carbons within the scope selection: comparing a chain the
+        # study excluded would report a correlation over residues it was
+        # not asked about.
+        scope = set(int(i) for i in self.select_atoms(traj))
+        alpha = np.array([
+            int(i) for i in traj.topology.select("name CA and protein")
+            if int(i) in scope
+        ], dtype=int)
+        if len(alpha) == 0:
+            raise StudyError(
+                "No alpha carbons in the selection, so there is no "
+                "per-residue fluctuation to compare."
+            , code="analysis.sampling.too_few_frames")
+
+        xyz = aligned.xyz[:, alpha, :]
+        rmsf = np.sqrt(np.mean(
+            np.sum((xyz - xyz.mean(axis=0)) ** 2, axis=2), axis=0))
+
+        chain_of = self._match_chains(traj, alpha, crystal)
+        by_number: dict[tuple[str, int], list[tuple[str, float]]] = {}
+        for (chain, number, code), value in crystal.items():
+            by_number.setdefault((chain, number), []).append((code, value))
+        from fastmdxplora.analysis.residues import has_insertions, insertion_code
+
+        codes_known = has_insertions(traj.topology)
+        seen: dict[tuple[int, int], int] = {}
+        in_trajectory: dict[tuple[int, int], int] = {}
+        for atom_index in alpha:
+            residue = traj.topology.atom(int(atom_index)).residue
+            key = (residue.chain.index, residue.resSeq)
+            in_trajectory[key] = in_trajectory.get(key, 0) + 1
+
+        rows: list[tuple[float, float, float]] = []
+        compared: list = []
+        missing = 0
+        for position, atom_index in enumerate(alpha):
+            residue = traj.topology.atom(int(atom_index)).residue
+            chain = chain_of.get(residue.chain.index)
+            deposited = by_number.get((chain, residue.resSeq), []) if chain is not None else []
+            occurrence = seen.get((residue.chain.index, residue.resSeq), 0)
+            seen[(residue.chain.index, residue.resSeq)] = occurrence + 1
+            value = None
+            if codes_known:
+                code = insertion_code(residue)
+                value = next((v for c, v in deposited if c == code), None)
+            elif len(deposited) == in_trajectory[(residue.chain.index, residue.resSeq)]:
+                # The trajectory does not carry the codes, so residues sharing
+                # a number are taken in the order the file gives them, which
+                # is the order they are in the chain: 184A, then 184.
+                value = deposited[occurrence][1]
+            elif len(deposited) == 1:
+                value = deposited[0][1]
+            if value is None or value <= 0.0:
+                missing += 1
+                continue
+            # Angstroms in the file, nanometres in the trajectory.
+            implied_nm = float(np.sqrt(B_TO_MSF * value)) / 10.0
+            rows.append((float(residue.resSeq),
+                         float(rmsf[position]), implied_nm))
+            compared.append(residue)
+
+        if len(rows) < 3:
+            raise StudyError(
+                f"Only {len(rows)} residues could be matched between the "
+                f"trajectory and {path.name}, which is too few to compare. "
+                "The usual cause is that the study renumbered or renamed "
+                "chains during preparation, so the residues no longer line "
+                "up with the deposited file."
+            , code="analysis.sampling.too_few_frames")
+
+        table = np.array(rows, dtype=float)
+        simulated, implied = table[:, 1], table[:, 2]
+        correlation = float(np.corrcoef(simulated, implied)[0, 1])
+        # Rank as well as value. Pearson on this pair is moved by the
+        # termini, which are the largest fluctuations on both sides and the
+        # least comparable: a crystallographic tail is disordered where a
+        # solution tail is mobile, and those are different statements. The
+        # rank correlation asks the question the comparison can actually
+        # answer -- whether the flexible residues are the same residues --
+        # and published values for this comparison are quoted both ways.
+        from scipy.stats import spearmanr
+        rank_correlation = float(spearmanr(simulated, implied).statistic)
+
+        self.findings["bfactor_comparison"] = {
+            "residues_compared": len(rows),
+            "residues_unmatched": missing,
+            "pearson_r": correlation,
+            "spearman_rho": rank_correlation,
+            "source": str(path),
+            "mean_simulated_nm": float(np.mean(simulated)),
+            "mean_implied_nm": float(np.mean(implied)),
+            "what_this_is_not": (
+                "A correlation, not an accuracy. A refined B-factor carries "
+                "static disorder across the lattice, the refinement's own "
+                "restraints and its TLS or occupancy model, and the lattice "
+                "damps the loop excursions a solution trajectory is free to "
+                "make. B-factors therefore bound loop amplitudes from "
+                "below: agreement everywhere can mean a protein held too "
+                "tightly, and exceeding them in loops can be correct. No "
+                "regression slope is reported, because the two are "
+                "not the same quantity."
+            ),
+        }
+        from fastmdxplora.analysis.residues import columns, distinct
+
+        if not distinct(traj.topology):
+            # Matched by chain and number, and now written that way too: the
+            # rows of every copy carried the number alone.
+            import pandas as pd
+
+            return pd.DataFrame({**columns(compared, traj.topology),
+                                 "simulated_nm": table[:, 1], "implied_nm": table[:, 2]})
+        return table
+
+    def plot(self, result: np.ndarray, ax: plt.Axes) -> None:
+        if hasattr(result, "columns"):
+            # A table names each residue's chain where there are several, and
+            # its insertion code where any has one; one chain with insertion
+            # codes (trypsin's 184 and 184A) has no chain column, and the
+            # figure raised on it.
+            several = "chain" in result
+            groups = result.groupby("chain", sort=False) if several else [("", result)]
+            for name, rows in groups:
+                said = f"chain {name}, " if several else ""
+                x = np.arange(len(rows)) if not several else rows["residue"]
+                line, = ax.plot(x, rows["simulated_nm"], linewidth=1.2,
+                                label=f"{said}simulated")
+                ax.plot(x, rows["implied_nm"], linewidth=1.2, linestyle="--",
+                        color=line.get_color(), label=f"{said}from B-factors")
+                if not several:
+                    self._label_by_residue(ax, rows)
+            ax.legend(loc="best", fontsize="small", ncol=2 if several else 1)
+            self._say_the_frames(ax)
+            return
+        ax.plot(result[:, 0], result[:, 1], linewidth=1.2, label="simulated")
+        ax.plot(result[:, 0], result[:, 2], linewidth=1.2,
+                linestyle="--", label="from B-factors")
+        ax.legend(loc="best", fontsize="small")
+        self._say_the_frames(ax)
+
+    def _say_the_frames(self, ax: plt.Axes) -> None:
+        """Which frames the simulated column is over, as the RMSF says it."""
+        from fastmdxplora.analysis.starting_frame import which_frames
+
+        said_frames = which_frames(self.findings.get("frames"))
+        if said_frames:
+            ax.text(0.01, 0.98, said_frames, transform=ax.transAxes, ha="left",
+                    va="top", fontsize="small")
+
+    @staticmethod
+    def _label_by_residue(ax: plt.Axes, rows: Any) -> None:
+        """Residues by position, ticked with their numbers and codes: 184 and
+        184A at one x drew one over the other."""
+        labels = [f"{int(n)}{code or ''}" for n, code in
+                  zip(rows["residue"], rows.get("insertion", [""] * len(rows)))]
+        step = max(1, len(labels) // 12)
+        ax.set_xticks(np.arange(0, len(labels), step))
+        ax.set_xticklabels(labels[::step])
+
+    def default_xlabel(self) -> str | None:
+        return "Residue"
+
+    def default_ylabel(self) -> str | None:
+        return "RMSF (nm)"
+
+
+register_analysis(BFactorComparison.name, BFactorComparison)

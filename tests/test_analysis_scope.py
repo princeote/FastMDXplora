@@ -13,6 +13,8 @@ the orchestrator, and we capture the selection each analysis is built with.
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pytest
 
@@ -20,10 +22,9 @@ from fastmdxplora.analysis.orchestrator import (
     VALID_SCOPES,
     AnalysisOrchestrator,
     _resolve_scope,
-    get_analysis_class,
     register_analysis,
 )
-from fastmdxplora.analysis.base import Analysis, AnalysisResult
+from fastmdxplora.analysis.base import Analysis
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +123,6 @@ def _register_probes():
 @pytest.fixture
 def tiny_traj(tmp_path):
     """A 2-frame, 2-residue PDB trajectory good enough to drive the orchestrator."""
-    import mdtraj as md
 
     pdb = tmp_path / "tiny.pdb"
     pdb.write_text(
@@ -217,6 +217,16 @@ class TestSolventBlindAnalysesSlice:
         result = qv.compute(protein_water_traj)  # would be huge/hang if unsliced
         assert np.asarray(result).shape == (2,)
 
+    @pytest.mark.xfail(
+        sys.platform == "win32",
+        reason=(
+            "Computes surface areas for real, so it meets the MDTraj "
+            "defect that returns unwritten frames on Windows. Not "
+            "strict: which calls are affected varies, so the test "
+            "passes whenever the retry finds a complete answer."
+        ),
+        strict=False,
+    )
     def test_sasa_slices_to_protein(self, protein_water_traj, tmp_path):
         from fastmdxplora.analysis.sasa import SASA
 
@@ -245,10 +255,15 @@ class TestScopeSchemaAndCLI:
         assert f.default == "solute"
 
     def test_cli_has_scope(self):
-        from fastmdxplora.cli.main import _ANALYSIS_OPTIONS
-        for flag, _kw, opts in _ANALYSIS_OPTIONS:
-            if flag == "scope":
-                assert set(opts["choices"]) == {"solute", "protein", "ligand", "all"}
-                break
-        else:
-            pytest.fail("--scope not found in _ANALYSIS_OPTIONS")
+        from fastmdxplora.cli.main import _ANALYSIS_OPTIONS, _build_parser
+
+        assert any(flag == "scope" for flag, _kw, _opts in _ANALYSIS_OPTIONS), (
+            "--scope not found in _ANALYSIS_OPTIONS"
+        )
+        # The accepted values are asked of the parser, not the option table.
+        # The schema declares them once and the parser reads them from there,
+        # so the table no longer carries a copy -- and the parser is what a
+        # user meets.
+        analyze = _build_parser()._subparsers._group_actions[0].choices["analyze"]
+        choices = next(a.choices for a in analyze._actions if a.dest == "scope")
+        assert set(choices) == {"solute", "protein", "ligand", "all"}

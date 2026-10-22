@@ -11,30 +11,55 @@ drives the CLI and the Python API:
 Public API
 ----------
 - :func:`validate_config` -- strict schema validation (raises ConfigError)
+- :func:`refuse_what_can_be_seen` -- what a run would refuse before it
+  starts that the schema cannot know: a system setup cannot read, a
+  selection that does not parse (raises ConfigError)
 - :func:`load_config_file` -- parse a YAML config to a dict
 - :func:`phase_options` -- extract per-phase option blocks
-- :func:`generate_template` -- the ``fastmdx init-config`` template
+- :func:`generate_template` -- the ``fastmdx config`` template
 - :func:`write_resolved_config` -- the reproducibility dump
 - :class:`ConfigError` -- raised on any config problem
 - :data:`PHASE_SCHEMAS` -- the schema registry (single source of truth)
 """
 
 from fastmdxplora.config.generate import generate_template, write_resolved_config
+from fastmdxplora.config.agent_modes import (
+    AgentModes,
+    resolve_agent_modes,
+    unchecked_phases,
+)
+from fastmdxplora.config.describe import (
+    describe_field,
+    describe_schema,
+    schema_as_json,
+)
 from fastmdxplora.config.loader import (
     ConfigError,
+    STUDY_LEVEL_KEYS,
     load_config_file,
     phase_options,
+    study_options,
     validate_config,
 )
+from fastmdxplora.config.before_run import refuse_what_can_be_seen
 from fastmdxplora.config.schema import PHASE_SCHEMAS, PhaseSchema
 
 __all__ = [
+    "AgentModes",
+    "resolve_agent_modes",
+    "unchecked_phases",
+    "describe_schema",
+    "describe_field",
+    "schema_as_json",
     "ConfigError",
     "PHASE_SCHEMAS",
     "PhaseSchema",
     "generate_template",
     "load_config_file",
     "phase_options",
+    "refuse_what_can_be_seen",
+    "STUDY_LEVEL_KEYS",
+    "study_options",
     "validate_config",
     "write_resolved_config",
 ]

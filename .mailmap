@@ -1,0 +1,12 @@
+# One person, one name: git shortlog, git log --use-mailmap and git blame
+# read this file. It changes nothing in the history.
+
+Adekunle Aina <kunleaina@gmail.com>
+Adekunle Aina <kunleaina@gmail.com> <aaina@csudh.edu>
+Adekunle Aina <kunleaina@gmail.com> <aaina@Adekunles-MBP.lan>
+
+# A misconfigured environment. The commits it made for Derrick keep him as
+# their author.
+Adekunle Aina <kunleaina@gmail.com> Review <review@localhost>
+
+Derrick K <91711641+Paradoxicaly@users.noreply.github.com>

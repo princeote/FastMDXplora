@@ -29,7 +29,7 @@ from fastmdxplora.config import (
     validate_config,
     write_resolved_config,
 )
-from fastmdxplora.config.schema import TOP_LEVEL, all_schemas
+from fastmdxplora.config.schema import all_schemas
 from fastmdxplora.cli.main import main as cli_main
 
 
@@ -51,7 +51,24 @@ SYS = [{"id": "a", "system": "x.pdb"}]
 def stub_pdb(tmp_path: Path) -> Path:
     p = tmp_path / "protein.pdb"
     p.write_text(
-        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        # A tripeptide, not a lone residue: one amino acid is simultaneously
+        # N- and C-terminal, and AMBER has no template for that. CHARMM36
+        # tolerated it, so this fixture survived until the default changed.
+        "ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N\n"
+        "ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      3  C   ALA A   1       2.009   1.420   0.000  1.00  0.00           C\n"
+        "ATOM      4  O   ALA A   1       1.251   2.390   0.000  1.00  0.00           O\n"
+        "ATOM      5  CB  ALA A   1       1.988  -0.773  -1.199  1.00  0.00           C\n"
+        "ATOM      6  N   GLY A   2       3.332   1.549   0.000  1.00  0.00           N\n"
+        "ATOM      7  CA  GLY A   2       3.972   2.849   0.000  1.00  0.00           C\n"
+        "ATOM      8  C   GLY A   2       5.486   2.705   0.000  1.00  0.00           C\n"
+        "ATOM      9  O   GLY A   2       6.008   1.593   0.000  1.00  0.00           O\n"
+        "ATOM     10  N   ALA A   3       6.171   3.845   0.000  1.00  0.00           N\n"
+        "ATOM     11  CA  ALA A   3       7.623   3.845   0.000  1.00  0.00           C\n"
+        "ATOM     12  C   ALA A   3       8.174   5.265   0.000  1.00  0.00           C\n"
+        "ATOM     13  O   ALA A   3       7.416   6.235   0.000  1.00  0.00           O\n"
+        "ATOM     14  CB  ALA A   3       8.153   3.072  -1.199  1.00  0.00           C\n"
+        "ATOM     15  OXT ALA A   3       9.400   5.400   0.000  1.00  0.00           O\n"
         "END\n"
     )
     return p
@@ -82,6 +99,8 @@ class TestSchema:
         assert setup.get("ph").default == SETUP_DEFAULTS["ph"]
         assert setup.get("ion_concentration_M").default == SETUP_DEFAULTS["ion_concentration_M"]
         assert setup.get("box_shape").default == SETUP_DEFAULTS["box_shape"]
+        assert setup.get("preparation_audit").default is False
+        assert SETUP_DEFAULTS["preparation_audit"] is False
 
 
 # ===========================================================================
@@ -199,8 +218,22 @@ class TestValidation:
         })
 
     def test_execution_bad_mode_rejected(self):
-        with pytest.raises(ConfigError, match="execution.mode must be"):
+        """The refusal is unchanged; the sentence now comes from the schema.
+
+        `mode` was checked here against a hand-written ("sequential",
+        "parallel") pair, beside a schema that named the same pair in prose
+        and declared no `choices` -- so the parser could not offer them and
+        the GUI could not either. It has the tuple now and is refused on the
+        same terms as the other nine choice-bearing settings, which is why
+        the wording moved. Asserted on the value and the accepted list rather
+        than on a phrase, so the next such consolidation does not fail a test
+        that is not about it.
+        """
+        with pytest.raises(ConfigError) as refusal:
             validate_config({"systems": SYS, "execution": {"mode": "turbo"}})
+        message = str(refusal.value)
+        assert "mode" in message and "'turbo'" in message
+        assert "sequential" in message and "parallel" in message
 
 
 # ===========================================================================
@@ -346,33 +379,52 @@ class TestOrchestrator:
 # End-to-end via the CLI
 # ===========================================================================
 class TestCLIConfig:
-    def test_init_config_writes_template(self, tmp_path):
+    def test_config_writes_template(self, tmp_path):
         out = tmp_path / "template.yml"
-        rc = cli_main(["init-config", "-o", str(out)])
+        rc = cli_main(["config", "-f", str(out)])
         assert rc == 0
         assert out.exists()
         # And it validates (systems is present and required)
         validate_config(load_config_file(out), require_systems=True)
 
-    def test_init_config_minimal(self, tmp_path):
+    def test_config_minimal(self, tmp_path):
         out = tmp_path / "min.yml"
-        rc = cli_main(["init-config", "-o", str(out), "--minimal"])
+        rc = cli_main(["config", "-f", str(out), "--minimal"])
         assert rc == 0
         assert "duration_ns" in out.read_text(encoding="utf-8")
         assert "systems:" in out.read_text(encoding="utf-8")
 
-    def test_init_config_refuses_overwrite(self, tmp_path):
+    def test_config_refuses_overwrite(self, tmp_path):
         out = tmp_path / "exists.yml"
         out.write_text("systems: []\n")
-        rc = cli_main(["init-config", "-o", str(out)])
+        rc = cli_main(["config", "-f", str(out)])
         assert rc == 2  # refuses without --force
+        assert out.read_text() == "systems: []\n"
 
-    def test_init_config_force_overwrites(self, tmp_path):
+    def test_config_force_overwrites(self, tmp_path):
         out = tmp_path / "exists.yml"
         out.write_text("old content\n")
-        rc = cli_main(["init-config", "-o", str(out), "--force"])
+        rc = cli_main(["config", "-f", str(out), "--force"])
         assert rc == 0
         assert "FastMDXplora configuration" in out.read_text(encoding="utf-8")
+
+    def test_config_writes_the_default_file_where_it_is_typed(
+            self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert cli_main(["config"]) == 0
+        assert (tmp_path / "fastmdxplora.yml").is_file()
+
+    def test_config_takes_its_file_by_its_long_name(self, tmp_path):
+        out = tmp_path / "long.yml"
+        assert cli_main(["config", "--file", str(out), "--minimal"]) == 0
+        assert out.is_file()
+
+    def test_the_old_name_says_where_the_command_went(self, tmp_path, capsys):
+        out = tmp_path / "old.yml"
+        assert cli_main(["init-config", "-o", str(out)]) == 2
+        assert not out.exists()
+        assert ("`fastmdx init-config` is now `fastmdx config` "
+                "(`-o FILE` is now `-f FILE`).") in capsys.readouterr().err
 
     def test_explore_with_config(self, tmp_path, stub_pdb):
         cfg = _write_yaml(tmp_path, f"""
@@ -388,12 +440,14 @@ systems:
 
     def test_config_short_flags(self, tmp_path, stub_pdb):
         """-c / -config / --config all work on explore."""
-        for flag in ("-c", "-config", "--config"):
-            out = tmp_path / f"out_{flag.strip('-')}"
+        # Numbered, because `strip("-")` gave `-config` and `--config` the
+        # same directory -- so the third run wrote into the second's output.
+        for index, flag in enumerate(("-c", "-config", "--config")):
+            out = tmp_path / f"out_{index}_{flag.strip('-')}"
             cfg2 = _write_yaml(
                 tmp_path,
                 f"output: {out}\ninclude: [setup]\nsystems:\n  - {{id: a, system: {stub_pdb}}}\n",
-                name=f"c_{flag.strip('-')}.yml",
+                name=f"c_{index}_{flag.strip('-')}.yml",
             )
             rc = cli_main(["explore", flag, str(cfg2)])
             assert rc == 0, f"{flag} failed"
@@ -475,3 +529,432 @@ systems:
         cfg = _write_yaml(tmp_path, f"systems:\n  - {{id: a, system: {stub_pdb}}}\n")
         with pytest.raises(ValueError, match="not both"):
             FastMDXplora(system=str(stub_pdb), config=str(cfg))
+
+
+class TestSettingsAreGrouped:
+    """Thirty-six settings for setup and thirty-seven for simulation arrived
+    as one flat list each, in the order they happened to be declared: a pH sat
+    beside a dispersion correction.
+
+    Finding the one you wanted meant reading all of them, which is a list to
+    read rather than a form to fill in. The schema is the one place that knows
+    what a setting is, so it is the place that says what it is about -- and
+    the browser and `--help` are two views of that one grouping rather than
+    two groupings that agree until one is edited.
+    """
+
+    def test_every_setting_is_in_exactly_one_group(self) -> None:
+        """A setting added and not placed would appear under 'Other' in every
+        interface at once. This is what makes that a failure rather than
+        something somebody notices later."""
+        from fastmdxplora.config.schema import PHASE_SCHEMAS, SETTING_GROUPS
+
+        for phase, schema in PHASE_SCHEMAS.items():
+            declared = {field.name for field in schema.fields}
+            placed: list[str] = []
+            for _title, _why, names in SETTING_GROUPS[phase]:
+                placed.extend(names)
+
+            assert not (declared - set(placed)), (
+                f"{phase}: not in any group: {sorted(declared - set(placed))}")
+            assert not (set(placed) - declared), (
+                f"{phase}: grouped but not declared: "
+                f"{sorted(set(placed) - declared)}")
+            assert len(placed) == len(set(placed)), (
+                f"{phase}: named in two groups: "
+                f"{sorted({n for n in placed if placed.count(n) > 1})}")
+
+    def test_a_group_says_what_it_is_about(self) -> None:
+        """A heading that only repeats the settings under it earns nothing."""
+        from fastmdxplora.config.schema import SETTING_GROUPS
+
+        for phase, groups in SETTING_GROUPS.items():
+            for title, why, names in groups:
+                assert title and not title.endswith(":"), (phase, title)
+                assert why and why.endswith("."), (phase, title)
+                assert names, (phase, title)
+
+    def test_the_groups_come_back_with_the_fields_in_them(self) -> None:
+        """In the declared order, which is the order a decision is met."""
+        from fastmdxplora.config.schema import (
+            PHASE_SCHEMAS,
+            SETTING_GROUPS,
+            grouped_fields,
+        )
+
+        for phase, schema in PHASE_SCHEMAS.items():
+            groups = grouped_fields(phase)
+            returned = [f.name for _t, _w, fields in groups for f in fields]
+            declared = [name for _t, _w, names in SETTING_GROUPS[phase]
+                        for name in names]
+
+            assert returned == declared
+            assert len(returned) == len(schema.fields)
+            assert not any(title == "Other" for title, _w, _f in groups)
+
+    def test_the_browser_is_given_them(self) -> None:
+        from fastmdxplora.gui.schema_payload import schema_payload
+
+        simulation = schema_payload()["phases"]["simulation"]
+        titles = [group["title"] for group in simulation["groups"]]
+        assert "Enhanced sampling" in titles
+        assert "How long it runs" in titles
+        drawn = sum(len(group["fields"]) for group in simulation["groups"])
+        assert drawn == len(simulation["fields"])
+
+    def test_and_help_reads_as_sections(self) -> None:
+        """Thirty-seven flags in declaration order is the same problem in a
+        terminal."""
+        from fastmdxplora.cli.main import _build_parser
+
+        parser = _build_parser()
+        simulate = parser._subparsers._group_actions[0].choices["simulate"]
+        titles = [group.title for group in simulate._action_groups]
+
+        assert "simulate: enhanced sampling" in titles
+        assert "simulate: how long it runs" in titles
+        assert "simulate options" not in titles, (
+            "every flag is an option; the word carries nothing")
+
+    def test_the_two_views_read_in_the_same_order(self) -> None:
+        """They are one grouping seen twice, so a reader moving between them
+        is not learning a second arrangement."""
+        from fastmdxplora.cli.main import _build_parser
+        from fastmdxplora.gui.schema_payload import schema_payload
+
+        page = [group["title"].lower()
+                for group in schema_payload()["phases"]["simulation"]["groups"]]
+
+        parser = _build_parser()
+        simulate = parser._subparsers._group_actions[0].choices["simulate"]
+        terminal = [group.title.removeprefix("simulate: ")
+                    for group in simulate._action_groups
+                    if group.title and group.title.startswith("simulate: ")
+                    and group.title != "simulate: other"]
+
+        assert terminal == page
+
+
+class TestTheResolvedConfigNamesEverySettingTheRunUsed:
+    """The point of the file, and what it did not do.
+
+    It recorded only what was explicitly set, so a phase that ran entirely
+    on its defaults left no block at all. That reproduces a study on the
+    version that wrote it and on no other: a default moving in a later
+    release silently changes what the file meant, which is the failure the
+    file exists to prevent.
+    """
+
+    @staticmethod
+    def _written(options, tmp_path):
+        import yaml
+
+        from fastmdxplora.config import write_resolved_config
+
+        path = write_resolved_config(
+            {"system": "1UBQ", "output": str(tmp_path), "options": options},
+            tmp_path,
+        )
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    def test_every_field_of_every_phase_is_named(self, tmp_path):
+        from fastmdxplora.config.schema import PHASE_SCHEMAS
+
+        doc = self._written({"setup": {"ph": 6.5}}, tmp_path)
+
+        for phase, schema in PHASE_SCHEMAS.items():
+            assert set(doc[phase]) == schema.field_names(), phase
+
+    def test_a_phase_that_ran_on_defaults_still_appears(self, tmp_path):
+        doc = self._written({"setup": {"ph": 6.5}}, tmp_path)
+
+        assert doc["report"]["title"] is None
+        assert doc["analysis"]["scope"] == "solute"
+
+    def test_what_was_set_still_wins_over_the_default(self, tmp_path):
+        doc = self._written({"setup": {"ph": 6.5}}, tmp_path)
+
+        assert doc["setup"]["ph"] == 6.5
+
+    def test_the_values_are_phase_values_not_declared_defaults(self, tmp_path):
+        """`simulation.pressure_bar` declares 1.0 and starts a phase at None,
+        so that `pressure_atm` stays detectable. Writing the declared default
+        would make bar always present, and bar wins."""
+        from fastmdxplora.config.schema import PHASE_SCHEMAS
+
+        doc = self._written({}, tmp_path)
+
+        for phase, schema in PHASE_SCHEMAS.items():
+            for field in schema.fields:
+                assert doc[phase][field.name] == field.phase_value, (
+                    f"{phase}.{field.name}")
+
+    def test_a_pressure_in_atm_survives_the_round_trip(self, tmp_path):
+        """The regression writing `Field.default` would have caused: a run
+        at 1.2 atm replaying at 1.0 bar, silently."""
+        from fastmdxplora.config import load_config_file, phase_options
+
+        doc = self._written({"simulation": {"pressure_atm": 1.2}}, tmp_path)
+        assert doc["simulation"]["pressure_bar"] is None
+
+        replayed = phase_options(
+            load_config_file(tmp_path / "resolved_config.yml"))["simulation"]
+        assert replayed["pressure_atm"] == 1.2
+        assert "pressure_bar" not in replayed
+
+    def test_a_duration_is_not_overridden_by_a_step_count(self, tmp_path):
+        """Step counts override durations, so a step count written beside
+        the duration it was derived from would change the run on replay.
+        A field resolved at run time is written null, which the loader
+        reads as "use the default"."""
+        from fastmdxplora.config import load_config_file, phase_options
+
+        doc = self._written({"simulation": {"nvt_duration_ns": 2}}, tmp_path)
+        assert doc["simulation"]["nvt_steps"] is None
+
+        replayed = phase_options(
+            load_config_file(tmp_path / "resolved_config.yml"))["simulation"]
+        assert replayed["nvt_duration_ns"] == 2
+        assert "nvt_steps" not in replayed
+
+    def test_it_round_trips_to_the_same_run(self, tmp_path):
+        """The whole claim: what a phase gets from the written file is what
+        it got from the config that produced it."""
+        from fastmdxplora.config import load_config_file, phase_options
+
+        original = {"setup": {"ph": 6.5, "forcefield": "amber14"},
+                    "simulation": {"duration_ns": 10}}
+        self._written(original, tmp_path)
+
+        replayed = phase_options(
+            load_config_file(tmp_path / "resolved_config.yml"))
+        for phase, block in original.items():
+            for key, value in block.items():
+                assert replayed[phase][key] == value
+
+    def test_the_written_file_still_validates(self, tmp_path):
+        from fastmdxplora.config import load_config_file, validate_config
+
+        self._written({"setup": {"ph": 6.5}}, tmp_path)
+        validate_config(
+            load_config_file(tmp_path / "resolved_config.yml"),
+            require_systems=True,
+        )
+
+    def test_the_short_form_is_still_available(self, tmp_path):
+        import yaml
+
+        from fastmdxplora.config import write_resolved_config
+
+        path = write_resolved_config(
+            {"system": "1UBQ", "options": {"setup": {"ph": 6.5}}},
+            tmp_path, full=False,
+        )
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert doc["setup"] == {"ph": 6.5}
+        assert "report" not in doc
+
+    def test_each_block_is_the_dict_the_phase_was_handed(self, tmp_path):
+        """The tightest statement of what the file is, and the one that
+        catches drift.
+
+        Every phase begins `{**DEFAULTS, **options}` with its own
+        module-level DEFAULTS, itself `PhaseSchema.defaults()`. Writing
+        that same merge means the file is not a reconstruction of the run
+        -- it is the dict the phase received. Anything that makes the two
+        diverge, on either side, shows up here rather than as a study that
+        replays differently.
+        """
+        import yaml
+
+        from fastmdxplora.config import write_resolved_config
+        from fastmdxplora.report.run import DEFAULTS as REPORT_DEFAULTS
+        from fastmdxplora.setup.pipeline import DEFAULTS as SETUP_DEFAULTS
+        from fastmdxplora.simulation.pipeline import (
+            DEFAULTS as SIMULATION_DEFAULTS,
+        )
+
+        options = {
+            "setup": {"ph": 6.5},
+            "simulation": {"pressure_atm": 1.2, "nvt_duration_ns": 2},
+            "report": {"title": "A study"},
+        }
+        path = write_resolved_config(
+            {"system": "1UBQ", "options": options}, tmp_path)
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+        for phase, defaults in (("setup", SETUP_DEFAULTS),
+                                ("simulation", SIMULATION_DEFAULTS),
+                                ("report", REPORT_DEFAULTS)):
+            assert doc[phase] == {**defaults, **options.get(phase, {})}, (
+                f"the {phase} block is not what the {phase} phase is handed")
+
+
+class TestAPhaseSaysWhatItWorkedOutForItself:
+    """The settings whose value the run decides, and used to lose.
+
+    A duration is not a number of steps until a timestep says so, and a
+    `forcefield: auto` is not a force field until a registry says which.
+    Those answers were worked out inside the phase and went no further, so
+    the file meant to reproduce the run wrote `null` and asked the same
+    question again -- of whatever version happened to be replaying it.
+
+    Each phase now records what it decided, under the config's own names,
+    and the resolved config reads it.
+    """
+
+    @staticmethod
+    def _record(run_dir, phase, resolved):
+        import json
+
+        where = {
+            "setup": "setup/setup_parameters.json",
+            "simulation": "simulation/simulation_parameters.json",
+            "analysis": "analysis/analysis_manifest.json",
+        }[phase]
+        path = run_dir / where
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"resolved": resolved}), encoding="utf-8")
+
+    @staticmethod
+    def _dump(run_dir, **options):
+        import yaml
+
+        from fastmdxplora.config import write_resolved_config
+
+        path = write_resolved_config(
+            {"system": "1UBQ", "output": str(run_dir), "options": options},
+            run_dir)
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    def test_a_step_count_worked_out_from_a_duration_is_written(
+        self, tmp_path
+    ):
+        self._record(tmp_path, "simulation", {"production_steps": 25_000_000})
+        doc = self._dump(tmp_path, simulation={"duration_ns": 50})
+        assert doc["simulation"]["production_steps"] == 25_000_000
+
+    def test_the_duration_it_came_from_is_kept_beside_it(self, tmp_path):
+        """Both, and they agree. The count is the duration, so on replay
+        the count winning over the duration gives the same run -- which is
+        not true of a count that was merely the default."""
+        self._record(tmp_path, "simulation", {"production_steps": 25_000_000})
+        doc = self._dump(tmp_path, simulation={"duration_ns": 50})
+        assert doc["simulation"]["duration_ns"] == 50
+        steps_per_ns = round(1_000_000.0 / doc["simulation"]["timestep_fs"])
+        assert doc["simulation"]["production_steps"] == 50 * steps_per_ns
+
+    def test_a_pressure_given_in_atm_is_recorded_in_bar(self, tmp_path):
+        """And the two agree, so either winning replays the same pressure.
+
+        Stage A wrote `pressure_bar: null` and left the conversion to be
+        done again. This records the number the barostat used.
+        """
+        from fastmdxplora.simulation.runner import ATM_TO_BAR
+
+        ran_at = 1.2 * ATM_TO_BAR
+        self._record(tmp_path, "simulation", {"pressure_bar": ran_at})
+        doc = self._dump(tmp_path, simulation={"pressure_atm": 1.2})
+        assert doc["simulation"]["pressure_bar"] == pytest.approx(ran_at)
+        assert doc["simulation"]["pressure_atm"] == 1.2
+        assert (doc["simulation"]["pressure_atm"] * ATM_TO_BAR
+                == pytest.approx(doc["simulation"]["pressure_bar"]))
+
+    def test_the_default_set_of_measures_is_named(self, tmp_path):
+        """`include: null` means "the default set", which is a property of
+        the version that ran. A release that adds a measure changes what
+        the unset value meant."""
+        self._record(tmp_path, "analysis",
+                     {"include": ["rmsd", "rmsf", "rg"]})
+        doc = self._dump(tmp_path)
+        assert doc["analysis"]["include"] == ["rmsd", "rmsf", "rg"]
+
+    def test_a_force_field_chosen_by_a_registry_is_named(self, tmp_path):
+        self._record(tmp_path, "setup",
+                     {"force_field": ["amber14-all.xml"], "water_model": "tip3p"})
+        doc = self._dump(tmp_path)
+        assert doc["setup"]["force_field"] == ["amber14-all.xml"]
+        assert doc["setup"]["water_model"] == "tip3p"
+
+    def test_a_setting_the_caller_gave_is_not_overwritten(self, tmp_path):
+        """A record says what the phase worked out. Where the caller said
+        it, the caller's value is what the study asked for."""
+        self._record(tmp_path, "simulation", {"timestep_fs": 4.0})
+        doc = self._dump(tmp_path, simulation={"timestep_fs": 1.0})
+        assert doc["simulation"]["timestep_fs"] == 4.0, (
+            "a recorded resolution is the more specific truth")
+
+    def test_a_key_that_is_not_a_setting_cannot_reach_the_config(
+        self, tmp_path
+    ):
+        """The records are files on disk, and setup's own parameters carry
+        private keys. A config with an unknown option is refused on replay,
+        so the file that must replay cannot be built by copying."""
+        self._record(tmp_path, "setup", {
+            "_retained_pdb": "/tmp/x.pdb",
+            "_reinstated_heterogens": ["BEN"],
+            "not_a_setting": 1,
+            "switch_distance_nm": 0.9,
+        })
+        doc = self._dump(tmp_path)
+        assert doc["setup"]["switch_distance_nm"] == 0.9
+        for leaked in ("_retained_pdb", "_reinstated_heterogens",
+                       "not_a_setting"):
+            assert leaked not in doc["setup"]
+
+    def test_a_run_with_no_records_still_dumps(self, tmp_path):
+        """A phase that did not run, a run from before the records existed,
+        and one whose phase failed before writing are the same answer."""
+        doc = self._dump(tmp_path, setup={"ph": 6.5})
+        assert doc["setup"]["ph"] == 6.5
+        assert doc["simulation"]["production_steps"] is None
+
+    def test_an_unreadable_record_is_not_fatal(self, tmp_path):
+        (tmp_path / "simulation").mkdir(parents=True)
+        (tmp_path / "simulation" / "simulation_parameters.json").write_text(
+            "{not json", encoding="utf-8")
+        doc = self._dump(tmp_path, simulation={"duration_ns": 50})
+        assert doc["simulation"]["duration_ns"] == 50
+
+    def test_what_a_run_achieved_is_not_written_back(self, tmp_path):
+        """Decisions, not outcomes. A run interrupted at 12 ns of a 50 ns
+        study must not replay as a 12 ns study -- so `duration_ns_actual`
+        stays out of the resolved block, under its own name."""
+        import json
+
+        path = tmp_path / "simulation" / "simulation_parameters.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({
+            "duration_ns_actual": 12.0,
+            "n_production_frames": 240,
+            "resolved": {"production_steps": 25_000_000},
+        }), encoding="utf-8")
+        doc = self._dump(tmp_path, simulation={"duration_ns": 50})
+        assert doc["simulation"]["duration_ns"] == 50
+        assert doc["simulation"]["production_steps"] == 25_000_000
+
+    def test_the_file_still_validates_with_every_record_present(
+        self, tmp_path
+    ):
+        from fastmdxplora.config.loader import (
+            load_config_file, normalise_config, validate_config,
+        )
+
+        self._record(tmp_path, "setup",
+                     {"switch_distance_nm": 0.9, "water_model": "tip3p"})
+        self._record(tmp_path, "simulation", {
+            "nvt_steps": 50_000, "npt_steps": 50_000,
+            "production_steps": 25_000_000,
+            "trajectory_interval_steps": 12_500, "pressure_bar": 1.0})
+        self._record(tmp_path, "analysis", {
+            "trajectory": "simulation/production.dcd",
+            "topology": "simulation/topology.pdb",
+            "include": ["rmsd"], "selection": "protein"})
+
+        from fastmdxplora.config import write_resolved_config
+
+        path = write_resolved_config(
+            {"system": "1UBQ", "output": str(tmp_path),
+             "options": {"simulation": {"duration_ns": 50}}}, tmp_path)
+        data = normalise_config(load_config_file(path))
+        validate_config(data, require_systems=True)

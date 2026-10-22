@@ -17,11 +17,20 @@ Output layout adapts to the run count:
 Execution modes (``execution:`` block):
 
   - **sequential** (default) — one run at a time, in process.
-  - **parallel** — a process pool of ``workers`` runs at once. On GPU,
-    set ``devices: [0, 1, ...]`` and each worker is pinned to a distinct
-    device round-robin (one run per GPU), which is the only safe way to
-    parallelize GPU MD — oversubscribing a single GPU is slower than
-    sequential.
+  - **parallel** — a process pool of ``workers`` runs at once. Setting
+    ``devices: [0, 1, ...]`` pins each worker to a distinct device
+    round-robin, one run per GPU, which is the safe default where there is
+    more than one card.
+
+    ``workers`` without ``devices`` puts them all on the same GPU. This
+    said that was always slower than sequential, and that is not a
+    measurement -- it depends entirely on whether one run saturates the
+    card, and a modestly sized solvated system on a large modern GPU does
+    not. A thirty-window umbrella study of trypsin and benzamidine, three
+    at a time on one RTX 4090, ran ten groups of three at about 390 ns/day
+    aggregate; the claim above would have had it run one at a time. How
+    many fit is a property of the system and the card, so measure it rather
+    than take a number from here.
 
 Process-based (not thread-based) parallelism is mandatory: OpenMM
 contexts and the GIL don't share across threads. Each run is therefore
@@ -32,8 +41,14 @@ from __future__ import annotations
 
 import json
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime, timezone
+import time
+from contextlib import contextmanager
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ProcessPoolExecutor,
+    wait as wait_for_any,
+)
+from multiprocessing import get_context
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -45,6 +60,9 @@ from fastmdxplora.batch.sweep import (
 )
 from fastmdxplora.config import load_config_file, validate_config
 from fastmdxplora.utils.logging import get_logger
+from fastmdxplora.refusals import RunStopped, StudyError
+from fastmdxplora.refusals import MissingResultError
+from fastmdxplora.refusals import OutputExistsError
 
 if TYPE_CHECKING:
     from fastmdxplora.orchestrator import RunResult
@@ -52,11 +70,540 @@ if TYPE_CHECKING:
 logger = get_logger("batch")
 
 
+#: How long the terminal may say nothing before it says something. A window of
+#: a real study runs for hours, and every worker's output goes to its own log
+#: so three of them do not interleave -- which left the terminal silent for the
+#: whole run, with no way to tell a study that is working from one that has
+#: hung.
+HEARTBEAT_SECONDS = 60.0
+
+
+def _elapsed(seconds: float) -> str:
+    """A duration a person can read at a glance."""
+    seconds = int(seconds)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    return f"{minutes}m{seconds:02d}s"
+
+
+#: How wide the bar is drawn. Narrow enough to leave room for the counts on
+#: an eighty-column terminal.
+_BAR_WIDTH = 28
+
+
+def _progress_line(*, running: int, done: int, queued: int, total: int,
+                   seconds: float) -> str:
+    """What is happening, for a terminal that would otherwise show nothing.
+
+    A bar rather than a sentence. A study of nine windows on a laptop prints
+    one of these a minute for an hour, and sixty lines saying almost the same
+    thing bury the ones that matter -- the windows finishing, and anything
+    that went wrong. The stage runners already draw a bar for the steps
+    inside a run; this is the same thing for the runs inside a study.
+    """
+    filled = int(round(_BAR_WIDTH * done / total)) if total else 0
+    bar = "━" * filled + "─" * (_BAR_WIDTH - filled)
+    percent = (100.0 * done / total) if total else 0.0
+    return (f"    {bar} {percent:5.1f}%  {done}/{total} done, "
+            f"{running} running, {queued} queued  {_elapsed(seconds)}")
+
+
+def _is_a_terminal() -> bool:
+    """Whether stdout is somewhere a redrawn line means anything."""
+    import sys
+
+    stream = sys.stdout
+    if not hasattr(stream, "isatty"):
+        return False
+    try:
+        return bool(stream.isatty())
+    except Exception:  # noqa: BLE001 - a stream that cannot say is not one.
+        return False
+
+
+def _how_far_along(run_dirs) -> str:
+    """Step progress for the runs in flight, from what they already write.
+
+    A member of a campaign has no terminal. Its stage bars go to
+    `on_step_progress`, which in a worker goes nowhere, and the runner
+    deliberately keeps them out of the run log -- a file of the same line at
+    one per cent intervals is noise. The consequence was that a campaign
+    printed "0/3 done" for hours with no way to tell a healthy run from a
+    stalled one, and the only recourse was watching a DCD grow.
+
+    Nothing new is recorded here. `live_status.json` already carries
+    `current_step` against `total_planned_steps`, written by the telemetry
+    the runner starts by default. This reads it back, so the study's own
+    heartbeat can say how far its members have got.
+
+    Returns empty where nothing can be read: telemetry switched off, a run
+    that has not written its first status, or a file caught mid-write. A
+    heartbeat that fails is worse than a heartbeat that says less.
+    """
+    parts = []
+    for run_id, run_dir in run_dirs:
+        # A run being carried on writes its status in the segment it runs
+        # now, so the newest is read; the run's own stood still at the step
+        # where it stopped for as long as the rest took.
+        found = [Path(run_dir) / "simulation" / "live_status.json",
+                 *Path(run_dir).glob("segment-*/simulation/live_status.json")]
+        try:
+            status_path = max((path for path in found if path.is_file()),
+                              key=lambda path: path.stat().st_mtime)
+        except (ValueError, OSError):
+            continue
+        try:
+            status = json.loads(status_path.read_text())
+        except Exception:  # noqa: BLE001 -- absent, partial, or unreadable
+            continue
+        done = status.get("current_step")
+        total = status.get("total_planned_steps")
+        if not isinstance(done, int) or not isinstance(total, int) or total <= 0:
+            continue
+        # The short form of the run id: the axis value is what distinguishes
+        # members, and the shared prefix is the same on every one of them.
+        label = str(run_id).split("__")[-1]
+        parts.append(f"{label} {100.0 * done / total:.0f}%")
+    return ("  [" + ", ".join(parts) + "]") if parts else ""
+
+
+def _clear_progress_line() -> None:
+    """Wipe the bar before an event is printed over it.
+
+    A finished window prints its own line, and without this it would land on
+    top of a bar that ends with no newline.
+    """
+    if _is_a_terminal():
+        print("\r" + " " * 78 + "\r", end="", flush=True)
+
+
+def _give_this_worker_its_share(threads: int) -> None:
+    """Cap the threads one parallel run may take, in the worker that runs it.
+
+    OpenMM's CPU platform takes every core it can see, and a pool of workers
+    each doing that does not divide the machine between them -- it has them
+    fight over it. Six runs on eight cores oversubscribe by six times, and
+    the study finishes slower than three would have.
+
+    Set in the worker process rather than passed down through the runner,
+    because it is a property of being one of several on a machine and not of
+    the simulation, and because the libraries below read it once at import.
+    """
+    import os
+
+    for variable in ("OPENMM_CPU_THREADS", "OMP_NUM_THREADS",
+                     "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                     "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[variable] = str(threads)
+    _listen_for_a_stop_in_this_worker()
+
+
+#: Set while a worker is running a run, so a stop that reaches an idle
+#: worker (between runs, waiting for work) is not raised into the pool's
+#: own loop, which would break the pool and every run in it.
+_running_a_run = False
+
+#: What a run ended by a stop outside production is recorded as, where no
+#: phase was running to carry the refusal.
+STOPPED_ERROR_TYPE = "Stopped"
+
+
+def _listen_for_a_stop_in_this_worker() -> None:
+    """Have a stop end this worker's run with a record, not end the worker.
+
+    Without it, SIGTERM or Ctrl-C reaching a worker outside production
+    killed it, and a worker dying breaks a ``ProcessPoolExecutor``: every
+    run still going lost its result with it. Production has its own
+    listener, which ends on a frame (see ``simulation/runner.py``); outside
+    it, the phase that was running ends with the retryable refusal
+    ``simulation.run.stopped``, and `fastmdx resume` runs that phase again.
+    """
+    import signal
+    import threading
+
+    if threading.current_thread() is not threading.main_thread():  # pragma: no cover
+        return
+    for number in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(number, _stop_this_run)
+        except (ValueError, OSError):  # pragma: no cover - a platform without it
+            continue
+
+
+def _stop_this_run(number: int, _frame: Any) -> None:
+    """The worker's stop listener; see :func:`_listen_for_a_stop_in_this_worker`."""
+    import signal
+
+    from fastmdxplora.simulation.runner import _a_stop_heard
+
+    heard = _a_stop_heard(number)
+    if heard == "again":
+        return
+    if heard == "now":
+        # Asked twice: stop now, as the signal would have with no listener.
+        signal.signal(number, signal.SIG_DFL)
+        os.kill(os.getpid(), number)
+        return
+    if not _running_a_run:
+        return
+    from fastmdxplora.refusals import RunStopped
+
+    raise RunStopped(signal.Signals(number).name)
+
+
+def _without_the_study_rule(options: dict[str, Any]) -> dict[str, Any]:
+    """A run's settings without `simulation.stop_when`. The study applies
+    its stopping rule across its runs once they finish; a run is one piece
+    of it, and a length."""
+    options = dict(options)
+    simulation = options.get("simulation")
+    if isinstance(simulation, dict) and "stop_when" in simulation:
+        options["simulation"] = {key: value for key, value in simulation.items()
+                                 if key != "stop_when"}
+    return options
+
+
+def _extend_one(run: str, more_ns: float, device: str | None) -> dict[str, Any]:
+    """One run extended, in a worker of its own."""
+    from fastmdxplora.simulation.resume import extend_study
+
+    return extend_study(run, more_ns=more_ns, device_index=device)
+
+
+def _was_stopped(result: Any) -> bool:
+    """Whether a run ended because it was asked to stop."""
+    from fastmdxplora.simulation.runner import STOPPED_CODE
+
+    # A run carried on to the end keeps the record of the stop it came back
+    # from; only one that ended stopped counts.
+    if getattr(result, "status", None) != "error":
+        return False
+    if getattr(result, "error_type", None) == STOPPED_ERROR_TYPE:
+        return True
+    return any((getattr(phase, "refusal", None) or {}).get("code") == STOPPED_CODE
+               for phase in getattr(result, "phases", None) or ())
+
+
+class _StudyStop:
+    """SIGTERM and SIGINT to the parent of a parallel study.
+
+    No further run is started, each run in progress ends where it can be
+    carried on, and the study then writes its record and returns. SIGTERM
+    is passed on to every worker, since it is sent to one process: a Stop
+    pressed in the GUI signals this one alone, and before this the workers
+    never heard it. Ctrl-C reaches them from the terminal. A second, later
+    one is obeyed at once.
+    """
+
+    def __init__(self, pool: Any) -> None:
+        self.pool = pool
+        self.signal: int | None = None
+        self._previous: dict[int, Any] = {}
+
+    @property
+    def requested(self) -> bool:
+        return self.signal is not None
+
+    def __enter__(self) -> "_StudyStop":
+        import signal
+        import threading
+
+        from fastmdxplora.simulation.runner import _listen_afresh
+
+        if threading.current_thread() is not threading.main_thread():
+            return self
+        _listen_afresh()
+        for number in (signal.SIGTERM, signal.SIGINT):
+            try:
+                self._previous[number] = signal.signal(number, self._heard)
+            except (ValueError, OSError):  # pragma: no cover
+                continue
+        return self
+
+    def _pass_on(self, number: int) -> None:
+        import signal
+
+        # Ctrl-C reaches the workers already: a terminal sends it to the
+        # whole process group. SIGTERM is sent to one process.
+        if number != signal.SIGTERM:
+            return
+        # Private to the executor, and the only list of its workers there is.
+        for pid in list(getattr(self.pool, "_processes", None) or {}):
+            try:
+                os.kill(int(pid), number)
+            except (ProcessLookupError, PermissionError, OSError, ValueError):
+                continue
+
+    def _heard(self, number: int, _frame: Any) -> None:
+        import signal
+
+        from fastmdxplora.simulation.runner import _a_stop_heard, stop_grace_seconds
+
+        heard = _a_stop_heard(number)
+        if heard == "again":
+            return
+        self._pass_on(number)
+        if heard == "first":
+            self.signal = number
+            logger.warning(
+                "%s received: each run in progress ends where it can be carried "
+                "on (in production, at its next frame if that is within %.0f s), "
+                "and no further run starts. Send it again to stop now.",
+                signal.Signals(number).name, stop_grace_seconds())
+            return
+        self._restore()
+        if number == signal.SIGINT:
+            raise KeyboardInterrupt
+        os.kill(os.getpid(), number)
+
+    def _restore(self) -> None:
+        import signal
+
+        for number, previous in self._previous.items():
+            try:
+                signal.signal(number, previous)
+            except (ValueError, OSError, TypeError):  # pragma: no cover
+                pass
+        self._previous = {}
+
+    def __exit__(self, *_exc: Any) -> bool:
+        self._restore()
+        return False
+
+
+def _threads_for_each(n_workers: int) -> int:
+    """The cores each worker may use, so together they fill the machine once.
+
+    At least one: a worker with no threads runs nothing, and a study with
+    more workers than cores is a scheduling choice rather than an error.
+    """
+    import os
+
+    cores = os.cpu_count() or 1
+    return max(1, cores // max(1, n_workers))
+
+
+#: Coordinates a standard-state binding free energy means anything along.
+#: A distance between two groups has a volume element; a torsion does not.
+COORDINATES_WITH_A_VOLUME = ("ligand_distance", "distance")
+
+
+def _the_coordinate_has_a_volume(plan: Any) -> bool:
+    """Whether a standard-state correction has anything to correct.
+
+    The correction is about the volume a ligand gives up on binding. Along a
+    torsion there is no volume and no concentration, so a number computed
+    there would be a category error rather than an inaccuracy.
+    """
+    return getattr(plan, "collective_variable", None) in \
+        COORDINATES_WITH_A_VOLUME
+
+
+def _a_binding_free_energy_belongs_here(payload: dict[str, Any],
+                                        plan: Any) -> bool:
+    """Whether this study is one the number can honestly be taken from.
+
+    There has to be a curve, and the overlap and sampling gates are what
+    decide that: a number integrated over a curve stitched across a gap would
+    be the most quotable thing the study produced and the least supported. And
+    the coordinate has to be one with a volume.
+
+    A predicate rather than a condition written inline, because it is the rule
+    itself and a rule that can only be checked by reading the source around
+    the call is a rule two tests broke on the day the call moved.
+    """
+    return bool(payload.get("pmf")) and _the_coordinate_has_a_volume(plan)
+
+
+class _WindowsRanOtherwise(StudyError):
+    """Windows on disk that ran with settings the config no longer gives."""
+
+    default_code = "config.option.conflicting"
+
+
+def _what_the_binding_says(binding: "dict[str, Any] | None") -> list[str]:
+    """The binding free energy as the console says it, with its warnings.
+
+    It was written to `pmf.json` and said nowhere, so the number a study of
+    this kind exists for, or the reason it was withheld, had to be looked for.
+    """
+    if not isinstance(binding, dict):
+        return []
+    lines = []
+    value = binding.get("delta_g_kjmol")
+    if value is not None:
+        error = binding.get("delta_g_standard_error_kjmol")
+        spread = f" +/- {error:.1f}" if error is not None else ""
+        lines.append(f"Binding:        {value:.1f}{spread} kJ/mol "
+                     "(standard state, 1 M)")
+    elif binding.get("refused"):
+        lines.append("Binding:        not reported -- "
+                     + str(binding["refused"]).split(". ")[0].rstrip(".") + ".")
+    for warning in (binding.get("reference") or {}).get("warnings") or []:
+        lines.append(f"Warning:        {warning}")
+    return lines
+
+
+def _a_prepared_system_is_there(setup_dir: Path) -> bool:
+    """Whether the three files a simulation starts from are on disk.
+
+    Asked through the simulation phase's own check, so what counts as
+    prepared is decided in one place. Its answer is a tuple of paths, and an
+    empty answer is a tuple of Nones -- which is truthy, so it is the first
+    element that has to be read.
+    """
+    from fastmdxplora.simulation.pipeline import _setup_outputs_present
+
+    return _setup_outputs_present(setup_dir)[0] is not None
+
+
 def _first_error_phase_message(phases: list[Any]) -> str:
     for phase in phases:
         if getattr(phase, "status", None) == "error":
             return getattr(phase, "message", "") or f"Phase '{phase.name}' failed."
     return ""
+
+
+#: Umbrella's own settings, which the collective-variable layer does not take.
+_UMBRELLA_ONLY = frozenset({
+    "centres", "centers", "centre", "from", "to", "n_windows",
+    "force_constant", "minimum_overlap", "minimum_samples",
+    "bootstrap_resamples",
+    # The wall on the angle is umbrella's own: the coordinate layer biases a
+    # distance and knows nothing about the cone around it.
+    "cone",
+    "index",
+})
+
+
+def _resolve_umbrella_selections(spec: dict[str, Any], topology: Any) -> None:
+    """Resolve an umbrella block's coordinate, and check its windows.
+
+    Two checks, because they catch different things. `plan_windows` reads the
+    positions and the force constant. The selections go through the shared
+    collective-variable layer, which is where a selection matching no atoms
+    is caught -- and that layer belongs to metadynamics, so it asks for a
+    `sigma` an umbrella study has no use for. Steered MD had the same problem
+    and answered it by supplying one and ignoring it; the same answer serves
+    here rather than a second copy of the resolver.
+    """
+    from fastmdxplora.simulation.metadynamics import plan_from_config
+    from fastmdxplora.simulation.umbrella import plan_windows
+
+    # The windows, only where the study's own spec is still intact. By the
+    # time this runs the block has been expanded: each window carries the
+    # single `centre` it sits at, and `from`, `to` and `n_windows` are gone.
+    # Asking the study's planner to validate a window's spec reported `from`
+    # as missing from a config that had it -- a refusal for the absence of a
+    # key that expansion had consumed on purpose.
+    if any(key in spec for key in ("centres", "centers", "from", "n_windows")):
+        plan_windows(spec)
+
+    coordinate = {k: v for k, v in spec.items() if k not in _UMBRELLA_ONLY}
+    coordinate.setdefault("sigma", 0.05)
+    coordinate.setdefault("unbounded", True)
+    plan_from_config(coordinate, topology)
+
+
+def _check_selections_against(prepared: Path, spec: dict[str, Any]) -> None:
+    """Resolve a biasing block's selections before any window is launched.
+
+    A selection is checked when a window starts, which is after the shared
+    system has been built and a run submitted. `resid 3 and name CA` on a
+    tripeptide -- MDTraj counts residues from zero, so there is no resid 3 --
+    cost a full preparation and a failed run to discover, and in a parallel
+    study it failed three windows at once. The topology is on disk by then
+    and the selections are in the config, so nothing about it needed a
+    simulation to find out.
+
+    Silent where it cannot tell: a selection this cannot resolve is not
+    thereby wrong, and refusing on that basis would be worse than the wait.
+    """
+    # Each method's own planner, not one for both. `plan_from_config` is
+    # metadynamics', and it requires `sigma` -- the width of a hill. An
+    # umbrella study has no hills and no sigma, so checking one through that
+    # planner refused a valid config for lacking a setting the method does
+    # not have. The selection-resolving code is shared between the methods;
+    # the validation around it is not.
+    planners = []
+    if isinstance(spec.get("umbrella"), dict):
+        umbrella = dict(spec["umbrella"])
+        planners.append(
+            lambda: _resolve_umbrella_selections(umbrella, _mdtop()))
+    if isinstance(spec.get("metadynamics"), dict):
+        from fastmdxplora.simulation.metadynamics import plan_from_config
+
+        metadynamics = dict(spec["metadynamics"])
+        planners.append(lambda: plan_from_config(metadynamics, _mdtop()))
+    if isinstance(spec.get("steered"), dict):
+        from fastmdxplora.simulation.steered import plan_steered
+
+        steered = dict(spec["steered"])
+        planners.append(lambda: plan_steered(steered, _mdtop()))
+    if not planners:
+        return
+    topology = prepared / "topology.pdb"
+    if not topology.is_file():
+        return
+
+    def _mdtop():
+        import mdtraj as md
+
+        return md.load(str(topology)).topology
+
+    try:
+        for planner in planners:
+            planner()
+    except ValueError as exc:
+        raise StudyError(
+            f"{exc}\n\nFound before any window ran, by resolving the "
+            "selection against the prepared system. Nothing has been "
+            "simulated."
+        , code="simulation.cv.selection_empty") from exc
+    except Exception:  # noqa: BLE001 - anything else is not a verdict
+        # Could not resolve it here, which is not the same as it being wrong.
+        return
+
+
+def _what_would_fix_it(study: Any) -> list[str]:
+    """What would fix each thing that stopped the study, and its price, as
+    the console says it. Nothing where nothing stopped it."""
+    try:
+        from fastmdxplora.remedies import remedies_of
+
+        found = remedies_of(study)
+    except Exception:  # noqa: BLE001 - advice, never the study's outcome
+        logger.debug("What would fix the study could not be read", exc_info=True)
+        return []
+    if not found:
+        return []
+    lines = ["What would fix it:"]
+    for remedy in found:
+        lines.extend("  " + line for line in remedy.as_lines())
+    return lines
+
+
+def _why_it_failed(result: Any) -> str:
+    """The reason a run stopped, ready to print.
+
+    The message was written into the manifest and never to the screen, so a
+    study that stopped said only which run had failed. Three separate causes
+    -- a selection matching no atoms, a box collapsing under NPT, a directory
+    already holding output -- each looked identical from the terminal, and
+    each needed the manifest opened to tell apart. A run's own log has the
+    detail; the reason it stopped belongs where the reader is looking.
+    """
+    message = str(getattr(result, "message", "") or "").strip()
+    if not message:
+        return "No reason was recorded. The run's own log may say more."
+    return message
+
+
+#: How a window of a study only prepared is said: skipped, its preparing
+#: done once for every window. Read by the Agent's summary as completed.
+PREPARED_ONCE = "Prepared once"
 
 
 def _skipped_run_result(spec: RunSpec, run_out: Path, message: str) -> "RunResult":
@@ -76,6 +623,48 @@ def _skipped_run_result(spec: RunSpec, run_out: Path, message: str) -> "RunResul
 # ---------------------------------------------------------------------------
 # Module-level worker (must be top-level so ProcessPoolExecutor can pickle it)
 # ---------------------------------------------------------------------------
+@contextmanager
+def _nothing_to_silence():
+    """A context manager that lets the output through."""
+    yield
+
+
+def _resume_run(spec_dict: dict[str, Any], run_out: str,
+                device_override: str | None, *, quiet: bool,
+                quiet_banner: Any) -> "RunResult":
+    """One run of a study being resumed, carried on from where it stopped."""
+    import os as _os
+
+    from fastmdxplora.orchestrator import RunResult, _phases_recorded_in
+    from fastmdxplora.simulation.resume import resume_study
+
+    try:
+        with quiet_banner(_os.path.join(run_out, "run.log")) if quiet \
+                else _nothing_to_silence():
+            answer = resume_study(run_out, device_index=device_override)
+    except (Exception, RunStopped) as exc:  # noqa: BLE001 -- isolate per-run failures
+        from fastmdxplora.refusals import refusal_of
+        from fastmdxplora.simulation.runner import STOPPED_CODE
+
+        if isinstance(exc, RunStopped):
+            exc = exc.as_error()
+        answer = {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                  "stopped": refusal_of(exc).code == STOPPED_CODE}
+    ok = bool(answer.get("ok"))
+    return RunResult(
+        run_id=spec_dict["run_id"],
+        system=spec_dict["system"],
+        status="ok" if ok else "error",
+        output_dir=Path(run_out),
+        sweep_values=spec_dict["sweep_values"],
+        phases=_phases_recorded_in(Path(run_out)),
+        message=(answer.get("detail") or f"resumed: {answer.get('did')}") if ok
+        else str(answer.get("error") or "it could not be resumed"),
+        error_type=None if ok else (STOPPED_ERROR_TYPE if answer.get("stopped")
+                                    else "ResumeRefused"),
+    )
+
+
 def _execute_run(
     spec_dict: dict[str, Any],
     run_out: str,
@@ -83,8 +672,16 @@ def _execute_run(
     exclude: list[str] | None,
     verbose: bool,
     device_override: str | None,
+    quiet: bool = True,
+    force: bool = False,
+    resume: bool = False,
+    keep_previous: bool = False,
 ) -> "RunResult":
     """Run one study and return a RunResult. Safe to call in a subprocess.
+
+    With ``resume``, a run that started before is carried on by
+    :func:`~fastmdxplora.simulation.resume.resume_study` rather than run
+    again, and one that never started is run as it would have been.
 
     Takes plain dicts/strings (picklable) rather than RunSpec objects so it
     works cleanly across the process boundary. Returns a RunResult, which
@@ -103,27 +700,136 @@ def _execute_run(
         except (AttributeError, ValueError):
             pass
 
+    # Several workers share one terminal, so none of them should print a
+    # banner to it. Three copies of the wordmark arriving a character at a
+    # time is not three runs starting -- it is one unreadable screen. Each
+    # run writes its own log file, and the batch prints the progress that
+    # belongs to the whole study.
+    # Restored when the run ends, because this function is called in-process
+    # by the tests as well as in a subprocess by a real run, and a worker
+    # that leaves a global changed poisons everything after it.
+    import os as _os
+    import sys as _sys
+
+    class _QuietBanner:
+        """Keep a worker's output out of the shared terminal.
+
+        Two sources. FastMDXplora's obeys an environment variable. PLUMED's comes from
+        C++ and writes to the file descriptor directly, so redirecting
+        Python's ``sys.stdout`` does not reach it -- the same lesson as a
+        Markdown renderer that printed its installation guide from a dynamic
+        loader. The descriptor itself has to move.
+
+        It moves to the run's own log, so nothing is lost: a worker's output
+        belongs beside its results rather than mixed with two others'.
+        """
+
+        def __init__(self, log_path):
+            self.log_path = log_path
+
+        def __enter__(self):
+            self.previous = _os.environ.get("FASTMDX_LOG_STYLE")
+            _os.environ["FASTMDX_LOG_STYLE"] = "plain"
+
+            self.saved = None
+            try:
+                _os.makedirs(_os.path.dirname(self.log_path), exist_ok=True)
+                self.sink = open(self.log_path, "a", encoding="utf-8")
+                self.saved = (_os.dup(1), _os.dup(2))
+                _os.dup2(self.sink.fileno(), 1)
+                _os.dup2(self.sink.fileno(), 2)
+            except OSError:
+                # A worker that cannot redirect should still run.
+                self.saved = None
+            return self
+
+        def __exit__(self, *_exc):
+            if self.saved is not None:
+                # Flush while the descriptors are still moved. PLUMED's
+                # writes sit in the C runtime's buffer until something
+                # empties it, and whatever is still there when the
+                # descriptors go back lands in the shared terminal -- the
+                # leak this guard exists to prevent, arriving late. The
+                # trajectory loader learned the same thing from MDTraj's
+                # plugin messages on macOS.
+                from fastmdxplora.utils.native_output import _LIBC
+
+                for stream in (_sys.stdout, _sys.stderr):
+                    try:
+                        stream.flush()
+                    except (ValueError, OSError):
+                        pass
+                if _LIBC is not None:
+                    try:
+                        _LIBC.fflush(None)  # fflush(NULL): every open stream
+                    except OSError:
+                        pass
+
+                out, err = self.saved
+                _os.dup2(out, 1)
+                _os.dup2(err, 2)
+                _os.close(out)
+                _os.close(err)
+                self.sink.close()
+            if self.previous is None:
+                _os.environ.pop("FASTMDX_LOG_STYLE", None)
+            else:
+                _os.environ["FASTMDX_LOG_STYLE"] = self.previous
+            return False
+
     # Imported here so the subprocess sets up its own logging/imports.
     from fastmdxplora import FastMDXplora
     from fastmdxplora.orchestrator import RunResult
 
-    options = dict(spec_dict["options"])
+    options = _without_the_study_rule(spec_dict["options"])
     # Round-robin GPU pinning: stamp this worker's device onto the run.
     if device_override is not None:
         sim = dict(options.get("simulation", {}))
         sim["device_index"] = device_override
         options["simulation"] = sim
 
+    # A stop reaching a worker from here on ends this run with a record.
+    global _running_a_run
+    from fastmdxplora.simulation.runner import _listen_afresh
+
+    _listen_afresh()
+    _running_a_run = True
+    if resume and (Path(run_out) / "resolved_config.yml").is_file():
+        try:
+            return _resume_run(spec_dict, run_out, device_override, quiet=quiet,
+                               quiet_banner=_QuietBanner)
+        finally:
+            _running_a_run = False
+    if resume:
+        # Never started: whatever a killed parent left in its folder (the
+        # folder itself, at most) is not a result to protect.
+        force = True
+
     try:
-        fmdx = FastMDXplora(
-            system=spec_dict["system"],
-            output_dir=run_out,
-            options=options,
-            verbose=verbose,
-        )
-        # A single-system explore() returns a one-element list of RunResult;
-        # take its phases and re-stamp the run's identity from the spec.
-        inner = fmdx.explore(include=include, exclude=exclude, report=True)
+        # Redirected only where output would collide. The guard exists so
+        # three parallel workers do not interleave three PLUMED banners into
+        # one unreadable screen; with a single run there is nothing to
+        # interleave with, and redirecting it left a config-driven study of
+        # one system printing a line and then nothing for half an hour.
+        with _QuietBanner(_os.path.join(run_out, "run.log")) if quiet \
+                else _nothing_to_silence():
+            fmdx = FastMDXplora(
+                system=spec_dict["system"],
+                output_dir=run_out,
+                options=options,
+                study_options=spec_dict.get("study") or None,
+                verbose=verbose,
+                _system_id=spec_dict.get("system_id") or None,
+                # Validated as the study it was expanded from, before the
+                # expansion; a run's settings are that study's, not a person's.
+                _expanded_from_a_validated_study=True,
+            )
+            # A single-system explore() returns a one-element list of
+            # RunResult; take its phases and re-stamp the run's identity.
+            inner = fmdx.explore(
+                include_phase=include, exclude_phase=exclude, report=True,
+                force=force, **({"keep_previous": True} if keep_previous else {}),
+            )
         phases = inner[0].phases if inner else []
         status = "error" if any(p.status == "error" for p in phases) else "ok"
         message = _first_error_phase_message(phases) if status == "error" else ""
@@ -137,7 +843,13 @@ def _execute_run(
             message=message,
             error_type="PhaseError" if status == "error" else None,
         )
-    except Exception as exc:  # noqa: BLE001 -- isolate per-run failures
+    except (Exception, RunStopped) as exc:  # noqa: BLE001 -- isolate per-run failures
+        from fastmdxplora.refusals import refusal_of
+        from fastmdxplora.simulation.runner import STOPPED_CODE
+
+        if isinstance(exc, RunStopped):
+            exc = exc.as_error()
+        stopped = refusal_of(exc).code == STOPPED_CODE
         return RunResult(
             run_id=spec_dict["run_id"],
             system=spec_dict["system"],
@@ -146,8 +858,231 @@ def _execute_run(
             sweep_values=spec_dict["sweep_values"],
             phases=[],
             message=f"{type(exc).__name__}: {exc}",
-            error_type=type(exc).__name__,
+            error_type=STOPPED_ERROR_TYPE if stopped else type(exc).__name__,
         )
+    finally:
+        _running_a_run = False
+
+
+def _not_submitted(after: str, *, umbrella: bool) -> str:
+    """Why a run was not started.
+
+    Umbrella windows are one measurement, so a failure ends the study rather
+    than costing it a data point -- and saying so is the difference between a
+    reader thinking something crashed and knowing the rest was not attempted
+    on purpose.
+    """
+    if umbrella:
+        return (
+            f"Not submitted: window '{after}' failed, and a free energy needs "
+            "every window -- the rest would be hours spent on runs that get "
+            "thrown away."
+        )
+    return (
+        f"Not submitted because continue_on_error=False stopped after failed "
+        f"run '{after}'."
+    )
+
+
+# The dashboard matches this to explain the commonest failure a run has.
+# A constant rather than a literal on both sides: a reworded message would
+# otherwise stop being recognised with nothing failing anywhere.
+ALREADY_HOLD_RESULTS = "These output directories already hold results:"
+
+
+def campaign_of(run: Path) -> Path | None:
+    """The study of several runs ``run`` is one of, or None."""
+    run = Path(run)
+    if run.parent.name == "runs" and (run.parent.parent / "batch_manifest.json").is_file():
+        return run.parent.parent
+    return None
+
+
+def compare_the_runs_again(campaign: Path) -> Path | None:
+    """A study of several runs' table of members and comparison, built
+    again from its runs' analyses as they are now, marked as the study
+    marks them. Best-effort, as after a campaign: the runs' own results
+    stand whether or not these are built."""
+    import yaml
+
+    explorer = BatchExplorer.__new__(BatchExplorer)
+    explorer.output_dir = Path(campaign)
+    try:
+        explorer._raw = yaml.safe_load(
+            (explorer.output_dir / "resolved_config.yml").read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        explorer._raw = {}
+    explorer._maybe_aggregate_members()
+    try:
+        from fastmdxplora.batch.compare import build_comparison_report
+
+        with explorer._marking_for_comparison():
+            path = build_comparison_report(explorer.output_dir)
+    except Exception as exc:  # noqa: BLE001 -- never break the run
+        logger.warning("Comparison report failed (runs are unaffected): %s", exc)
+        return None
+    if path is not None:
+        print(f"Comparison:     {path / 'comparison_report.md'}")
+    return path
+
+
+def _say_if_the_replicas_will_not_share_water(run_specs) -> None:
+    """Name `prepared_from` where runs differ only in how they are driven.
+
+    Setup places hydrogens and ions at random (OpenMM's Modeller does), so
+    unless `setup.random_seed` is given two preparations of one system are
+    two systems; the hydrogens set the solute's extent, and the box and its
+    water follow. This module already
+    shares one prepared system across umbrella windows for that reason --
+    "water arranged differently between windows is noise in the free energy
+    rather than physics" -- but that path is gated on `_is_umbrella`, and a
+    seed sweep is not umbrella.
+
+    A seed sweep is the same case in kind: one system, one setup block, only
+    the integrator's seed differing. Left alone, each member solvates
+    independently. Measured on a three-member sweep: 30,654 atoms against
+    30,803. Anything called a replica sweep then measures dynamics variance
+    *plus* solvation variance, and nothing in the output says so, because
+    every recorded setting is identical -- the difference is in water that no
+    setting names.
+
+    This says it rather than fixing it, deliberately. Sharing setup by
+    default would silently change what an existing config produces, and a
+    study half-run under the old behaviour would stop being comparable with
+    its own earlier members. The person is told at plan time, once, with the
+    setting that resolves it.
+    """
+    if len(run_specs) < 2:
+        return
+
+    def preparation(spec):
+        return json.dumps(
+            {"system": spec.system, "setup": spec.options.get("setup") or {}},
+            sort_keys=True, default=str)
+
+    if len({preparation(spec) for spec in run_specs}) != 1:
+        return  # Different systems, or prepared differently on purpose.
+    # Both spellings. Checking only one told a study that had already done
+    # the right thing to go and do it -- the worst kind of warning, because
+    # a reader who believes it concludes their config is wrong.
+    if any((spec.options.get("simulation") or {}).get("setup_from")
+           or (spec.options.get("simulation") or {}).get("prepared_from")
+           for spec in run_specs):
+        return
+    # A seed for setup's random choices prepares every run alike.
+    if (run_specs[0].options.get("setup") or {}).get("random_seed") is not None:
+        return
+
+    logger.warning(
+        "These %d runs share one system and one setup block, so they differ "
+        "only in how they are driven -- but each is prepared with a random "
+        "seed of its own, which places the hydrogens and ions, and so the "
+        "box and its water, differently. Differences between them will "
+        "include the preparation as well as the dynamics. Set "
+        "`setup.random_seed` to prepare them alike, or "
+        "`simulation.setup_from` to a finished study to share one prepared "
+        "system.",
+        len(run_specs))
+
+
+def _file_digest(system: Any) -> str | None:
+    """The SHA-256 of a structure given as a file; None for anything else."""
+    import hashlib
+
+    path = Path(str(system)).expanduser()
+    try:
+        if not path.is_file():
+            return None
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _what_it_was_prepared_for(shared: Path) -> dict[str, Any] | None:
+    """What a shared system was prepared from: its `prepared_for.json`, or,
+    for one prepared before that was written, its own setup record. None
+    where neither can be read."""
+    try:
+        found = json.loads((shared / "prepared_for.json").read_text(encoding="utf-8"))
+        if isinstance(found, dict):
+            return found
+    except (OSError, ValueError):
+        pass
+    try:
+        setup = json.loads((shared / "setup" / "setup_parameters.json")
+                           .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(setup, dict) or not isinstance(setup.get("parameters"), dict):
+        return None
+    given = setup.get("input") or {}
+    return {"system": given.get("system"), "setup": setup["parameters"],
+            "structure_sha256": (given.get("structure") or {}).get("sha256"),
+            "read_from": "setup record"}
+
+
+def _same_setting(first: Any, second: Any) -> bool:
+    """One setting, compared as a value: 7 and 7.0 are one pH."""
+    numbers = (int, float)
+    if (isinstance(first, numbers) and isinstance(second, numbers)
+            and not isinstance(first, bool) and not isinstance(second, bool)):
+        return float(first) == float(second)
+    return json.dumps(first, sort_keys=True, default=str) == json.dumps(
+        second, sort_keys=True, default=str)
+
+
+def _what_differs(found: dict[str, Any], wanted: dict[str, Any]) -> list[str]:
+    """The settings, and the system, a shared preparation differs from a
+    study in. A setup record holds every setting the phase used, defaults
+    included, so it is checked on what the study states; a setting it does
+    not hold cannot be confirmed and counts as different."""
+    if found.get("structure_sha256") and wanted.get("structure_sha256"):
+        same_system = found["structure_sha256"] == wanted["structure_sha256"]
+    else:
+        same_system = str(found.get("system")) == str(wanted["system"])
+    stated = wanted.get("setup") or {}
+    held = found.get("setup") or {}
+    if found.get("read_from") == "setup record":
+        keys = set(stated)
+    else:
+        keys = set(stated) | set(held)
+    changed = sorted(key for key in keys
+                     if key not in held or key not in stated
+                     or not _same_setting(held[key], stated[key]))
+    if not same_system:
+        changed.insert(0, "system")
+    return changed
+
+
+def _phases_it_recorded(output_dir: Path, study: dict[str, Any]) -> "tuple[Any, Any] | None":
+    """The phases a study of several runs recorded, where this run asks for
+    none of its simulation and the record says it simulated: its analysis
+    or report run again is still that study, and writing `[analysis,
+    report]` over its record made the Config that reproduces it reproduce
+    only its analysis (as a study of one run's does, `orchestrator`)."""
+    def simulates(include: Any, exclude: Any) -> bool:
+        return ((not isinstance(include, list) or not include or "simulation" in include)
+                and not (isinstance(exclude, list) and "simulation" in exclude))
+
+    if simulates(study.get("include_phase"), study.get("exclude_phase")):
+        return None
+    try:
+        import yaml
+
+        recorded = yaml.safe_load((Path(output_dir) / "resolved_config.yml").read_text(
+            encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - nothing recorded, nothing kept
+        return None
+    if not isinstance(recorded, dict) or not any(
+            (Path(output_dir) / "runs").glob("*/simulation/live_status.json")):
+        return None
+    include, exclude = recorded.get("include_phase"), recorded.get("exclude_phase")
+    if not simulates(include, exclude):
+        return None
+    from fastmdxplora.orchestrator import _with_the_phases_run
+
+    now = study.get("include_phase")
+    return _with_the_phases_run(include, exclude, now if isinstance(now, list) else None)
 
 
 class BatchExplorer:
@@ -180,9 +1115,13 @@ class BatchExplorer:
         output_dir: str | os.PathLike | None = None,
         verbose: bool = False,
         continue_on_error: bool | None = None,
+        force: bool = False,
+        resume: bool = False,
+        rerun_windows: "list[int] | None" = None,
+        keep_previous: bool = False,
     ) -> None:
         if config is None and config_data is None:
-            raise ValueError("BatchExplorer requires `config` (path) or `config_data` (dict).")
+            raise StudyError("BatchExplorer requires `config` (path) or `config_data` (dict).", code="config.option.missing_companion")
 
         if config_data is not None:
             self.config_path = str(config) if config is not None else "<in-memory>"
@@ -192,16 +1131,51 @@ class BatchExplorer:
             raw = load_config_file(self.config_path)
         validate_config(raw, require_systems=True)
         self._raw = raw
+        # `--rerun` is `--force-overwrite` keeping what it replaces in each
+        # run's previous/ (`fastmdxplora.replaced`).
+        self.keep_previous = bool(keep_previous)
+        self.force = bool(force or keep_previous)
+        # Carrying on a study that stopped: each run that started is resumed
+        # from where it got to, and each that never started is run.
+        self.resume = bool(resume)
         self.verbose = verbose
+        # Umbrella windows to run again in place, every other window kept.
+        # Carried out as a resume of the study with those windows moved
+        # aside, so a kept window is left as it is and a named one starts
+        # afresh with whatever the config now gives it.
+        self.rerun_windows = sorted({int(i) for i in rerun_windows or []})
+        if self.rerun_windows and self.force:
+            raise StudyError(
+                "--rerun-window keeps every window it does not name, and "
+                "--force-overwrite or --rerun runs them all again. Choose one.",
+                code="config.option.conflicting")
 
         # Execution settings
         execution = raw.get("execution") or {}
-        self.mode = execution.get("mode", "sequential")
         self.workers = execution.get("workers")
         self.devices = execution.get("devices")
+        # Asking for workers or devices is asking to run in parallel. The two
+        # were read independently, so `workers: 3` on its own scheduled the
+        # runs one at a time and said nothing about it -- and a study of nine
+        # windows took three times as long as it was told to. Nobody sets a
+        # worker count wanting one at a time, and nobody lists GPUs to leave
+        # all but one idle. `mode` written out still wins, so a config that
+        # asks for both a worker count and sequential gets sequential.
+        self.mode = execution.get("mode") or (
+            "parallel" if (self.workers or self.devices) else "sequential")
+        # Umbrella windows are one measurement, not several systems. A
+        # campaign should carry on when one system fails -- the others are
+        # still results. A free energy cannot be computed at all if a window
+        # is missing, so continuing spends hours producing runs that will be
+        # thrown away.
+        from fastmdxplora.simulation.umbrella import plan_from_expanded
+
+        self._is_umbrella = plan_from_expanded(raw) is not None
+
         self.continue_on_error = (
             continue_on_error if continue_on_error is not None
-            else execution.get("continue_on_error", True)
+            else execution.get(
+                "continue_on_error", not self._is_umbrella)
         )
         # The cross-run comparison report is a reporting artifact, so it's
         # controlled by the `report` block (default on).
@@ -210,20 +1184,24 @@ class BatchExplorer:
 
         # Output root
         resolved_output = output_dir or raw.get("output")
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        from fastmdxplora.naming import default_output_name, system_of
+
         self.output_dir = (
             Path(resolved_output) if resolved_output
-            else Path(f"fastmdxplora_output_{timestamp}")
+            else Path(default_output_name(system_of(raw)))
         )
 
         # Expand the run matrix
         self.run_specs = self._build_run_specs(raw)
         self.is_single = len(self.run_specs) == 1
         self.results: list[dict[str, Any]] = []
+        if not self._is_umbrella:
+            # Windows prepared alike already share one preparation.
+            _say_if_the_replicas_will_not_share_water(self.run_specs)
 
     # ------------------------------------------------------------------
     def _build_run_specs(self, raw: dict[str, Any]) -> list[RunSpec]:
-        from fastmdxplora.config import phase_options
+        from fastmdxplora.config import phase_options, study_options
 
         base_options = phase_options(raw)
 
@@ -231,9 +1209,142 @@ class BatchExplorer:
         sweep = (
             normalize_sweep(raw["sweep"]) if raw.get("sweep") is not None else None
         )
-        return expand_runs(systems=systems, sweep=sweep, base_options=base_options)
+        specs = expand_runs(
+            systems=systems, sweep=sweep, base_options=base_options
+        )
+        # `phase_options` keeps the four phase blocks and nothing else, so
+        # the study-level settings are attached here rather than threaded
+        # through the cross-product, which has no opinion about them. Every
+        # run of one config shares them: they describe the study.
+        study = study_options(raw)
+        if study:
+            from fastmdxplora.config.defaults_file import decisions_for_system
+
+            for spec in specs:
+                spec.study = dict(study)
+                if "decisions" in study:
+                    # A default only some systems took is the reason only in
+                    # their runs' records.
+                    spec.study["decisions"] = decisions_for_system(
+                        study["decisions"], spec.system_id)
+        return specs
 
     # ------------------------------------------------------------------
+    def _refuse_to_overwrite_runs(
+        self, include: list[str] | None, exclude: list[str] | None
+    ) -> None:
+        if self.force or self.resume:
+            return
+        from fastmdxplora.orchestrator import PHASES
+
+        planned = [
+            phase
+            for phase in PHASES
+            if (not include or phase in include)
+            and (not exclude or phase not in exclude)
+        ]
+        clashes: list[str] = []
+        for spec in self.run_specs:
+            run_out = self._run_output_dir(spec)
+            occupied = [
+                phase
+                for phase in planned
+                if (run_out / phase).is_dir() and any((run_out / phase).iterdir())
+            ]
+            if occupied:
+                clashes.append(f"{run_out} ({', '.join(occupied)})")
+        if clashes:
+            listed = "\n  ".join(clashes)
+            raise OutputExistsError(
+                f"{ALREADY_HOLD_RESULTS}\n  "
+                f"{listed}\n"
+                "Choose another output directory, delete these, or pass "
+                "--force-overwrite to overwrite them (--rerun keeps what it "
+                "replaces in previous/)."
+            , code="environment.path.exists")
+
+    def _make_way_for_the_windows_named(self) -> None:
+        """Move the windows to be run again aside, once the rest are checked.
+
+        Refused, before anything moves, where this is not an umbrella study,
+        a window named is not one of its windows, a window is still running,
+        or a window kept has not finished or ran with settings the config no
+        longer gives it: recombined with the new ones, it would be unbiased
+        by the wrong spring. A window run again is moved, not deleted, to
+        ``superseded/``, beside the study.
+        """
+        import shutil
+        from datetime import datetime, timezone
+
+        from fastmdxplora.simulation.resume import _still_running
+        from fastmdxplora.simulation.umbrella import (
+            plan_from_expanded,
+            windows_run_otherwise,
+        )
+
+        plan = plan_from_expanded(self._raw or {})
+        if plan is None:
+            raise StudyError(
+                "--rerun-window names umbrella windows, and this study has "
+                "none. Run the study, or `fastmdx resume` a stopped one.",
+                code="config.option.inapplicable")
+        directories: dict[int, Path] = {}
+        for spec in self.run_specs:
+            block = (spec.options.get("simulation") or {}).get("umbrella") or {}
+            if block.get("index") is not None:
+                directories[int(block["index"])] = self._run_output_dir(spec)
+        unknown = [i for i in self.rerun_windows if i not in directories]
+        if unknown:
+            raise StudyError(
+                f"This study has no window {', '.join(str(i) for i in unknown)}. "
+                f"Its windows are numbered 0 to {max(directories)}.",
+                code="config.option.not_permitted")
+        going = [f"window {i}" for i, where in sorted(directories.items())
+                 if where.is_dir() and _still_running(where)]
+        if going:
+            raise StudyError(
+                f"{', '.join(going)} {'is' if len(going) == 1 else 'are'} still "
+                "running. Run windows again once the study has stopped.",
+                code="environment.path.exists")
+        kept = {i: where for i, where in directories.items()
+                if i not in self.rerun_windows}
+        unfinished = [i for i, where in sorted(kept.items())
+                      if not (where / "simulation" / "COLVAR").is_file()]
+        if unfinished:
+            raise StudyError(
+                "Windows "
+                f"{', '.join(str(i) for i in unfinished)} have no production to "
+                "keep. Carry the study on first with `fastmdx resume`, or name "
+                "them with --rerun-window too.",
+                code="analysis.data.absent")
+        differ = windows_run_otherwise(kept, plan)
+        if differ:
+            raise StudyError(
+                "Kept windows ran with settings the config no longer gives "
+                f"them: {'; '.join(differ)}. Name them with --rerun-window too, "
+                "or restore the settings they ran with.",
+                code="config.option.conflicting")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        aside = self.output_dir / "superseded"
+        for index in self.rerun_windows:
+            where = directories[index]
+            if not where.exists():
+                continue
+            aside.mkdir(parents=True, exist_ok=True)
+            moved = aside / f"{where.name}-{stamp}"
+            shutil.move(str(where), str(moved))
+            print(f"Window {index} will run again; its earlier run is in "
+                  f"{moved.relative_to(self.output_dir)}")
+
+    def _keeping(self) -> dict[str, bool]:
+        """``keep_previous`` for `_execute_run`, passed only when asked for."""
+        return {"keep_previous": True} if self.keep_previous else {}
+
+    def _resuming(self) -> dict[str, bool]:
+        """``resume`` for `_execute_run`, passed only when resuming, so a run
+        started afresh calls it as it always has."""
+        return {"resume": True} if self.resume else {}
+
     def _run_output_dir(self, spec: RunSpec) -> Path:
         """Flat output for a single run; runs/<id>/ for many."""
         if self.is_single:
@@ -249,6 +1360,39 @@ class BatchExplorer:
         # CPU default: all cores, capped at the number of runs.
         return max(1, min(os.cpu_count() or 1, len(self.run_specs)))
 
+    def _devices_shared(self) -> str | None:
+        """Said where more workers are asked for than devices listed: the
+        extra runs share a card, each running slower, and nothing said so.
+        Listing a device twice is how two runs on one card are asked for."""
+        if not self.devices:
+            return None
+        workers = self._resolve_workers()
+        slots = len(self.devices)
+        if workers <= slots:
+            return None
+        return (f"{workers} workers over {slots} listed device slot(s) "
+                f"({', '.join(str(d) for d in self.devices)}): up to "
+                f"{-(-workers // slots)} runs will share a card at once, each "
+                "slower than alone. List a device twice to mean two runs on "
+                "it, or set `workers` to the number of devices.")
+
+    def _least_used_device(self, in_flight) -> str | None:
+        """The listed device with the most room, the first listed on a tie.
+
+        Chosen by what is running, not by the run's place in the queue: by
+        place, with two cards, the third run went to card 0 whenever the
+        second finished first, so two runs shared one card and the other sat
+        idle. A device listed twice has room for two.
+        """
+        if not self.devices:
+            return None
+        from collections import Counter
+
+        room = Counter(str(d) for d in self.devices)
+        busy = Counter(str(d) for d in in_flight)
+        return min(dict.fromkeys(str(d) for d in self.devices),
+                   key=lambda d: busy[d] / room[d])
+
     def _device_for_worker(self, worker_slot: int) -> str | None:
         """Round-robin GPU device for a worker slot, or None if no devices."""
         if not self.devices:
@@ -262,31 +1406,1052 @@ class BatchExplorer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         n = len(self.run_specs)
-        include = self._raw.get("include")
-        exclude = self._raw.get("exclude")
+        include = self._raw.get("include_phase")
+        exclude = self._raw.get("exclude_phase")
+
+        if self.rerun_windows:
+            self._make_way_for_the_windows_named()
+            self.resume = True
+
+        # Checked here, before anything starts. Each run also refuses to
+        # overwrite its own directory, but that refusal is raised inside a
+        # worker and recorded as a failed run -- the study exits non-zero and
+        # says nothing about why, or what to do instead. A study of eight
+        # systems should also not run seven of them before saying the eighth
+        # cannot start.
+        self._refuse_to_overwrite_runs(include, exclude)
+        # A stopping rule the study cannot keep is refused now, not after
+        # the first piece has run.
+        stopping = self._stopping_rule()
+        if stopping is not None:
+            self._write_planned_stopping(stopping)
+
+        if not self.is_single:
+            # The study's process, at its top: each run records its own (a
+            # worker's, in parallel), which says nothing between two runs,
+            # while the comparison is written, or while an umbrella study
+            # prepares once for every window (seventh and eighth reviews,
+            # 10-08). A GUI opened on the study finds it running, and can
+            # stop it. After the refusals above, so a second `explore`
+            # refused for a study whose runs have begun does not write over
+            # its record (one by hand during the shared preparation still
+            # can; the GUI and an AI app refuse it by `runs_here`).
+            from fastmdxplora.orchestrator import _record_run_process
+
+            _record_run_process(self.output_dir)
+
+        shared = self._maybe_prepare_once(include, exclude)
+        if shared is not None:
+            # The windows read the system that was just prepared, so none of
+            # them prepares one of its own. Which of the two lists says so
+            # depends on which the study used: naming a phase in both is
+            # refused, and adding to the wrong one failed every window before
+            # it had done anything.
+            if include:
+                include = [phase for phase in include if phase != "setup"]
+            else:
+                exclude = list(exclude or []) + ["setup"]
+            from fastmdxplora.orchestrator import PHASES
+
+            remaining = [] if include == [] else [
+                phase for phase in PHASES
+                if (not include or phase in include) and phase not in (exclude or [])]
+            if not remaining:
+                # Preparing was the whole study, and it is done. An empty
+                # list of phases means every phase to a run, so the windows
+                # are not handed one.
+                (self.output_dir / "runs").mkdir(exist_ok=True)
+                self.results = [_skipped_run_result(
+                    spec, self._run_output_dir(spec),
+                    f"{PREPARED_ONCE}, in {shared}, for every window; the "
+                    "windows simulate from it.") for spec in self.run_specs]
+                self._write_study_config()
+                self._write_batch_manifest()
+                return list(self.results)
 
         if self.is_single:
-            logger.info("Running 1 study in %s", self.output_dir)
+            logger.info("Exploring 1 molecular system in %s", self.output_dir)
         else:
             (self.output_dir / "runs").mkdir(exist_ok=True)
+            self._write_study_config()
+            # The plan, before any run starts: the manifest's `runs` are
+            # results and fill in as runs finish, so until then nothing said
+            # which runs the study would make. The dashboard reads this to
+            # list them, with their status, while they run.
+            self._write_batch_manifest()
             logger.info(
-                "Batch: %d runs in %s (mode=%s)", n, self.output_dir, self.mode
+                "Exploring %d molecular systems in %s (mode=%s)", n, self.output_dir, self.mode
             )
-            print(f"\nFastMDXplora: {n} runs ({self.mode})\n{'=' * 40}")
+            print(f"\nFastMDXplora: exploring {n} systems ({self.mode})\n{'=' * 40}")
 
         if self.mode == "parallel" and not self.is_single:
             self.results = self._run_parallel(include, exclude)
         else:
             self.results = self._run_sequential(include, exclude)
 
+        if stopping is not None:
+            self._run_until_known(stopping)
+
+        # One run of a study of several analysed again: the study's
+        # comparison of its runs read this run's analyses before.
+        campaign = campaign_of(self.output_dir) if self.is_single else None
+        if (campaign is not None and self.results and self.results[0].status == "ok"
+                and (not include or "analysis" in include)
+                and "analysis" not in (exclude or [])):
+            print(f"\nThe comparison of {campaign.name}'s runs, built again from "
+                  f"{self.output_dir.name}'s new analyses:")
+            compare_the_runs_again(campaign)
+
         # Only write a batch manifest when there's actually a batch.
         if not self.is_single:
             self._write_batch_manifest()
+            self._maybe_aggregate_members()
+            # The free energy first, because the comparison report reads it.
+            # `_umbrella_result` looks for `pmf.json` beside the manifest and
+            # treats its absence as "these runs are not an umbrella study",
+            # so building the comparison first meant an umbrella campaign was
+            # written up as a set of independent runs whose radius of
+            # gyration happened to differ -- the preamble that says otherwise
+            # exists, and never ran. A batch that is not umbrella exits
+            # `_maybe_build_pmf` at its first check and is unaffected.
+            self._maybe_build_pmf()
             self._maybe_build_comparison()
             self._print_summary()
         return list(self.results)
 
     # ------------------------------------------------------------------
+    def _stopping_rule(self) -> "list | None":
+        """The study's `simulation.stop_when`, checked; None where it has
+        none. Its phases are read after `explore()`'s own lists are applied,
+        which validation of the config alone does not see."""
+        from fastmdxplora.simulation.stopping import check_stopping, phases_of, replicas_of
+
+        replicas, _ = replicas_of(self._raw)
+        return check_stopping(self._raw, replicas=replicas and not self.is_single,
+                              runs=len(self.run_specs), phases=phases_of(self._raw))
+
+    def _write_planned_stopping(self, targets: list) -> None:
+        """What the study runs until, written before its first piece. A
+        resumed study keeps the rounds it had."""
+        from fastmdxplora.simulation.stopping import RECORD, planned_record
+
+        where = self.output_dir / RECORD
+        if self.resume and where.is_file():
+            return
+        stop_when = (self._raw.get("simulation") or {}).get("stop_when") or {}
+        where.write_text(json.dumps(planned_record(
+            targets, stop_when, [spec.run_id for spec in self.run_specs]), indent=2),
+            encoding="utf-8")
+
+    def _earlier_rounds(self) -> list:
+        """A resumed study's rounds, so its record reads as one history."""
+        from fastmdxplora.simulation.stopping import RECORD
+
+        if not self.resume:
+            return []
+        try:
+            record = json.loads((self.output_dir / RECORD).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        rounds = record.get("rounds") if isinstance(record, dict) else None
+        return list(rounds) if isinstance(rounds, list) else []
+
+    def _run_until_known(self, targets: list) -> None:
+        """Extend the runs until what the study asked for is determined, then
+        write the study's report again with the record of how long it ran."""
+        from fastmdxplora.simulation.stopping import RECORD, run_until_known
+
+        stop_when = (self._raw.get("simulation") or {}).get("stop_when") or {}
+
+        def ended(outcome: str, said: str) -> None:
+            """The planned record, told why no round was judged."""
+            where = self.output_dir / RECORD
+            try:
+                record = json.loads(where.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                record = {}
+            if not isinstance(record, dict):
+                record = {}
+            record.update({"outcome": outcome, "said": said})
+            record.setdefault("rounds", [])
+            where.write_text(json.dumps(record, indent=2), encoding="utf-8")
+            print(said)
+
+        if any(_was_stopped(result) for result in self.results):
+            ended("stopped", "Stopped when asked, before the rule was applied. Resuming "
+                             "the study applies it.")
+            return
+        finished = [result for result in self.results
+                    if result.status == "ok" and result.output_dir is not None]
+        independent = str(stop_when.get("independent_starts") or "required")
+        if not finished or (independent == "required" and len(finished) < 2):
+            ended("not_applied", f"Not applied: {len(finished)} of {len(self.results)} runs "
+                                 "finished, and the rule judges replicas against each other.")
+            return
+        if len(finished) < len(self.results):
+            print(f"The stopping rule judges the {len(finished)} runs that finished.")
+        runs = [Path(result.output_dir) for result in finished]
+        print(f"\nRunning until determined\n{'=' * 40}")
+        side_by_side = self.mode == "parallel" and len(runs) > 1
+        run_until_known(runs, targets, stop_when, record_in=self.output_dir,
+                        extend_all=self._extend_runs, earlier_rounds=self._earlier_rounds(),
+                        at_once=min(self._resolve_workers(), len(runs)) if side_by_side else 1)
+        if self.is_single:
+            self._report_again(runs[0])
+
+    def _extend_runs(self, runs: list[Path], more_ns: float) -> list[dict[str, Any]]:
+        """Every run extended by ``more_ns``: side by side in a parallel
+        study, as its runs were, and one after another otherwise."""
+        if self.mode != "parallel" or len(runs) < 2:
+            from fastmdxplora.simulation.resume import extend_study
+
+            device = str(self.devices[0]) if self.devices else None
+            answers = []
+            for run in runs:
+                answers.append(extend_study(run, more_ns=more_ns, device_index=device))
+                if not answers[-1].get("ok"):
+                    break
+            return answers
+        workers = min(self._resolve_workers(), len(runs))
+        pool = ProcessPoolExecutor(
+            max_workers=workers, mp_context=get_context("spawn"),
+            initializer=_give_this_worker_its_share,
+            initargs=(_threads_for_each(workers),))
+        stop = _StudyStop(pool)
+        try:
+            stop.__enter__()
+            futures = [pool.submit(_extend_one, str(run), more_ns,
+                                   self._device_for_worker(index))
+                       for index, run in enumerate(runs)]
+            answers = []
+            for future in futures:
+                try:
+                    answers.append(future.result())
+                except Exception as exc:  # noqa: BLE001 - said in the record
+                    answers.append({"ok": False, "stage": "simulation",
+                                    "error": f"{type(exc).__name__}: {exc}"})
+            return answers
+        finally:
+            stop.__exit__(None, None, None)
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    def _report_again(self, run: Path) -> None:
+        """The study's report once more, now that the record of how long it
+        ran and why is complete. Each extension rewrote it, but before the
+        round that decided to stop."""
+        import yaml
+
+        from fastmdxplora import FastMDXplora
+
+        resolved = run / "resolved_config.yml"
+        try:
+            kept = resolved.read_bytes()
+            config = yaml.safe_load(kept) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning("The report was not written again: %s", exc)
+            return
+        config = {key: value for key, value in config.items() if key != "exclude_phase"}
+        config["output"] = str(run)
+        config["include_phase"] = ["report"]
+        try:
+            FastMDXplora(config_data=config, output_dir=str(run)).explore(force=True)
+        except Exception as exc:  # noqa: BLE001 - the runs and the record stand
+            logger.warning("The report was not written again: %s", exc)
+        finally:
+            # The record of what the study ran, not of this one step.
+            resolved.write_bytes(kept)
+
+    # ------------------------------------------------------------------
+    def _maybe_aggregate_members(self) -> None:
+        """One table across the members, written beside the manifest.
+
+        Separate from the comparison report, which overlays series. This
+        collects what each member concluded -- its recorded means and the
+        error it claimed for them -- and, for a seed sweep, sets those
+        errors against the spread the replicas actually show. That
+        comparison is the only check a reported uncertainty gets.
+        """
+        import json as _json
+
+        from fastmdxplora.batch.aggregate import aggregate_members
+
+        try:
+            summary = aggregate_members(self.output_dir)
+        except Exception as exc:  # noqa: BLE001 - a summary must not
+            # take the campaign down with it: every member's own results
+            # are already on disk and are the thing worth keeping.
+            logger.warning("Could not aggregate members: %s", exc)
+            return
+
+        destination = Path(self.output_dir) / "members.json"
+        destination.write_text(
+            _json.dumps(summary, indent=2), encoding="utf-8")
+
+        if summary.get("refused"):
+            return
+        for name, entry in summary.get("analyses", {}).items():
+            note = entry.get("calibration")
+            if note and "too tight" in note:
+                logger.warning("%s: %s", name, note)
+
+    # ------------------------------------------------------------------
+    def _maybe_prepare_once(self, include, exclude) -> Path | None:
+        """Prepare the system once for a set of umbrella windows.
+
+        Seven windows of one real study came out with 37,212, 37,254, 37,436
+        and 37,445 atoms: four different systems for one measurement. The
+        windows are the same molecule held at different points along a
+        coordinate, so they should be the same molecule. Unseeded, setup does
+        not place hydrogens and ions the same way twice, and a system
+        arranged differently between windows is noise in the free energy
+        rather than physics; sharing one preparation also saves the time.
+
+        A window is not a system of its own, so it does not get a system of
+        its own. Preparing seven times was also seven times the work.
+
+        Only for a study whose runs are one measurement. An ordinary campaign
+        is untouched: different systems *are* different systems, and one
+        preparation shared between them would be wrong rather than efficient.
+        """
+        if not self._is_umbrella:
+            return None
+
+        wanted = set(include) if include else {"setup", "simulation",
+                                               "analysis", "report"}
+        # Asked only to prepare, the study prepares the one system its
+        # windows share, and stops there: seeding the windows is simulation,
+        # and a pull is hours of it. Each window prepared a system of its own
+        # instead, a box of water per window, which is what sharing exists to
+        # prevent; and a budget, which prepares first and prices the rest on
+        # what was prepared, found no system to price and refused every
+        # umbrella study.
+        only_preparing = wanted - set(exclude or []) == {"setup"}
+        # A study that names a prepared system is not asking to prepare
+        # another one. Preparing anyway solvates a second box, and unseeded
+        # it is not the same box: the named system's frames
+        # -- the seeds a study takes from a pull run in it -- then belong to
+        # a different set of atoms. A real study said `setup_from`, ran with
+        # the setup phase in its list, and stopped ten seconds later with
+        # "the prepared system has 36075 particles and the pull's trajectory
+        # has 36087". The refusal was right and the silence before it was
+        # not: the setting had been ignored rather than obeyed.
+        named = ((self._raw or {}).get("simulation") or {})
+        named = named.get("setup_from") or named.get("prepared_from")
+        if named and "setup" in wanted and "setup" not in set(exclude or []):
+            where = Path(named)
+            if not (_a_prepared_system_is_there(where)
+                    or _a_prepared_system_is_there(where / "setup")
+                    or _a_prepared_system_is_there(
+                        where / "shared_setup" / "setup")):
+                raise MissingResultError(
+                    f"`simulation.setup_from` names {named!r}, and there is "
+                    "no prepared system there: a directory holding "
+                    "`system.xml`, `state.xml` and `topology.pdb`, or one "
+                    "with `setup/` or `shared_setup/setup/` under it. "
+                    "Preparing one instead would give this study a different "
+                    "box of water from the one that setting points at, and "
+                    "anything taken from it -- seeds from a pull, a frame to "
+                    "start from -- would not fit."
+                , code="analysis.data.absent")
+            logger.info(
+                "Preparing nothing: `setup_from` names %s, and this study "
+                "uses that system. A second preparation would solvate a "
+                "second box, the same one only with the same settings and "
+                "setup seed -- so frames from the named system could belong "
+                "to a different set of atoms than the one being simulated.",
+                named)
+            exclude = list(exclude or []) + ["setup"]
+        if "setup" not in wanted or "setup" in set(exclude or []):
+            # Nothing is being prepared here -- the windows are simulating
+            # from something that already exists. They may still need
+            # seeding, and this is the path a study takes when it reuses a
+            # prepared system, which is exactly when seeding matters most.
+            # Returning early without seeding meant a study could ask to be
+            # seeded, say nothing, and start every window in the same place.
+            # Both spellings, and this is the one that matters most: a
+            # config saying `setup_from` took this path, matched nothing,
+            # and started every window in the same place -- the bug this
+            # branch exists to prevent, reintroduced by renaming the key
+            # that reaches it.
+            reused = (self._raw or {}).get("simulation") or {}
+            supplied = reused.get("setup_from") or reused.get("prepared_from")
+            if supplied and not only_preparing:
+                self._give_each_window_its_start(Path(supplied))
+            return None
+
+        # An umbrella study is one system by the time it gets here -- expansion
+        # refuses several -- but a sweep can still ask for the windows to be
+        # prepared differently from one another. Sharing then would quietly
+        # ignore what the sweep asked for, which is worse than preparing
+        # seven times.
+        preparations = self._setup_blocks()
+        if len(preparations) != 1:
+            logger.warning(
+                "The windows are swept over %d different setup settings, so "
+                "each prepares its own system.", len(preparations))
+            return None
+
+        shared = self.output_dir / "shared_setup"
+        prepared = shared / "setup"
+        # What the shared system was prepared from, so that reusing it is a
+        # checked claim. Its existence was the whole check, so a study re-run
+        # with pH 5.0 simulated every window in the pH 7.4 system it had
+        # prepared before, while its resolved config said 5.0.
+        wanted = {"system": str(self.run_specs[0].system),
+                  "setup": json.loads(next(iter(preparations)))}
+        # The structure's bytes too, where it is a file: the path alone
+        # passed a structure edited in place.
+        digest = _file_digest(self.run_specs[0].system)
+        if digest is not None:
+            wanted["structure_sha256"] = digest
+        record = shared / "prepared_for.json"
+        if _a_prepared_system_is_there(prepared):
+            found = _what_it_was_prepared_for(shared)
+            changed = None if found is None else _what_differs(found, wanted)
+            if (found is None or changed) and self.force:
+                logger.info("The shared system was prepared from %s, not what this study "
+                            "asks for; --force-overwrite prepares it again.",
+                            "settings it did not record" if found is None else "other settings")
+                import shutil
+
+                shutil.rmtree(shared)
+            elif found is None:
+                # An older shared system with neither record was reused with
+                # a warning, whatever it had been prepared from.
+                raise StudyError(
+                    f"The shared system in {shared} records neither what it was "
+                    "prepared from (prepared_for.json) nor its setup "
+                    "(setup/setup_parameters.json), so whether it is the system "
+                    "this study asks for cannot be checked. Re-run with "
+                    "--force-overwrite to prepare it again.",
+                    code="setup.prepared.unverifiable", path=str(shared))
+            elif changed:
+                raise StudyError(
+                    f"The shared system in {shared} was prepared with different "
+                    f"settings from this study's ({', '.join(changed)}), so every "
+                    "window would simulate a system other than the one asked for. "
+                    "Re-run with --force-overwrite to prepare it again, or restore the settings "
+                    "it was prepared with.",
+                    code="setup.prepared.mismatch", changed=changed)
+            elif found.get("read_from") == "setup record":
+                logger.info(
+                    "The shared system in %s was prepared before what it was "
+                    "prepared from was recorded; its setup record agrees with "
+                    "this study, so it is reused.", shared)
+                record.write_text(json.dumps(wanted, indent=2, sort_keys=True, default=str),
+                                  encoding="utf-8")
+        if ((self.force or self.resume) and shared.exists()
+                and not _a_prepared_system_is_there(prepared)):
+            # A half-written shared setup from an interrupted study: with
+            # --force the intent is plainly to start again, and a resume
+            # carries on a study whose setup never finished; leaving the
+            # remains there means the preparation refuses its own directory.
+            import shutil
+
+            shutil.rmtree(shared)
+        if not _a_prepared_system_is_there(prepared):
+            print("\nPreparing one system for every window\n" + "=" * 40)
+            first = self.run_specs[0]
+            result = _execute_run(
+                first.to_dict(), str(shared), ["setup"], None,
+                self.verbose, None, quiet=False, force=self.force,
+            )
+            if result.status == "error" or not _a_prepared_system_is_there(prepared):
+                # Every window would fail the same way, one after another,
+                # for hours. Say it once here instead.
+                raise MissingResultError(
+                    "The system could not be prepared, so there is nothing "
+                    f"for the windows to simulate: {result.message or prepared}"
+                , code="analysis.data.absent")
+            record.write_text(json.dumps(wanted, indent=2, sort_keys=True, default=str),
+                              encoding="utf-8")
+
+        # Outside the block that prepares, because the selections need
+        # checking against whatever system the windows will use -- and a
+        # study re-run with --force finds one already there and prepares
+        # nothing. Inside, this checked only freshly prepared systems, which
+        # is the one case where the author has just seen the structure built.
+        _check_selections_against(
+            prepared, self.run_specs[0].options.get("simulation") or {})
+
+        if not only_preparing:
+            self._give_each_window_its_start(prepared)
+        return prepared
+
+    # ------------------------------------------------------------------
+    def _give_each_window_its_start(self, prepared: Path) -> None:
+        """Point every window at the system it begins from.
+
+        One place, because there are two ways to arrive here -- a system
+        prepared just now, or one named by `prepared_from` and reused -- and
+        a seeded study must behave the same either way. It did not: seeding
+        lived on one of those paths, so asking to reuse a prepared system
+        silently turned seeding off.
+        """
+        seeds = self._maybe_seed_the_windows(prepared)
+        self._give_each_window_its_cone()
+        for spec in self.run_specs:
+            simulation = dict(spec.options.get("simulation") or {})
+            index = (simulation.get("umbrella") or {}).get("index")
+            mine = seeds.get(int(index)) if index is not None else None
+            simulation["prepared_from"] = str(mine or prepared)
+            # A window does not pull. The block travels with the study so
+            # `_maybe_seed_the_windows` can find it; leaving it on the window
+            # would have every one of them drag the ligand out again while
+            # restrained at a fixed point.
+            simulation.pop("steered", None)
+            spec.options["simulation"] = simulation
+
+    # ------------------------------------------------------------------
+    def _give_each_window_its_cone(self) -> None:
+        """Hand the measured cone to every window, and to the analysis.
+
+        A study that writes `cone: auto` has asked for an angle and an axis it
+        does not know yet. The pull that seeds the windows supplies both, and
+        `_maybe_seed_the_windows` has just written the measurement down. Here
+        it stops being a file and becomes the restraint: the concrete angle
+        and the atoms it opens away from, on every window's block.
+
+        Written onto the expanded systems as well as onto the run specs,
+        because that is where the analysis rebuilds the plan from -- and the
+        correction the cone costs is several kJ/mol on the answer, so a
+        recombination that read `auto` would have nothing to correct by.
+        """
+        from fastmdxplora.simulation.umbrella import (
+            ConeToMeasure,
+            plan_from_expanded,
+        )
+
+        plan = plan_from_expanded(self._raw or {})
+        if plan is None or not isinstance(plan.cone, ConeToMeasure):
+            return
+
+        measured = self.output_dir / "seeds" / "cone.json"
+        if not measured.is_file():
+            # Nothing to hand over. Left to the window to refuse, where the
+            # message can say what a measured cone needs -- a pull -- instead
+            # of this one saying a file is missing.
+            return
+        record = json.loads(measured.read_text(encoding="utf-8"))
+        block = {key: record[key] for key in
+                 ("half_angle_deg", "force_constant", "axis_selection",
+                  "axis_atoms") if key in record}
+
+        for entry in (self._raw or {}).get("systems") or []:
+            window = ((entry.get("simulation") or {}).get("umbrella")
+                      if isinstance(entry, dict) else None)
+            if window and window.get("cone"):
+                window["cone"] = dict(block)
+        for spec in self.run_specs:
+            simulation = dict(spec.options.get("simulation") or {})
+            window = dict(simulation.get("umbrella") or {})
+            if not window.get("cone"):
+                continue
+            window["cone"] = dict(block)
+            simulation["umbrella"] = window
+            spec.options["simulation"] = simulation
+
+    # ------------------------------------------------------------------
+    def _maybe_seed_the_windows(self, prepared: Path) -> dict[int, str]:
+        """Start each window where it belongs, from a steered pull.
+
+        Empty where the study did not ask for it, and every window then
+        shares the one prepared state as before.
+
+        Two ways to ask, because there are two situations. A `steered` block
+        beside the `umbrella` one means *pull, then seed*: one config, one
+        command, which is the case this exists for. `umbrella.seed_from`
+        naming a finished pull means *reuse that one*, which matters because
+        retuning the spacing or the force constant should not cost another
+        pull -- the windows change, the pathway does not.
+
+        The pull runs from the same prepared system the windows will use.
+        Seeds are positions in a particular `system.xml`, and positions from
+        a second preparation belong to a different arrangement of water.
+        """
+        from fastmdxplora.simulation.metadynamics import (
+            with_general_selection_names,
+        )
+        from fastmdxplora.simulation.seeding import seed_windows
+        from fastmdxplora.simulation.umbrella import (
+            ConeToMeasure,
+            plan_from_expanded,
+        )
+
+        raw = self._raw or {}
+        simulation = raw.get("simulation") or {}
+        pull_spec = simulation.get("steered")
+        plan = plan_from_expanded(raw)
+        if plan is None:
+            return {}
+
+        first_window = (self.run_specs[0].options.get("simulation") or {}
+                        ).get("umbrella") or {}
+        reuse = first_window.get("seed_from")
+        if not pull_spec and not reuse:
+            return {}
+
+        pull_output = (Path(reuse) if reuse
+                       else self.output_dir / "seed_pull")
+        if pull_spec and not _a_pull_is_there(pull_output):
+            print("\nPulling once, to start every window where it belongs\n"
+                  + "=" * 52)
+            # `to_dict()` nests the phase blocks under "options", which is
+            # where `_execute_run` reads them. Assigning `options["simulation"]`
+            # put a key at the top level that nothing reads and left the
+            # window's own block in place -- so the pull ran as umbrella
+            # window 0, restrained at 0.4 nm, dragging nothing anywhere.
+            options = dict(self.run_specs[0].to_dict())
+            options["run_id"] = "seed-pull"
+            carried = {k: v for k, v in simulation.items()
+                       if k not in ("umbrella", "steered")}
+            carried["prepared_from"] = str(prepared)
+            carried["steered"] = pull_spec
+            # Every atom, overriding whatever the study saves elsewhere. A
+            # trajectory defaults to "not water" because water is ten times
+            # the file for questions nobody is asking -- but a seed is a
+            # complete set of positions, and a frame without solvent cannot
+            # produce one. Taking the water from the prepared system instead
+            # would put bound-state solvent where the ligand now is.
+            carried["save_selection"] = "all"
+            options["options"] = dict(options.get("options") or {})
+            options["options"]["simulation"] = carried
+            result = _execute_run(
+                options, str(pull_output), ["simulation"], None,
+                self.verbose, None, quiet=False, force=self.force,
+            )
+            if result.status == "error":
+                raise MissingResultError(
+                    "The pull that seeds the windows did not finish, so "
+                    "there are no starting structures to take: "
+                    f"{result.message or pull_output}"
+                , code="analysis.data.absent")
+
+        centres = [w.centre for w in plan.windows]
+        # The seeder has to read the same config the PLUMED builder reads.
+        # `with_general_selection_names` is what turns the general
+        # `select_atoms` into whichever role name a variable uses, and it
+        # runs inside `plan_from_config` -- so the pull was translated and
+        # this was not. A study written with `select_atoms`, which is the
+        # spelling the documentation leads with, therefore pulled for two
+        # and a half hours and then found nothing here to measure against.
+        #
+        # Two readers of one block again, which is what patch 0038 was
+        # about. The line below it already carried the lesson for the
+        # ligand and not for the selection.
+        window = with_general_selection_names(
+            dict(first_window),
+            str(first_window.get("collective_variable", "")).lower())
+        seeds = seed_windows(
+            pull_output, prepared, centres, self.output_dir / "seeds",
+            # Either spelling: the umbrella block accepts both, so the
+            # thing reading it has to as well.
+            ligand_resname=str(window.get("ligand_resname")
+                               or window.get("ligand_name") or ""),
+            site_selection=str(window.get("site_selection") or ""),
+            temperature_K=float(simulation.get("temperature_K", 300.0)),
+            random_seed=int(simulation.get("random_seed") or 0),
+            # Measured here, off the trajectory the seeder has already
+            # opened. The pull is the one continuous path from the site to
+            # bulk, so it is where the way out is visible -- and reading it
+            # twice would mean loading tens of thousands of atoms twice.
+            #
+            # A cone the study stated is handed over too, unmeasured. The
+            # seeder does not need it to build a seed; it needs it to check
+            # one, because a window seeded outside its own wall starts with
+            # the wall pushing and no later gate can see that it did.
+            cone=(plan.cone.as_asked()
+                  if isinstance(plan.cone, ConeToMeasure)
+                  else plan.cone.as_record() if plan.cone is not None
+                  else None),
+        )
+        record = self.output_dir / "seeds" / "seeds.json"
+        record.write_text(
+            json.dumps({"pull": str(pull_output),
+                        "seeds": [s.as_record() for s in seeds]}, indent=2),
+            encoding="utf-8")
+        return {s.index: s.directory for s in seeds}
+
+    # ------------------------------------------------------------------
+    def _maybe_build_pmf(self, *, bootstrap_resamples: int | None = None) -> None:
+        """Recombine umbrella windows once they have all run.
+
+        The windows are ordinary runs, so nothing before this point knows
+        they belong together. Here is where they have all finished and the
+        set is visible -- and where the overlap between them can be checked,
+        which is the thing that decides whether a free energy exists at all.
+
+        ``bootstrap_resamples`` is the one knob a caller may need and had no
+        way to reach. A study pays for it: on seventeen windows of three
+        thousand samples the curve itself takes 0.04 s and the two hundred
+        resamples behind its error bar take 13.6, and with a binding free
+        energy riding along there are two hundred of those too. That is the
+        right default for a study, whose curve is worth an interval, and the
+        wrong one for a caller exercising the recombination rather than the
+        statistics. Every other caller in the tree already says a number
+        here -- 0, 8, 20, 25, 30, 40 -- because `compute_pmf` takes one
+        directly; this path was the only one that could not, so the only
+        test that takes it was paying two hundred resamples to check a
+        directory name. `None` takes the study's own count, which its
+        umbrella block sets as `bootstrap_resamples`.
+        """
+        import json
+
+        from fastmdxplora.simulation.umbrella import (
+            as_a_config_block,
+            collect_samples,
+            compute_pmf,
+            design_from_a_pilot,
+            plan_from_expanded,
+        )
+
+        # Rebuilt from the runs rather than carried in the config: a config is
+        # what a user wrote, not a place to hide state, and validation
+        # rightly refused an extra key when this was smuggled through one.
+        plan = plan_from_expanded(self._raw or {})
+        if plan is None:
+            return
+
+        # Where the runs actually went, from the same method that put them
+        # there. Reconstructing the path from the output directory got both
+        # the "runs" level and the slugged identifier wrong.
+        directories = {}
+        for spec in self.run_specs:
+            block = (spec.options.get("simulation") or {}).get("umbrella") or {}
+            if block.get("index") is not None:
+                directories[int(block["index"])] = self._run_output_dir(spec)
+
+        from fastmdxplora.simulation.umbrella import windows_run_otherwise
+
+        differ = windows_run_otherwise(directories, plan)
+        try:
+            if differ:
+                raise _WindowsRanOtherwise(
+                    "The windows did not all run with the settings the config "
+                    "now gives them: " + "; ".join(differ) + ". Each window is "
+                    "recombined with the spring it is given, so a free energy "
+                    "from these would be shifted by the difference. Restore "
+                    "the settings they ran with, or run those windows again "
+                    "with --rerun-window.")
+            # The plan's fraction, not the function's default: a study
+            # that asked to discard a third and quietly got a fifth
+            # would report the third in `pmf.json` and have used the
+            # other number to build the histograms.
+            samples = collect_samples(
+                directories,
+                equilibration_fraction=plan.equilibration_fraction)
+        except (FileNotFoundError, _WindowsRanOtherwise) as exc:
+            # Some window did not produce sampling. Recorded rather than
+            # raised: the runs that did work are still on disk and worth
+            # keeping.
+            payload = {"pmf": None, "refused": str(exc),
+                       "plan": plan.as_record()}
+        else:
+            temperature = float(
+                ((self._raw or {}).get("simulation") or {})
+                .get("temperature_K", 300.0))
+            # The binding free energy rides along on the recombination's own
+            # resamples. Without this it is the one headline number the study
+            # produces with no statistical uncertainty at all -- only a
+            # sensitivity to where the bound state is cut, which is a
+            # different quantity and reads as an error bar if it is the only
+            # bar there.
+            #
+            # Uncorrected on purpose: the cone correction and the
+            # standard-state term are constants, so they move the interval
+            # without widening it, and computing them per resample would mean
+            # resolving the cone thirty thousand times for no change in the
+            # spread.
+            def _binding_from(where, curve, _t=temperature):
+                from fastmdxplora.simulation.binding import binding_free_energy
+
+                return binding_free_energy(
+                    where, curve, temperature_K=_t).get("delta_g_kjmol")
+
+            wants_binding = _the_coordinate_has_a_volume(plan)
+            # The caller's count, else the study's own (its umbrella block's
+            # `bootstrap_resamples`, two hundred unless it says otherwise).
+            how_many = {"bootstrap_resamples": int(
+                plan.bootstrap_resamples if bootstrap_resamples is None
+                else bootstrap_resamples)}
+            payload = compute_pmf(samples, plan, temperature_K=temperature,
+                                  also=_binding_from if wants_binding else None,
+                                  **how_many)
+            payload["plan"] = plan.as_record()
+
+            # What these windows say the study should have been. Every
+            # window measures the gradient where it came to rest, and the
+            # gradient fixes both settings a study has to choose, so a run
+            # that has just finished can size the next one -- a short set of
+            # windows run deliberately as a pilot, or this one.
+            #
+            # Computed whether the study passed or refused, and especially
+            # when it refused: a refusal that says which windows slid is
+            # worth less than one that comes with the design that holds
+            # them. It sits in a `try` because it is advice, and a study
+            # that produced a free energy must not lose it to a failure in
+            # the paragraph recommending the next study.
+            try:
+                payload["next_study"] = design_from_a_pilot(
+                    samples, plan, temperature_K=temperature,
+                    # The curve where this study produced one: its slope is
+                    # the same gradient the windows measure, with every
+                    # window's sampling behind it instead of one window's
+                    # median. A study that refused has none, and then the
+                    # windows' own displacements are what there is.
+                    curve=((payload["pmf"]["coordinate"],
+                            payload["pmf"]["free_energy_kjmol"])
+                           if payload.get("pmf") else None))
+            except (ValueError, ZeroDivisionError) as exc:
+                payload["next_study"] = {"not_designed": str(exc)}
+
+            # A binding free energy only where there is a free energy to
+            # take it from. The overlap and sampling gates decide that, and
+            # this sits behind them rather than beside them: a number
+            # integrated over a curve stitched across a gap would be the
+            # most quotable thing the study produced and the least
+            # supported. Attempted only for a ligand-distance coordinate,
+            # since the standard-state correction is about the volume a
+            # ligand gives up and means nothing along a torsion.
+            if _a_binding_free_energy_belongs_here(payload, plan):
+                from fastmdxplora.simulation.binding import (
+                    binding_free_energy)
+
+                # The cone the windows ran under, and the measurement the
+                # correction for it rests on. A wall that bit where the bound
+                # state is has removed part of the population the integral is
+                # over, so the number it pushed is read off the runs rather
+                # than assumed to be zero.
+                from fastmdxplora.simulation.umbrella import (
+                    cone_the_windows_ran_under,
+                    wall_bias_where_the_bound_state_is,
+                )
+
+                # What the windows ran under, not what the config asked for.
+                # A cone measured from the pull was never written in the
+                # config at all, and a config edited since the windows
+                # finished would correct by a cone that did not run.
+                cone = cone_the_windows_ran_under(directories)
+                wall = None
+                if cone is not None:
+                    minimum = min(
+                        (point for point in zip(
+                            payload["pmf"]["coordinate"],
+                            payload["pmf"]["free_energy_kjmol"])
+                         if point[1] is not None),
+                        key=lambda point: point[1], default=(0.0, 0.0))[0]
+                    wall = wall_bias_where_the_bound_state_is(
+                        directories, plan, bound_below=float(minimum) * 1.25)
+                if plan.cone is not None and cone is None:
+                    # Asked for a cone and no window recorded one. The
+                    # correction is worth several kJ/mol, so a number without
+                    # it is not the same number -- said, rather than quietly
+                    # produced.
+                    payload["binding"] = {"refused": (
+                        "This study asked for a cone and no window recorded "
+                        "one, so how much room the bulk state gave up is not "
+                        "known. Without it a binding free energy would be too "
+                        "negative by kT ln(4 pi / Omega) and there is nothing "
+                        "here to say what Omega was.")}
+                else:
+                    payload["binding"] = binding_free_energy(
+                        payload["pmf"]["coordinate"],
+                        payload["pmf"]["free_energy_kjmol"],
+                        temperature_K=temperature,
+                        cone=cone, wall_bias_kjmol=wall,
+                        resampled=payload.get("derived"),
+                    )
+                    payload["binding"] = self._with_the_reference_checked(
+                        payload["binding"], payload["pmf"], plan, directories,
+                        temperature=temperature, cone=cone)
+
+        destination = Path(self.output_dir) / "pmf.json"
+        destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        # Cleared before anything is drawn, so a refusal cannot leave the
+        # previous run's figure in place. `--force` clears the run
+        # directories and not this one, so a study that refused where the
+        # last one succeeded kept a plot from a different set of windows --
+        # and the comparison report beside it linked to that plot as though
+        # it were this study's result.
+        self._clear_previous_drawing()
+        drawn = None if payload.get("refused") else self._draw_pmf(destination)
+
+        # Printed rather than sent to a presenter this class does not have.
+        # The `getattr` chain here looked for `_presenter` and `presenter`,
+        # and a BatchExplorer has neither, so the free energy -- the result
+        # the whole study exists for -- was computed, written and drawn in
+        # silence while the comparison of the windows' restrained
+        # trajectories announced itself on the line below.
+        if payload.get("refused"):
+            print("Free energy:    not computed -- "
+                  + payload["refused"].split(".")[0])
+        else:
+            drawn_note = f", plotted in {drawn.parent.name}/" if drawn else ""
+            print(f"Free energy:    {destination}{drawn_note}")
+        for line in _what_the_binding_says(payload.get("binding")):
+            print(line)
+
+        # Printed when the study refused, or when it passed with windows off
+        # their centres -- the two cases where the person is about to choose
+        # settings for another run. A study where everything held prints
+        # nothing and leaves the design in `pmf.json`.
+        design = payload.get("next_study") or {}
+        if design.get("centres") and (payload.get("refused")
+                                      or payload.get("drifted")):
+            print(f"Next study:     {design['n_windows']} windows from these "
+                  f"windows' own gradients, "
+                  f"{design['covers'][0]:g} to {design['covers'][1]:g}, "
+                  f"worst overlap {design['worst_predicted_overlap']:.2f} "
+                  "predicted")
+            print(as_a_config_block(design), end="")
+
+    def _with_the_reference_checked(self, binding: dict[str, Any],
+                                    pmf: dict[str, Any], plan: Any,
+                                    directories: dict[int, Any], *,
+                                    temperature: float, cone: Any) -> dict[str, Any]:
+        """The binding free energy, with what its reference rests on measured.
+
+        The shell at the outer range, a membrane, the path the pull took and
+        the ligand's orientation (see `simulation.reference_state`). A shell
+        that is not open, or a membrane without a cone, withholds the number;
+        the other two are said beside it. Advice about the number rather than
+        the number itself, so a failure here leaves the number as it was and
+        says the checks were not made.
+        """
+        from fastmdxplora.simulation.binding import BULK_RESIDUAL_KJMOL
+        from fastmdxplora.simulation.metadynamics import (
+            detect_ligand,
+            with_general_selection_names,
+        )
+        from fastmdxplora.simulation.reference_state import check_the_reference
+
+        if plan.collective_variable != "ligand_distance":
+            return {**binding, "reference": {"not_checked": (
+                "The coordinate is a distance between two selections, not "
+                "from a ligand to its site.")}}
+        first = next((((spec.options.get("simulation") or {}).get("umbrella") or {})
+                      for spec in self.run_specs
+                      if ((spec.options.get("simulation") or {}).get("umbrella") or {})
+                      .get("index") is not None), {})
+        window = with_general_selection_names(dict(first), "ligand_distance")
+        centres = {w.index: float(w.centre) for w in plan.windows}
+        points = [(y, x) for x, y in zip(pmf.get("coordinate") or [],
+                                         pmf.get("free_energy_kjmol") or [])
+                  if y is not None]
+        bound_at = (binding.get("minimum_at_nm")
+                    or (min(points)[1] if points else None))
+        bulk_from = binding.get("bulk_from_nm")
+        if bound_at is None or bulk_from is None:
+            return binding
+        try:
+            resname = str(window.get("ligand_resname") or window.get("ligand_name") or "")
+            if not resname:
+                import mdtraj as md
+
+                some = next(iter(directories.values()))
+                resname = detect_ligand(md.load_topology(
+                    str(Path(some) / "simulation" / "trajectory_topology.pdb"))) or ""
+            checks = check_the_reference(
+                directories, centres, ligand_resname=resname,
+                site_selection=str(window.get("site_selection") or ""),
+                bound_at_nm=float(bound_at), bulk_from_nm=float(bulk_from),
+                temperature_K=temperature, cone=cone,
+                allowed_kjmol=BULK_RESIDUAL_KJMOL,
+                skip=plan.equilibration_fraction)
+        except Exception as exc:  # noqa: BLE001 - the number stands, unchecked, and says so
+            logger.debug("The reference checks failed", exc_info=True)
+            return {**binding, "reference": {"not_checked": str(exc)}}
+        if cone is not None:
+            checks["exit"] = (
+                "The cone chose one way out. The binding free energy does not "
+                "depend on which, but the barrier and the path along the "
+                "curve describe that exit only.")
+        if checks.get("refused") and binding.get("delta_g_kjmol") is not None:
+            kept = {key: binding.get(key) for key in (
+                "bulk_residual_kjmol", "bulk_from_nm", "minimum_at_nm",
+                "bound_cutoff_nm", "cone", "cone_correction_kjmol",
+                "cone_wall_bias_kjmol", "standard_volume_nm3")}
+            return {"delta_g_kjmol": None, **kept, "reference": checks,
+                    "refused": checks["refused"]}
+        return {**binding, "reference": checks}
+
+    def _clear_previous_drawing(self) -> None:
+        """Remove a figure from an earlier study of this directory.
+
+        A stale plot is worse than no plot: it is the previous answer,
+        presented as this one.
+        """
+        import shutil
+
+        drawn = Path(self.output_dir) / "free_energy"
+        if drawn.is_dir():
+            shutil.rmtree(drawn, ignore_errors=True)
+
+    def _draw_pmf(self, pmf_json: Path) -> Path | None:
+        """Draw the study's free energy, beside the study.
+
+        The PMF belongs to the study rather than to any window, and putting
+        the drawing in the per-run analysis phase left it undrawn: each
+        window analysed itself before the last one finished, so no window
+        found a result to draw, and by the time one existed no analysis
+        phase remained. The windows had each produced ten figures of their
+        own restrained trajectory, and the one result the study existed for
+        had none.
+
+        Best effort, like the comparison report beside it: a study whose
+        windows all succeeded must not fail here.
+        """
+        def unaffected(reason: object) -> None:
+            logger.warning(
+                "The free energy was computed and written to %s but could "
+                "not be plotted (%s). The numbers are unaffected.",
+                pmf_json.name, reason)
+
+        try:
+            from fastmdxplora.analysis.pmf import PMF
+
+            analysis = PMF(output_dir=Path(self.output_dir) / "free_energy")
+            result = analysis.run(None)
+        except Exception as exc:  # noqa: BLE001 -- never break the study
+            unaffected(exc)
+            return None
+        # The analysis catches a failure of its own and records it in the log
+        # file, off the console, because in the analysis phase its row in the
+        # results table says so. Drawn here there is no table, so the failure
+        # passed in silence, and the log's "Analysis 'pmf' failed" read as if
+        # the free energy had failed rather than its picture.
+        if getattr(result, "status", "ok") != "ok":
+            unaffected(getattr(result, "message", None) or "the analysis reported an error")
+            return None
+        return getattr(result, "figure_path", None)
+
+    @contextmanager
+    def _marking_for_comparison(self):
+        """Mark the comparison figures if nothing checked the analyses.
+
+        Best-effort on both counts: a config that cannot be read for a mode,
+        and an environment with no matplotlib, both leave the figures
+        unmarked rather than stopping a campaign that has already run.
+        """
+        mark = ""
+        try:
+            from fastmdxplora.marking import mark_for
+
+            mark = mark_for(self._raw, "analysis")
+        except Exception:  # noqa: BLE001 -- never break the batch
+            logger.debug("Could not work out the mark for the comparison.")
+        if not mark:
+            yield
+            return
+        try:
+            from fastmdxplora.analysis.plotting import marked_as
+        except Exception:  # noqa: BLE001 -- no matplotlib, no figures
+            yield
+            return
+        with marked_as(mark):
+            yield
+
     def _maybe_build_comparison(self) -> None:
         """Build the cross-run comparison report (best-effort).
 
@@ -301,11 +2466,64 @@ class BatchExplorer:
         try:
             from fastmdxplora.batch.compare import build_comparison_report
 
-            path = build_comparison_report(self.output_dir)
+            # Drawn by the batch layer rather than inside a phase, so the
+            # orchestrator's per-phase marking does not reach it. It
+            # overlays the members' analyses, so the analysis phase's mode
+            # is the one that applies -- and every run of one config shares
+            # it, which is what makes a single answer the right one here.
+            # Left unmarked, a campaign whose analyses nothing checked
+            # would produce one figure, the summary, carrying no mark.
+            with self._marking_for_comparison():
+                path = build_comparison_report(self.output_dir)
             if path is not None:
                 print(f"Comparison:     {path / 'comparison_report.md'}")
         except Exception as exc:  # noqa: BLE001 -- never break the batch
             logger.warning("Comparison report failed (runs are unaffected): %s", exc)
+
+    # ------------------------------------------------------------------
+    def _named_prepared_system(self, spec) -> str | None:
+        """The prepared system a run's `setup_from` names, as written."""
+        simulation = spec.options.get("simulation") or {}
+        return simulation.get("setup_from") or simulation.get("prepared_from")
+
+    def _setup_blocks(self) -> set[str]:
+        """The distinct setup blocks across the runs, for sharing one
+        preparation: windows swept over setup each prepare their own."""
+        return {json.dumps(spec.options.get("setup") or {}, sort_keys=True, default=str)
+                for spec in self.run_specs}
+
+    def _one_preparation_for_every_window(self, plan: list[str]) -> bool:
+        """Whether `run` would prepare one system for every umbrella window,
+        as `_maybe_prepare_once` decides it."""
+        return (self._is_umbrella and "setup" in plan and plan != ["setup"]
+                and not any(self._named_prepared_system(s) for s in self.run_specs)
+                and len(self._setup_blocks()) == 1)
+
+    def _what_setup_would_do(self, spec, plan: list[str]) -> tuple[bool, str]:
+        """Whether the run would skip preparing its own system, and what it
+        would do instead, in words ("" where it prepares as planned)."""
+        if "setup" not in plan:
+            return False, ""
+        named = self._named_prepared_system(spec)
+        if named:
+            from fastmdxplora.simulation.pipeline import (
+                _a_prepared_system_sits_in,
+                _as_named,
+                where_a_prepared_system_sits,
+            )
+
+            where = where_a_prepared_system_sits(_as_named(named))
+            if _a_prepared_system_sits_in(where):
+                return True, f"not run; simulates the system prepared in {where}"
+            if self._is_umbrella:
+                return True, (f"`setup_from` names {named}, where there is no "
+                              "prepared system, so the study stops before any window")
+            return False, (f"`setup_from` names {named}, where there is no "
+                           "prepared system, so the simulation will refuse")
+        if self._one_preparation_for_every_window(plan):
+            return True, (f"prepared once, in {self.output_dir / 'shared_setup'}, "
+                          "for every window")
+        return False, ""
 
     # ------------------------------------------------------------------
     def dry_run(self) -> list["RunResult"]:
@@ -317,8 +2535,10 @@ class BatchExplorer:
         """
         from fastmdxplora.orchestrator import RunResult, PHASES
 
-        include = self._raw.get("include")
-        exclude = self._raw.get("exclude")
+        # Refused in the plan as it would be refused in the run.
+        self._stopping_rule()
+        include = self._raw.get("include_phase")
+        exclude = self._raw.get("exclude_phase")
         # Compute the phase plan the same way the orchestrator would.
         if include:
             plan = [p for p in PHASES if p in include]
@@ -328,17 +2548,33 @@ class BatchExplorer:
             plan = list(PHASES)
 
         n = len(self.run_specs)
+        # What each run would really do about setup, as `run` decides it: a
+        # run naming a prepared system prepares nothing, and umbrella
+        # windows share one preparation. The plan listed setup for every
+        # run either way.
+        setups = [self._what_setup_would_do(spec, plan) for spec in self.run_specs]
+        plans = [[p for p in plan if p != "setup" or not skips]
+                 for skips, _ in setups]
         layout = "flat" if self.is_single else "runs/<id>/"
         print("\nFastMDXplora dry run (no execution)")
         print("=" * 50)
         print(f"  runs:    {n}")
         print(f"  output:  {self.output_dir}  ({layout} layout)")
-        print(f"  phases:  {' → '.join(plan) if plan else '(none)'}")
+        uniform = len({(tuple(p), words) for p, (_, words) in zip(plans, setups)}) <= 1
+        if uniform:
+            phases = plans[0] if plans else plan
+            print(f"  phases:  {' → '.join(phases) if phases else '(none)'}")
+            if setups and setups[0][1]:
+                print(f"  setup:   {setups[0][1]}")
         if self.mode == "parallel":
-            print(f"  mode:    parallel ({self._resolve_workers()} workers"
+            workers = self._resolve_workers()
+            print(f"  mode:    parallel ({workers} worker{'' if workers == 1 else 's'}"
                   + (f", devices={self.devices}" if self.devices else "") + ")")
+            shared = self._devices_shared()
+            if shared:
+                print(f"           {shared}")
         else:
-            print(f"  mode:    sequential")
+            print("  mode:    sequential")
         print("-" * 50)
 
         planned: list[RunResult] = []
@@ -351,12 +2587,25 @@ class BatchExplorer:
                     f"{k}={v}" for k, v in spec.sweep_values.items()) + "]"
             print(f"  [{i}/{n}] {label}{sweep}")
             print(f"          → {run_out}")
+            if not uniform:
+                print(f"          phases: {' → '.join(plans[i - 1]) or '(none)'}")
+                if setups[i - 1][1]:
+                    print(f"          setup:  {setups[i - 1][1]}")
             planned.append(RunResult(
                 run_id=spec.run_id, system=spec.system, status="planned",
                 output_dir=run_out, sweep_values=spec.sweep_values, phases=[],
             ))
         print("=" * 50)
         return planned
+
+    # ------------------------------------------------------------------
+    def _not_started(self, specs) -> list["RunResult"]:
+        """The runs a stopped study did not start, each saying so."""
+        return [_skipped_run_result(
+            spec, self._run_output_dir(spec),
+            "Not started: the study was asked to stop. `fastmdx resume "
+            f"{self.output_dir}` runs it, and carries on the runs that were "
+            "stopped.") for spec in specs]
 
     # ------------------------------------------------------------------
     def _run_sequential(self, include, exclude) -> list["RunResult"]:
@@ -373,18 +2622,24 @@ class BatchExplorer:
             device = self._device_for_worker(0) if self.devices else None
             result = _execute_run(
                 spec.to_dict(), str(run_out), include, exclude,
-                self.verbose, device,
+                self.verbose, device, quiet=not self.is_single,
+                force=self.force, **self._resuming(), **self._keeping(),
             )
             results.append(result)
+            if _was_stopped(result):
+                results.extend(self._not_started(self.run_specs[i:]))
+                break
             if result.status == "error" and not self.continue_on_error:
-                logger.error("Stopping after failed run '%s'.", spec.run_id)
+                logger.error(
+                    "Stopping after failed run '%s': %s",
+                    spec.run_id, _why_it_failed(result))
                 for skipped in self.run_specs[i:]:
                     results.append(_skipped_run_result(
                         skipped,
                         self._run_output_dir(skipped),
-                        (
-                            "Not submitted because continue_on_error=False "
-                            f"stopped after failed run '{spec.run_id}'."
+                        _not_submitted(
+                            spec.run_id,
+                            umbrella=getattr(self, "_is_umbrella", False),
                         ),
                     ))
                 break
@@ -398,12 +2653,24 @@ class BatchExplorer:
         n = len(self.run_specs)
         print(f"Parallel execution: {n_workers} worker(s)"
               + (f", devices={self.devices}" if self.devices else ""))
+        shared = self._devices_shared()
+        if shared:
+            logger.warning("%s", shared)
+
+        # A worker's output goes to its own log so three of them do not
+        # interleave, which means the terminal will show nothing at all unless
+        # this loop says something.
+        print("Each run writes its own log; the study reports here.")
 
         results: list[RunResult] = []
         futures = {}
+        # The device each run was given. The runs in flight are the ones
+        # still in `futures`, so what each device holds is counted from it.
+        held: dict = {}
         next_index = 0
         done = 0
         stopped_after: str | None = None
+        began = time.monotonic()
 
         def submit_next(pool: ProcessPoolExecutor) -> bool:
             nonlocal next_index
@@ -411,23 +2678,83 @@ class BatchExplorer:
                 return False
             spec = self.run_specs[next_index]
             run_out = self._run_output_dir(spec)
-            device = self._device_for_worker(next_index)
+            device = self._least_used_device(held[f] for f in futures if f in held)
             fut = pool.submit(
                 _execute_run,
                 spec.to_dict(), str(run_out), include, exclude,
-                self.verbose, device,
+                self.verbose, device, force=self.force, **self._resuming(),
+                **self._keeping(),
             )
             futures[fut] = (next_index, spec)
+            held[fut] = device
             next_index += 1
+            # Said on the way in, so a run that is still going has been named
+            # once and its log can be followed while it goes.
+            print(f"       started {spec.run_id} -> {run_out / 'run.log'}",
+                  flush=True)
             return True
 
-        pool = ProcessPoolExecutor(max_workers=n_workers)
+        def await_one():
+            """The next run to finish, saying what is happening until one does.
+
+            A window runs for hours. Without this the terminal shows the last
+            completion and then nothing, and a study that is working looks
+            exactly like one that has hung.
+            """
+            while True:
+                finished, pending = wait_for_any(
+                    futures, timeout=HEARTBEAT_SECONDS,
+                    return_when=FIRST_COMPLETED)
+                if finished:
+                    return next(iter(finished))
+                # Redrawn in place where there is a terminal to redraw on.
+                # Piped to a file, a carriage return makes one endless line,
+                # so there the heartbeat is written out as before -- a log is
+                # read after the fact and wants the history.
+                in_flight = [
+                    (spec.run_id, self._run_output_dir(spec))
+                    for fut, (_index, spec) in futures.items()
+                    if fut in pending
+                ]
+                line = _progress_line(
+                    running=len(pending), done=done, total=n,
+                    queued=n - next_index, seconds=time.monotonic() - began
+                ) + _how_far_along(in_flight)
+                if _is_a_terminal():
+                    print("\r" + line, end="", flush=True)
+                else:
+                    print(line, flush=True)
+
+        threads_each = _threads_for_each(n_workers)
+        print(f"Each worker takes up to {threads_each} thread(s) of "
+              f"{os.cpu_count() or 1}; without that they compete for all of "
+              "them.", flush=True)
+        pool = ProcessPoolExecutor(
+            max_workers=n_workers,
+            # Spawn, on every platform. Linux's default is still fork, and a
+            # forked worker inherits the parent as it stood -- including the
+            # thread pools numpy, mdtraj and OpenMM had started, whose
+            # threads do not survive the fork but whose locks do. Three CI
+            # runs in a row walled silently at the first parallel test, six
+            # hours each until a job timeout existed, beginning the day
+            # OpenMM landed in CI -- and never on a one-core machine, where
+            # those pools are never spun up, which is why it would not
+            # reproduce locally. macOS and Windows have spawned all along;
+            # this makes Linux match them, and it is where Python itself
+            # goes in 3.14. Spawn is also what makes the initializer below
+            # honest: the thread-cap variables are read once at import, and
+            # only a fresh interpreter imports after they are set.
+            mp_context=get_context("spawn"),
+            initializer=_give_this_worker_its_share,
+            initargs=(threads_each,))
+        stop = _StudyStop(pool)
         try:
+            stop.__enter__()
             for _ in range(min(n_workers, n)):
                 submit_next(pool)
 
             while futures:
-                fut = next(as_completed(futures))
+                fut = await_one()
                 _idx, spec = futures.pop(fut)
                 done += 1
                 try:
@@ -441,16 +2768,30 @@ class BatchExplorer:
                         error_type=type(exc).__name__,
                     )
                 mark = "✓" if result.status == "ok" else "✗"
+                _clear_progress_line()
                 print(f"[{done}/{n}] {mark} {spec.run_id}")
+                if result.status == "error":
+                    print(f"      {_why_it_failed(result)}")
                 results.append(result)
 
+                if _was_stopped(result) and not stop.requested:
+                    # Stopped directly, not through this process: the
+                    # study was asked to stop all the same.
+                    stop.signal = -1
+                if stop.requested:
+                    continue
                 if result.status == "error" and not self.continue_on_error:
                     stopped_after = spec.run_id
-                    logger.error("Stopping parallel batch after failed run '%s'.", spec.run_id)
+                    logger.error(
+                        "Stopping parallel batch after failed run '%s': %s",
+                        spec.run_id, _why_it_failed(result))
                     break
 
                 if stopped_after is None:
                     submit_next(pool)
+
+            if stop.requested:
+                results.extend(self._not_started(self.run_specs[next_index:]))
 
             if stopped_after is not None:
                 # Do not submit new work. Running tasks cannot always be
@@ -468,8 +2809,9 @@ class BatchExplorer:
                         ))
                         futures.pop(fut, None)
 
-                for fut in as_completed(futures):
-                    _idx, spec = futures[fut]
+                while futures:
+                    fut = await_one()
+                    _idx, spec = futures.pop(fut)
                     done += 1
                     try:
                         result = fut.result()
@@ -482,6 +2824,7 @@ class BatchExplorer:
                             error_type=type(exc).__name__,
                         )
                     mark = "✓" if result.status == "ok" else "✗"
+                    _clear_progress_line()
                     print(f"[{done}/{n}] {mark} {spec.run_id}")
                     results.append(result)
 
@@ -489,12 +2832,13 @@ class BatchExplorer:
                     results.append(_skipped_run_result(
                         spec,
                         self._run_output_dir(spec),
-                        (
-                            "Not submitted because continue_on_error=False "
-                            f"stopped after failed run '{stopped_after}'."
+                        _not_submitted(
+                            stopped_after,
+                            umbrella=getattr(self, "_is_umbrella", False),
                         ),
                     ))
         finally:
+            stop.__exit__(None, None, None)
             pool.shutdown(wait=True, cancel_futures=True)
 
         # Preserve deterministic (submission) order in the manifest.
@@ -503,6 +2847,26 @@ class BatchExplorer:
         return results
 
     # ------------------------------------------------------------------
+    def _write_study_config(self) -> None:
+        """The whole study as a config: every run it makes, not one of them.
+
+        Each run writes its own resolved config under `runs/<id>/`, and that
+        file is that run. A study of several -- a sweep, several systems, an
+        umbrella's windows -- is written here as well, before any run starts,
+        so one file repeats all of it and survives a study that stops
+        part-way. A study of one run is its own run's file, at the root.
+        """
+        from fastmdxplora.config import write_resolved_config
+        from fastmdxplora.config.schema import PHASE_KEYS
+
+        study = {key: value for key, value in self._raw.items() if key not in PHASE_KEYS}
+        study["options"] = {key: value for key, value in self._raw.items() if key in PHASE_KEYS}
+        study["output"] = str(self.output_dir)
+        kept = _phases_it_recorded(self.output_dir, study)
+        if kept is not None:
+            study["include_phase"], study["exclude_phase"] = kept
+        write_resolved_config(study, self.output_dir)
+
     def _write_batch_manifest(self) -> None:
         from fastmdxplora import __citation__, __doi__, __version__
 
@@ -525,22 +2889,56 @@ class BatchExplorer:
                 for s in normalize_systems(self._raw["systems"])
             ],
             "sweep": self._raw.get("sweep") or {},
-            "runs": [r.to_dict() for r in self.results],
+            "planned": [spec.to_dict() for spec in self.run_specs],
+            "runs": [self._with_relative_dir(r.to_dict()) for r in self.results],
         }
         path = self.output_dir / "batch_manifest.json"
         with path.open("w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2, default=str)
         logger.debug("Wrote batch manifest: %s", path)
 
+    def _with_relative_dir(self, run: dict[str, Any]) -> dict[str, Any]:
+        """A member's folder relative to the batch too, so a campaign moved
+        or copied elsewhere still finds its members."""
+        import os
+
+        if run.get("output_dir"):
+            try:
+                run["output_dir_relative"] = os.path.relpath(
+                    Path(run["output_dir"]).resolve(), self.output_dir.resolve())
+            except ValueError:  # another drive
+                pass
+        return run
+
     # ------------------------------------------------------------------
     def _print_summary(self) -> None:
         ok = sum(1 for r in self.results if r.status == "ok")
         err = sum(1 for r in self.results if r.status == "error")
         skipped = sum(1 for r in self.results if r.status == "skipped")
+        stopped = sum(1 for r in self.results if _was_stopped(r))
         print(f"\n{'=' * 40}")
         print(
-            f"Batch complete: {ok} ok, {err} error(s), "
-            f"{skipped} skipped, {len(self.results)} total"
+            f"{'Batch stopped' if stopped else 'Batch complete'}: {ok} ok, "
+            f"{err} error(s), {skipped} skipped, {len(self.results)} total"
         )
+        fixes = _what_would_fix_it(self.output_dir)
+        if fixes:
+            print("\n".join(fixes))
+        elif stopped:
+            # One command for all of it: resuming each run by name carries
+            # the runs on and leaves the comparison across them unbuilt.
+            print(f"`fastmdx resume {self.output_dir}` carries on the "
+                  f"{stopped} run(s) stopped and runs the ones not started.")
         print(f"Batch output:   {self.output_dir}")
         print(f"Manifest:       {self.output_dir / 'batch_manifest.json'}")
+
+
+def _a_pull_is_there(directory: Path) -> bool:
+    """Whether a finished pull already sits where one would be written.
+
+    A study re-run with the same output does not pull again: the pathway is
+    the expensive part and it does not change when the windows do.
+    """
+    root = directory / "simulation"
+    root = root if root.is_dir() else directory
+    return any(root.glob("*.dcd")) or any(root.glob("*.xtc"))

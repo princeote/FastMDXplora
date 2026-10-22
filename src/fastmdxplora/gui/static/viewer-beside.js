@@ -1,0 +1,236 @@
+/* Another study beside this one in the Viewer (gui/beside.py).
+ *
+ * A wild type and a mutant, or two related proteins: the other study's
+ * frames played beside this one's, its residues paired by sequence, fitted
+ * on the paired alpha carbons to this study's first frame and timed by
+ * simulation time; the residues that differ listed, and this study's
+ * protein coloured by the difference in RMSF where both have one.
+ */
+(function () {
+  "use strict";
+
+  var COLOUR = "#E69F00";
+  var KEY = "rmsf-difference";
+
+  var state = { said: null, listed: false, ready: false, colourBefore: null, next: null,
+                shownNext: null };
+
+  function byId(id) { return document.getElementById(id); }
+
+  function viewer() { return window.FastMDXMoleculeViewer; }
+
+  function engine() {
+    var v = viewer();
+    return v && v.STATE ? v.STATE.engine : null;
+  }
+
+  function say(text) {
+    var note = byId("beside-note");
+    if (note) note.textContent = text || "";
+  }
+
+  async function listStudies() {
+    if (state.listed) return;
+    state.listed = true;
+    var select = byId("beside-study");
+    var said;
+    try {
+      said = await (await fetch("/api/studies", { cache: "no-store" })).json();
+    } catch (error) {
+      said = null;
+    }
+    var dashboard = window.FastMDXDashboard;
+    var here = dashboard && dashboard.state.appState ? dashboard.state.appState.active_run || "" : "";
+    var cards = (said && said.ok ? said.studies : []).filter(function (card) {
+      return card.path !== here;
+    });
+    select.replaceChildren.apply(select, cards.map(function (card) {
+      var option = document.createElement("option");
+      option.value = card.path;
+      option.textContent = card.name + (card.system ? " (" + card.system + ")" : "");
+      option.title = option.textContent;
+      return option;
+    }));
+    // The study chosen said whole on hover, where a name is longer than
+    // the panel is wide.
+    var named = function () {
+      select.title = select.selectedOptions[0] ? select.selectedOptions[0].textContent : "";
+    };
+    if (!select.dataset.named) {
+      select.dataset.named = "true";
+      select.addEventListener("change", named);
+    }
+    named();
+    byId("side-beside").hidden = cards.length === 0;
+    state.ready = true;
+    takeUpNext();
+  }
+
+  /* What Compare asked to play beside the study it opened in the Viewer:
+   * kept for this tab while the page loads again on that study. */
+  var NEXT = "fastmdx.besideNext";
+
+  function next(path, name, on) {
+    var asked = { path: path, name: name || "", on: on || [] };
+    try {
+      sessionStorage.setItem(NEXT, JSON.stringify(asked));
+    } catch (error) {
+      state.next = asked;
+    }
+    if (state.ready) takeUpNext();
+  }
+
+  /* Kept until it is shown: the page may list its studies again (the run
+   * it shows settles) before the frames are there to play beside. Taken
+   * up on the Viewer only: asked from Compare, the page may load again on
+   * the study first. */
+  function takeUpNext() {
+    if (document.documentElement.dataset.page !== "viewer") return;
+    try {
+      var stored = JSON.parse(sessionStorage.getItem(NEXT) || "null");
+      sessionStorage.removeItem(NEXT);
+      if (stored && stored.path) state.next = stored;
+    } catch (error) { /* kept in state.next instead */ }
+    var asked = state.next;
+    if (!asked || !asked.path) return;
+    // Asked for beside the study Compare opened: not beside another one (a
+    // switch the server refused leaves the study open as it was).
+    var openNow = "";
+    try { openNow = window.FastMDXDashboard.state.appState.active_run || ""; } catch (error) { openNow = ""; }
+    var on = [].concat(asked.on || []);
+    if (on.length && openNow && on.indexOf(openNow) < 0) { state.next = null; return; }
+    var select = byId("beside-study");
+    var here = Array.prototype.some.call(select.options, function (o) { return o.value === asked.path; });
+    if (!here) {
+      // A run of a study is not among the workspace's studies: offered too.
+      var option = document.createElement("option");
+      option.value = asked.path;
+      option.textContent = asked.name || asked.path;
+      option.title = option.textContent;
+      select.appendChild(option);
+    }
+    select.value = asked.path;
+    select.title = select.selectedOptions[0] ? select.selectedOptions[0].textContent : "";
+    byId("side-beside").hidden = false;
+    var rail = window.FastMDXViewerRail;
+    if (rail && rail.choose) rail.choose("side-beside");
+    show().then(function () {
+      if (state.said && state.next === asked) {
+        state.next = null;
+        state.shownNext = asked;
+      }
+    });
+  }
+
+  function listMutations() {
+    var list = byId("beside-mutations");
+    list.replaceChildren();
+    if (!state.said) return;
+    state.said.mutations.forEach(function (m) {
+      var item = document.createElement("li");
+      item.className = "occ-site";
+      item.textContent = (m.chain ? m.chain + ":" : "") + m.from + m.resi + (m.icode || "")
+        + " → " + m.to + (m.theirs !== m.resi ? " (" + m.theirs + " there)" : "");
+      list.append(item);
+    });
+  }
+
+  async function show() {
+    var v = viewer();
+    var path = byId("beside-study").value;
+    if (!path) return;
+    say("Fitting the other study's frames beside these…");
+    var frames = await v.movie.frames();
+    if (!frames) { say("This study has no frames to play beside."); return; }
+    var said;
+    try {
+      said = await (await fetch("/api/beside?" + new URLSearchParams({ path: path }),
+        { cache: "no-store" })).json();
+    } catch (error) {
+      said = { ok: false, reason: "The server did not answer." };
+    }
+    if (!said.ok) { say("Not shown: " + said.reason); return; }
+    state.said = said;
+    var version = Date.now();
+    if (!v.placedFitAsPlayed() || v.STATE.superposed !== "backbone") {
+      v.STATE.superposedTo = "first";
+      v.STATE.smoothedOver = 1;
+      await v.superpose("backbone");
+    }
+    await engine().showRuns([{ label: said.name, colour: COLOUR,
+      topology: said.topology + "&v=" + version,
+      coordinates: said.coordinates + "&v=" + version }], null, "beside");
+    await engine().setRunsAside(v.STATE.superposed !== "backbone");
+    byId("beside-remove").hidden = false;
+    byId("beside-colour-row").hidden = !said.property;
+    listMutations();
+    say(said.said + (said.frames < (v.STATE.playbackFrames || 0)
+      ? " It ends at frame " + (said.frames - 1) + ", where its run does." : ""));
+    if (byId("beside-colour").checked) await colour(true);
+  }
+
+  async function colour(on) {
+    var v = viewer();
+    if (on && state.said && state.said.property) {
+      if (state.colourBefore == null) state.colourBefore = v.STATE.colorMode;
+      v.addResult(state.said.property);
+      await v.colourBy("result:" + KEY);
+    } else if (state.colourBefore != null) {
+      var before = state.colourBefore;
+      state.colourBefore = null;
+      await v.removeResult(KEY);
+      if (before !== "result:" + KEY) await v.colourBy(before);
+    }
+  }
+
+  async function remove() {
+    var shown = engine();
+    if (shown) await shown.removeRuns("beside");
+    byId("beside-colour").checked = false;
+    await colour(false);
+    state.said = null;
+    listMutations();
+    byId("beside-remove").hidden = true;
+    byId("beside-colour-row").hidden = true;
+    say("");
+  }
+
+  function wire() {
+    if (!byId("side-beside")) return;
+    byId("beside-show").addEventListener("click", function () { show(); });
+    byId("beside-remove").addEventListener("click", function () { remove(); });
+    byId("beside-colour").addEventListener("change", function () {
+      colour(byId("beside-colour").checked);
+    });
+    window.FastMDXDashboard && window.FastMDXDashboard.on("playback-ready", listStudies);
+    window.addEventListener("dashboard:viewer-rendered", listStudies);
+    window.addEventListener("dashboard:viewer-page-opened", function () {
+      if (state.ready) takeUpNext();
+    });
+    window.addEventListener("dashboard:frames-ready", function () {
+      if (state.said) show();
+      else if (state.next && state.ready) takeUpNext();
+    });
+    window.addEventListener("dashboard:run-changed", function (event) {
+      // The page's first word of the study it opened on comes after the
+      // Viewer may have shown what Compare asked for: shown again then.
+      var again = event.detail && event.detail.first ? state.shownNext || state.next : null;
+      state.shownNext = null;
+      state.next = again;
+      state.said = null;
+      state.listed = false;
+      state.ready = false;
+      state.colourBefore = null;
+      byId("side-beside").hidden = true;
+      byId("beside-remove").hidden = true;
+      byId("beside-colour").checked = false;
+      listMutations();
+      say("");
+    });
+  }
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", wire);
+  else wire();
+
+  window.FastMDXBeside = { show: show, remove: remove, next: next };
+}());

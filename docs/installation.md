@@ -1,251 +1,160 @@
-# Installation
+# Installing FastMDXplora
 
-FastMDXplora is designed so a brand-new user can go from a fresh machine to a runnable simulation in **3 commands** on **Linux, macOS, or Windows**. The same commands work everywhere. **Miniforge is auto-installed** when no conda is on PATH, so a fresh machine is enough — no prior Python, conda, or OpenMM install needed.
-
-This page covers every supported starting point and gives troubleshooting tips. If you just want to get going, the [Quick install](#quick-install-any-os) section is enough.
-
-## Quick install (any OS)
+## Recommended: conda-forge
 
 ```bash
-git clone https://github.com/aai-research-lab/FastMDXplora.git   # 1
-cd FastMDXplora                                                  # 2
-python fastmdx install                                           # 3
-```
-
-The third command (`install`) does everything else:
-
-1. Detects whether conda or mamba is already on your `PATH`.
-2. If not, downloads and installs **Miniforge** for your platform (Linux x86_64 / aarch64, macOS x86_64 / arm64, Windows x86_64 / aarch64) into `~/miniforge3`.
-3. Creates a `fastmdxplora` conda environment with **Python 3.10**.
-4. Installs **OpenMM** and **PDBFixer** (the only heavy chemistry dependencies).
-5. Installs **FastMDXplora** itself into that environment.
-6. Runs `fastmdx info` as a smoke test.
-
-> Why the `python fastmdx …` prefix? The repo includes a tiny `fastmdx` shim at its root that lets the CLI run before any `pip install` step — full details in [Why `python fastmdx`](#why-python-fastmdx) below.
-
-Then activate the environment and run a first simulation:
-
-```bash
+conda create -n fastmdxplora -c conda-forge fastmdxplora
 conda activate fastmdxplora
-fastmdx explore --system 1L2Y
+fastmdx info
 ```
 
-`1L2Y` is a small trp-cage PDB that exercises every phase on a fast turnaround. Replace it with any 4-character PDB ID or with the path to a local `.pdb` / `.cif` file.
+That gives you everything: the simulation engine, the ligand chemistry stack,
+the PDF report, enhanced sampling. `fastmdx info` confirms it.
 
-### Windows local development install
+conda-forge is the recommendation and not a preference. Three of the packages
+FastMDXplora depends on — the OpenFF toolkit, AmberTools and openmm-plumed —
+**have no PyPI distribution at all**, so no pip command can reach them.
 
-On Windows PowerShell, the most reliable local development path is to use the
-Python launcher and call pip through Python:
+AmberTools is where a ligand's charges come from. Every ligand is given AM1-BCC
+partial charges, which the OpenFF toolkit computes by calling AmberTools' `sqm`
+program; the toolkit installs without it and then cannot charge anything. The
+conda-forge package brings it, and `fastmdx info` reports it on the line
+**AM1-BCC charges**. Where nothing can compute them, a study with a ligand
+refuses before setup repairs or solvates anything, and says what to install.
 
-```powershell
-cd C:\Users\User\OneDrive\Documents\GitHub\FastMDXplora
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -e ".[test]"
-python -m fastmdxplora.cli.main --version
-python -m fastmdxplora.cli.main info
-```
+---
 
-If activation is blocked by PowerShell's execution policy, allow local scripts
-for your user account:
+## Installing from PyPI
 
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
-
-Activation is optional. You can also run the virtual environment's Python
-directly:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[test]"
-.\.venv\Scripts\python.exe -m fastmdxplora.cli.main --version
-```
-
-### Optional extras
-
-For ligand parameterization and PLUMED enhanced sampling in an editable
-development checkout:
+If you already manage the chemistry stack, or you only need part of the
+pipeline:
 
 ```bash
-pip install -e ".[ligand]"   # OpenFF small-molecule parameterization
-pip install -e ".[plumed]"   # PLUMED enhanced sampling
+pip install fastmdxplora            # analysis and reporting
+pip install "fastmdxplora[md]"      # adds setup and simulation
+pip install "fastmdxplora[ligand]"  # adds most of ligand preparation
+pip install "fastmdxplora[pdf]"     # adds the PDF report
 ```
 
-The `plumed` extra also requires the `openmm-plumed` conda package:
+Two of those are partial, and `fastmdx info` will tell you which parts are
+missing and how to get them.
+
+**The ligand path** needs the OpenFF toolkit, and AmberTools to give each
+ligand its charges. Neither is on PyPI, so after a pip install they have to
+come from conda-forge:
+
+```bash
+conda install -c conda-forge openff-toolkit openmmforcefields ambertools
+```
+
+**Enhanced sampling** needs openmm-plumed, likewise:
 
 ```bash
 conda install -c conda-forge openmm-plumed
 ```
 
-> Need to install for development instead? Use `python fastmdx install-e` — same flow but the local checkout is installed in editable mode.
-
-## Prerequisites
-
-- A **shell** (bash / zsh / PowerShell) with **internet access**.
-- `git` on `PATH` (preinstalled on modern macOS and Windows 10+; on bare Linux you may need to install via your package manager).
-- A terminal that supports **UTF-8** output (the CLI renders a box-drawing banner).
-- **~1.5 GB of free disk** for the full install (Miniforge downloads ~150 MB; the `fastmdxplora` conda environment adds another ~800 MB of OpenMM / MDTraj / matplotlib / etc.).
-- Python is **not required** up front — if you don't have it, `install` will install Miniforge, which brings Python 3.10 along for the ride.
-
-## Scenarios your new user might be in
-
-### Scenario A — Fresh machine, nothing installed (cold start)
-
-You have a brand-new machine (or a fresh VM, a new WSL distro, etc.) that has no Python, conda, or mamba yet.
-
-Just run the three commands above. The third command detects the missing conda and downloads Miniforge for your OS from `github.com/conda-forge/miniforge/releases/latest/download/`. Miniforge is then installed into `~/miniforge3` (Linux/macOS) or `%USERPROFILE%\miniforge3` (Windows).
-
-Time: roughly 5–10 minutes for Miniforge + ~5–10 minutes for `mamba`-style env resolution (classic `conda` works too but is slower). Disk cost: ~1 GB.
-
-### Scenario B — You already have conda or mamba installed
-
-Skip the auto-install. The same `python fastmdx install` command detects your existing conda/mamba, skips the Miniforge download, and creates the `fastmdxplora` environment directly.
-
-If you don't yet have conda/mamba, Miniforge is the easiest source (it's conda + mamba + conda-forge preconfigured). The `install` command installs it for you, so you don't need to grab it manually.
-
-### Scenario C — You only need analysis + reporting, not MD
+**The PDF report** needs Pango, Cairo and GDK-PixBuf as system libraries. The
+conda-forge package brings its own; from PyPI they have to be there already:
 
 ```bash
-pip install fastmdxplora
-fastmdx explore --system 1L2Y --include analyze report
+sudo apt install libpango-1.0-0 libpangoft2-1.0-0 libcairo2 libgdk-pixbuf-2.0-0
 ```
 
-This installs FastMDXplora from PyPI directly into your system Python (no conda env required). The `analyze` and `report` phases only need pip-installable dependencies (MDTraj, matplotlib, scikit-learn, python-pptx), all of which are bundled.
+Where they are missing, the run says so and writes the other formats rather
+than failing.
 
-The `setup` and `simulation` phases need OpenMM + PDBFixer. If you run them and they're missing, FastMDXplora's self-healing prologue will print the exact install command and exit cleanly — no stack trace.
+---
 
-### Scenario D — conda-forge (one command, when published)
-
-> Coming soon. A single-command install is in progress via a `recipes/fastmdxplora/meta.yaml` recipe, which would give:
->
-> ```bash
-> conda install -c conda-forge fastmdxplora
-> fastmdx explore --system 1L2Y
-> ```
->
-> Use Scenario A or B until the recipe clears review.
-
-### Scenario E — Editable install (contributors hacking on FastMDXplora)
-
-This is for users who want to **modify FastMDXplora's source** — adding a new analysis, fixing a bug, or contributing back upstream. The flow mirrors Scenarios A and B (clone the repo, `cd` into it, run `install`), but use `install-e` instead of `install` for editable mode. The local checkout is then installed in **editable mode** (`pip install -e .`) so any change you make under `src/fastmdxplora/` shows up the next time you run `fastmdx`.
+## Working on FastMDXplora itself
 
 ```bash
-git clone https://github.com/aai-research-lab/FastMDXplora.git   # 1
-cd FastMDXplora                                                  # 2
-python fastmdx install-e                                          # 3
-```
-
-What `install-e` does differently from `install`:
-
-- Miniforge auto-install (if needed), conda env creation with Python 3.10, OpenMM + PDBFixer drop-in, and the `fastmdx info` smoke test are unchanged.
-- The last step uses `pip install -e .` (editable) on the local repository checkout instead of pulling `fastmdxplora` from PyPI — your edits to `src/fastmdxplora/` immediately affect the next `fastmdx` invocation.
-
-Then activate and run as usual:
-
-```bash
+git clone https://github.com/aai-research-lab/FastMDXplora.git
+cd FastMDXplora
+conda env create -f environment.yml
 conda activate fastmdxplora
-fastmdx explore --system 1L2Y
+pip install -e ".[dev]"
+pytest -q
 ```
 
-To validate changes locally, install the test extras and run the suite. **Run these inside the `fastmdxplora` conda env from the previous step** (`conda activate fastmdxplora`) so the editable `src/` and `pytest` are on `PATH`:
+The environment file carries the conda-only packages -- openmm-plumed above
+all, which has no PyPI distribution -- so a clone set up this way has the whole
+stack.
+
+It carries rdkit, propka, openff-toolkit and ambertools for ligand chemistry,
+charges and pKa assignment, openmm-plumed for enhanced sampling, weasyprint
+and markdown for the PDF report, umap-learn for the dimensionality-reduction
+analysis that offers it, and scipy, pillow and netcdf4.
+
+What it does not carry is MDAnalysis and ProLIF, the `validation` extra. That
+is deliberate: they exist here to compare against, and a comparison between
+two stacks means less when one environment holds both. Install them
+separately when you want to run that comparison.
+
+`tests/test_the_conda_file_installs_what_it_claims.py` holds this file to
+that paragraph — every requirement named, at a floor no lower than
+`pyproject.toml`'s — so a conda environment and a pip install are the same
+software rather than two stacks wearing one name.
+
+---
+
+## Platforms
+
+| | |
+|---|---|
+| **Linux** | Everything, including CUDA. The usual choice for production. |
+| **macOS** | Everything. Apple Silicon runs on the CPU platform; OpenCL is not usable, and FastMDXplora falls back automatically and says so. |
+
+Python 3.10 to 3.13.
+
+**Windows is not supported.** AmberTools, which gives every ligand its
+charges, has no Windows build, so a Windows install cannot prepare a ligand
+at all. Continuous integration, the package metadata and this guide cover
+Linux and macOS, and `fastmdx info` says so when it runs on Windows.
+
+**Movies** in the GUI are encoded by ffmpeg, which is not installed with
+FastMDXplora: `conda install -c conda-forge ffmpeg`, `brew install ffmpeg`,
+or the system's package. The GUI uses the one on the PATH, or the one
+`FASTMDXPLORA_FFMPEG` names. A movie made without the GUI open
+(`fastmdx movie`, or `make_movie` from an AI app) is rendered by the Viewer
+in a browser with no window as well: `pip install "fastmdxplora[movies]"` and
+`playwright install chromium`, or have Chrome or Edge installed.
+
+---
+
+## Checking what you have
 
 ```bash
-pip install -e ".[test]"     # adds pytest, pytest-cov, ruff
-pytest                       # full test suite
-ruff check src tests         # lint with project conventions
+fastmdx info
 ```
 
-For full contributor conventions (test requirements, coding style, PR workflow) see [CONTRIBUTING.md](../CONTRIBUTING.md).
+It lists every backend grouped by what it is for, and for anything missing it
+gives the command that installs it. A backend that is present but will not
+load — WeasyPrint without Pango, say — is reported as broken rather than
+missing, because reinstalling something already there fixes nothing.
 
-## Verify the install
-
-```bash
-fastmdx --version    # e.g. fastmdx 2.0.1 (FastMDXplora)
-fastmdx info         # version, detected phases, OpenMM/PDBFixer status, citation
-```
-
-`fastmdx info` reports which backends are present. If `PDBFixer: installed` and `OpenMM: installed` both say yes, all four phases will work end-to-end.
-
-If the package imports but the `fastmdx` command is not recognized, the
-console-script directory is probably not on PATH. This is common on Windows
-with Microsoft Store Python or a mismatched PowerShell environment. Use the
-module entrypoint as a robust fallback:
-
-```powershell
-python -m pip show fastmdxplora
-python -c "import sys; print(sys.executable)"
-python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
-python -m fastmdxplora.cli.main --version
-python -m fastmdxplora.cli.main info
-```
-
-Reinstalling with the same Python can recreate the console script:
-
-```powershell
-python -m pip install -e .
-```
-
-Avoid mixing multiple Python installs in one terminal. The Python used for
-`python -m pip install ...` should be the same Python used for
-`python -m fastmdxplora.cli.main ...`.
-
-To check whether a GPU-capable OpenMM platform is available:
-
-```python
-import openmm as mm
-plats = [mm.Platform.getPlatform(i).getName()
-         for i in range(mm.Platform.getNumPlatforms())]
-print("Available platforms:", plats)
-print("CUDA available" if "CUDA" in plats else "CPU-only: simulations will run on CPU")
-```
+---
 
 ## If something goes wrong
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `git` not found | `git` is not installed (rare on modern Windows and macOS, but possible on stripped-down Linux installs) | Install Git from https://git-scm.com/downloads, then re-run the first command |
-| `python` isn't recognized | `python` is not on `PATH`, so the `install` command can't even start | Install Miniforge manually from https://conda-forge.org/miniforge/ — it ships Python and conda together — then re-run the install command |
-| `[FAILED] Python X.Y.Z is too new` from `python health.py` | Python ≥ 3.13 (the OpenMM / PDBFixer chemistry stack caps out at 3.12) | Use Python 3.10 or 3.11 — `install` defaults to 3.10, which is the smoothest supported version |
-| `conda` / `mamba` not on PATH after Miniforge install | New shell didn't pick it up | On Linux/macOS: `source ~/miniforge3/etc/profile.d/conda.sh`. On Windows: open a fresh `cmd` or PowerShell |
-| Simulation phase missing OpenMM | You used `pip install fastmdxplora` without installing the chemistry stack | `conda install -c conda-forge openmm pdbfixer` (recommended) or `pip install "fastmdxplora[md]"` (best-effort) |
-| Self-heal prints a friendly install hint at exit 2 | A `setup` / `simulate` / `explore` command needs OpenMM and it's missing | Follow the install command in the hint, or use `--include analyze report` to skip chemistry phases |
-| PDB won't download | No internet to RCSB, or your input wasn't a valid 4-character ID | Use a local `.pdb` / `.cif` path instead, or check the ID |
+**`fastmdx: command not found`** — the environment is not active. `conda
+activate fastmdxplora`.
 
-## Diagnostic entry points
+**A phase reports a backend missing** — `fastmdx info` names it and the
+command to install it. This is the common case after a pip install.
 
-| Command | What it does |
-|---|---|
-| `python fastmdx health` | Runs the repository doctor (verifies repo layout, deps, imports, runs a smoke test). Add `--no-fix` for diagnose-only mode. |
-| `python fastmdx info` | Prints FastMDXplora version + detected backends. |
-| `python fastmdx --version` | Version only. Available before `pip install` (uses the pure-Python shim in the repo root). |
+**`No template found for residue ...`** — the force field has no parameters
+for something in your structure. The message names the residue and what to do:
+supply parameters, exclude it, or pass it as a ligand.
 
-`health` from inside a fresh clone is what's caught the highest-friction install bugs historically, so run it if anything seems off.
+**Solver conflicts on conda** — install into a fresh environment rather than
+an existing one. The chemistry stack pins a lot, and resolving it against
+whatever is already there is usually slower than starting clean.
 
-## Why `python fastmdx`?
-
-The third step in [Quick install](#quick-install-any-os) is `python fastmdx install`, not bare `fastmdx install`. The reason is order-of-operations:
-
-- When you first clone the repo, FastMDXplora is **not yet installed** on your system, so there's no `fastmdx` console script on `PATH` yet.
-- The repo ships a tiny Python file called **`fastmdx`** at its root. It has no shebang, so it runs identically on Linux, macOS, and Windows. Running it as `python fastmdx <subcommand>` invokes a one-shot script that puts `src/` on `sys.path`, sets `PYTHONPATH`, and forwards to the CLI module — i.e. `python -m fastmdxplora.cli.main <subcommand>`.
-- After you run `python fastmdx install` (or do `pip install fastmdxplora` first), a real `fastmdx` console script from `[project.scripts]` in `pyproject.toml` lands on `PATH`. From that point on, plain `fastmdx install` (and any other subcommand) works directly, with no `python fastmdx` prefix.
-So the right command for your situation is:
-
-| Your situation | Run this |
-|---|---|
-| Fresh clone, haven't run any install yet | `python fastmdx install` |
-| Already ran `install` once (or `pip install fastmdxplora`) | `fastmdx install` (plain) |
-| Want the canonical modulepath form (always works) | `python -m fastmdxplora.cli.main install` |
-
-## Why Python 3.9–3.12 (and not 3.13)?
-
-The chemistry phases depend on **OpenMM** and **PDBFixer**, which are primarily distributed through **conda-forge**. Their current wheels target Python 3.9–3.12. The `health.py` doctor and the `install` command both enforce this range from a single source of truth (`fastmdxplora.MIN_PYTHON = (3, 9)` and `MAX_PYTHON = (3, 13)`). Python 3.13 and newer are detected as out-of-range.
-
-If your environment is too new, install Python 3.10 or 3.11 in a dedicated conda env, then re-run `install` (it already defaults to Python 3.10, the smoothest supported version).
+---
 
 ## Where to go next
 
-- **Ready to run?** Try the [Usage examples](usage_examples.md).
-- **Need a specific output config?** See [Configuration files](configuration.md).
-- **Want to write your own analyses or extend FastMDXplora?** See [Phases](phases.md) and the [API reference](api.md).
-- **Want to contribute?** See [CONTRIBUTING.md](../CONTRIBUTING.md).
+- [Your first FastMDXplora study](first_study.md)
+- [The FastMDXplora GUI](gui.md)
+- [Running FastMDXplora elsewhere](clusters.md) — clusters, containers, and machines
+  with no network

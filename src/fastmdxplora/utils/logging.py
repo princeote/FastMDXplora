@@ -56,6 +56,27 @@ _ICON = {"DEBUG": "·", "INFO": "✓", "WARNING": "⚠", "ERROR": "✗", "CRITIC
 # ---------------------------------------------------------------------------
 # Formatters
 # ---------------------------------------------------------------------------
+class _NotOnTheConsole(logging.Filter):
+    """Keep a record out of the console without keeping it out of the log.
+
+    An analysis that raises is an error, and `fastmdxplora.log` should say
+    so at ERROR with its traceback -- a log recording it at DEBUG would
+    report a run as clean when an analysis failed in it.
+
+    The console is a different audience. It already shows the failure in
+    the results table, on the analysis's own row, with the reason beneath
+    it. A second line saying only ``Analysis 'rdf' failed``, arriving
+    several analyses before the table is drawn, tells the reader nothing
+    the table will not tell them better.
+
+    So the record carries ``to_console=False`` and this drops it there.
+    Anything without the attribute is unaffected, which is everything else.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return getattr(record, "to_console", True)
+
+
 class _PrettyFormatter(logging.Formatter):
     """Compact, human-friendly formatter. Color only when stderr is a TTY."""
 
@@ -161,6 +182,36 @@ def _is_owned_handler(handler: logging.Handler, kind: str | None = None) -> bool
     return kind is None or getattr(handler, _KIND_ATTR, None) == kind
 
 
+def _mark_a_new_run(path: str | Path) -> None:
+    """Write a line saying a new invocation starts here.
+
+    Plain text rather than a log record: it is a separator in the file, not
+    something a handler should format, and it has to appear whatever level
+    the run is logging at.
+    """
+    from datetime import datetime
+
+    try:
+        version = _package_version()
+    except Exception:  # noqa: BLE001 - a version that cannot be read
+        version = "unknown"
+    stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(
+                f"\n{'=' * 78}\n"
+                f"=== new run  {stamp}  fastmdxplora {version}\n"
+                f"{'=' * 78}\n")
+    except OSError:  # pragma: no cover - a log that cannot be written to
+        pass
+
+
+def _package_version() -> str:
+    from importlib.metadata import version
+
+    return version("fastmdxplora")
+
+
 def _find_owned_handler(
     logger: logging.Logger,
     kind: str,
@@ -194,6 +245,16 @@ def setup_console(
     Safe to call multiple times; the second call updates the level on the
     existing handler instead of adding a duplicate.
 
+    This attaches a handler. It does not touch ``propagate``, and that is
+    deliberate: turning propagation off is a decision about who owns the
+    process, not part of setting up a console. It used to live here, and
+    the effect was that importing this package and running one study left
+    the caller's own logging permanently unable to see anything from it --
+    silently, for the rest of the session.
+
+    :func:`own_the_console` is where that decision is made now, and the
+    CLI is the only thing that makes it.
+
     Returns
     -------
     logging.Logger
@@ -201,7 +262,6 @@ def setup_console(
     """
     global _console_handler
     base = logging.getLogger("fastmdx")
-    base.propagate = False
 
     env_level = os.getenv("FASTMDX_LOGLEVEL")
     base.setLevel(_to_level(env_level) if env_level else _to_level(level))
@@ -220,12 +280,49 @@ def setup_console(
             fmt = _PrettyFormatter(use_color)
         handler.setFormatter(fmt)
         handler.setLevel(base.level)
+        handler.addFilter(_NotOnTheConsole())
         _mark_owned(handler, _CONSOLE_KIND)
         base.addHandler(handler)
         _console_handler = handler
     else:
+        # The console is wherever stdout points now, not wherever it pointed
+        # the first time this ran. A handler holds the stream object it was
+        # built with, so after a redirect it keeps writing to the old one --
+        # which means output going somewhere the caller cannot see, or, if
+        # that stream has since been closed, a ValueError raised from the
+        # logging call rather than from anything the caller did.
+        _rebind_console(_console_handler, style)
         _console_handler.setLevel(base.level)
     return base
+
+
+def _rebind_console(handler: logging.Handler, style: str) -> None:
+    """Point the console handler at the current ``sys.stdout``."""
+    current = sys.stdout
+    existing = getattr(handler, "stream", None)
+    if existing is current:
+        return
+    handler.acquire()
+    try:
+        try:
+            handler.flush()
+        except (ValueError, OSError):
+            # The stream being left may already be closed, which is the
+            # commonest reason to be here at all. Nothing to flush it to.
+            pass
+        # Assigned rather than `setStream`, which flushes the outgoing
+        # stream itself and so raises on exactly the closed stream this
+        # exists to get away from.
+        handler.stream = current
+    finally:
+        handler.release()
+    if style != "plain":
+        # Whether to colour depends on what is being written to, so it is
+        # decided again rather than carried over from the previous stream.
+        use_color = bool(
+            getattr(current, "isatty", lambda: False)()
+        ) and not os.getenv("NO_COLOR")
+        handler.setFormatter(_PrettyFormatter(use_color))
 
 
 def attach_file_logger(
@@ -268,7 +365,21 @@ def attach_file_logger(
             pass
         _file_handler = None
 
+    # Appended, not truncated. A run directory is the record of what
+    # happened in it, and a second attempt that overwrote the first would
+    # erase the evidence of why the first was made -- which is exactly what
+    # somebody reading the log is looking for. A failed run that named a
+    # wrong CUDA version, followed by the corrected one, belongs in the same
+    # file in that order.
+    #
+    # What appending needs and did not have is a mark saying where one
+    # invocation ends and the next begins. Without it the second run's first
+    # line follows the first run's traceback with nothing between them, and
+    # reading backwards there is no way to tell how far back "this run" goes.
+    existing = Path(path).exists() and Path(path).stat().st_size > 0
     handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    if existing:
+        _mark_a_new_run(path)
 
     # File logs are audit-oriented: when an explicit style is supplied
     # (the typical case from the project orchestrator), respect it and
@@ -290,6 +401,45 @@ def attach_file_logger(
     return base
 
 
+def file_logger_path() -> Path | None:
+    """The file the package's file log is writing to, or None."""
+    base = logging.getLogger("fastmdx")
+    handler = _file_handler if _file_handler in base.handlers else \
+        _find_owned_handler(base, _FILE_KIND)
+    name = getattr(handler, "baseFilename", None)
+    return Path(name) if name else None
+
+
+def detach_file_logger(path: str | Path | None = None) -> bool:
+    """Detach and close the package's file log, if it is writing to
+    ``path`` (to anything, when ``path`` is None). Returns whether one was.
+
+    A study's log stayed attached after the study ended, so whatever the
+    process logged next was written into that study's folder, and moving
+    the folder broke logging for the rest of the process.
+    """
+    global _file_handler
+    base = logging.getLogger("fastmdx")
+    handler = _file_handler if _file_handler in base.handlers else \
+        _find_owned_handler(base, _FILE_KIND)
+    if handler is None:
+        return False
+    if path is not None:
+        try:
+            same = Path(handler.baseFilename).resolve() == Path(path).resolve()
+        except (AttributeError, OSError):
+            same = False
+        if not same:
+            return False
+    try:
+        base.removeHandler(handler)
+        handler.close()
+    except Exception:  # noqa: BLE001 -- cleanup must never raise
+        pass
+    _file_handler = None
+    return True
+
+
 def get_logger(name: str | None = None) -> logging.Logger:
     """Return the package logger or a namespaced child.
 
@@ -303,6 +453,31 @@ def get_logger(name: str | None = None) -> logging.Logger:
     """
     base = logging.getLogger("fastmdx")
     return base if name is None else base.getChild(name)
+
+
+
+def own_the_console() -> None:
+    """Claim this process's console output for the package.
+
+    Stops records propagating to the root logger, so they are printed once
+    by this package's handler rather than twice. Correct for the command
+    line, which owns the terminal and ends when the run does.
+
+    Not correct for a library. A caller who imports this package has their
+    own logging, and silently cutting it off from this package is the worse of the
+    two failures available here: the alternative, where a caller with a
+    root handler sees these records twice, is at least visible and something
+    they can turn off.
+
+    So this is not called from the library path, and a study run through
+    the API leaves the caller's logging as it found it.
+    """
+    logging.getLogger("fastmdx").propagate = False
+
+
+def release_the_console() -> None:
+    """Undo :func:`own_the_console`. For tests and for embedding."""
+    logging.getLogger("fastmdx").propagate = True
 
 
 def set_level(level: int | str) -> None:

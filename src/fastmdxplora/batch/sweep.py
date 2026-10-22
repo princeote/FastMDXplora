@@ -35,10 +35,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from fastmdxplora.config.schema import PHASE_KEYS
+from fastmdxplora.naming import default_system_id
+from fastmdxplora.refusals import CodedError
 
 
-class SweepError(ValueError):
+class SweepError(CodedError, ValueError):
     """Raised for malformed systems/sweep specifications."""
+
+    default_code = "batch.sweep.invalid"
 
 
 # A safe slug for run-directory names: keep alnum, dot, plus, minus.
@@ -62,6 +66,11 @@ class RunSpec:
         for the batch manifest.
     system_id : str
         The originating system's id.
+    study : dict[str, Any]
+        The study-level settings -- ``agent`` and ``agent_model`` -- which
+        belong to the config as a whole rather than to a phase. Carried per
+        run because a run is what writes a manifest, and the manifest is
+        where they are recorded.
     """
 
     run_id: str
@@ -69,6 +78,7 @@ class RunSpec:
     options: dict[str, dict[str, Any]] = field(default_factory=dict)
     sweep_values: dict[str, Any] = field(default_factory=dict)
     system_id: str = ""
+    study: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -77,7 +87,57 @@ class RunSpec:
             "system": self.system,
             "sweep_values": self.sweep_values,
             "options": self.options,
+            "study": self.study,
         }
+
+
+def values_from_text(text: Any) -> list[Any]:
+    """An axis's values as someone typed them: separated by commas, or in
+    brackets where a value holds a comma. Each is read the way the config
+    file reads a value, so 300 is a number and true is a truth value. The
+    command line's --sweep and the GUI's sweep rows both read through here,
+    so the two cannot come to disagree about what was meant.
+    """
+    import yaml
+
+    written = str(text).strip()
+    if not written:
+        raise SweepError("A sweep axis needs at least one value.")
+    if written.startswith("["):
+        values = yaml.safe_load(written)
+        if not isinstance(values, list):
+            raise SweepError(f"Could not read {written!r} as a list of values.")
+        return values
+    return [yaml.safe_load(part.strip()) for part in written.split(",")]
+
+
+def text_from_values(values: list[Any]) -> str:
+    """Values written back as `values_from_text` reads them: separated by
+    commas where that reads back the same, in brackets where a value holds a
+    comma or is itself a list or mapping."""
+    import json
+
+    if any(isinstance(v, (list, dict)) or (isinstance(v, str) and "," in v) for v in values):
+        return json.dumps(list(values))
+    return ", ".join(_written(v) for v in values)
+
+
+def _written(value: Any) -> str:
+    """One value as it must be typed to read back as itself: a string that
+    YAML would read as a number or a truth value is quoted."""
+    import json
+
+    import yaml
+
+    plain = {True: "true", False: "false", None: "null"}.get(value, str(value)) \
+        if isinstance(value, (bool, type(None))) else str(value)
+    try:
+        back = yaml.safe_load(plain)
+        if back == value and type(back) is type(value):
+            return plain
+    except yaml.YAMLError:
+        pass
+    return json.dumps(value)
 
 
 def _slug(value: Any) -> str:
@@ -139,13 +199,28 @@ def normalize_systems(raw: Any) -> list[dict[str, Any]]:
     seen_ids: set[str] = set()
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict):
-            raise SweepError(f"`systems[{i}]` must be a mapping, got {type(entry).__name__}.")
+            raise SweepError(
+                f"`systems[{i}]` must be a mapping, got {type(entry).__name__}: "
+                "each entry is `{system: <PDB id or path>}`, with an optional "
+                "`id` and phase blocks.",
+                code="config.option.wrong_type", option=f"systems[{i}]",
+                context="systems", expected_type="mapping",
+                found_type=type(entry).__name__)
         if "system" not in entry or not entry["system"]:
-            raise SweepError(f"`systems[{i}]` is missing a `system` input.")
+            raise SweepError(
+                f"`systems[{i}]` is missing a `system` input: a PDB identifier "
+                "to fetch or the path of a structure file.",
+                code="config.option.missing_companion", option=f"systems[{i}]",
+                requires=["system"])
 
-        sid = str(entry.get("id") or f"s{i + 1}")
+        sid = str(entry.get("id") or default_system_id(i))
         if sid in seen_ids:
-            raise SweepError(f"Duplicate system id '{sid}' in `systems`.")
+            raise SweepError(
+                f"Duplicate system id '{sid}' in `systems`: each id names its "
+                "own run folder, so two systems cannot share one. Give each "
+                "entry its own `id`.",
+                code="config.option.conflicting",
+                options=[f"systems[{i}].id"], context="systems")
         seen_ids.add(sid)
 
         # Per-system per-phase option overrides
@@ -224,7 +299,7 @@ def expand_runs(
     elif base_system is not None:
         sys_entries = [{"id": "s1", "system": base_system, "options": {}}]
     else:
-        raise SweepError("expand_runs requires either `systems` or `base_system`.")
+        raise SweepError("expand_runs requires either `systems` or `base_system`.", code="config.option.missing_companion")
 
     # Build the sweep grid: list of (axis_key, value) tuples per point
     if sweep:
@@ -329,8 +404,15 @@ def normalize_summary_for_validation(data: dict[str, Any]) -> None:
             phase, option = _split_dotted(axis)
             schema = PHASE_SCHEMAS[phase]
             if schema.get(option) is None:
+                from fastmdxplora.config.loader import _suggest, _suggestion_only
+
                 valid = sorted(schema.field_names())
                 raise SweepError(
                     f"Sweep axis '{axis}' names option '{option}', which is "
-                    f"not a valid {phase} option. Valid: {', '.join(valid)}."
+                    f"not a valid {phase} option{_suggest(option, set(valid))}. "
+                    f"Valid: {', '.join(valid)}.",
+                    code="config.option.unknown", option=str(axis),
+                    context="sweep", permitted=[f"{phase}.{v}" for v in valid],
+                    suggestion=(f"{phase}.{s}" if (s := _suggestion_only(
+                        option, set(valid))) else None),
                 )

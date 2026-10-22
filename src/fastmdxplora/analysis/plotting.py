@@ -13,6 +13,8 @@ do not silently hang waiting for a display.
 from __future__ import annotations
 
 import os
+import textwrap
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
@@ -33,26 +35,320 @@ if "MPLBACKEND" not in os.environ:
 import matplotlib.pyplot as plt  # noqa: E402  -- backend set above
 from matplotlib.axes import Axes  # noqa: E402
 from matplotlib.colorbar import Colorbar  # noqa: E402
-from matplotlib.ticker import FixedLocator, MaxNLocator  # noqa: E402
+from matplotlib.ticker import (  # noqa: E402
+    AutoMinorLocator,
+    FixedLocator,
+    MaxNLocator,
+)
 import numpy as np  # noqa: E402
+from fastmdxplora.refusals import StudyError
+from fastmdxplora.refusals import CodedKeyError
 
 
 NumericSeq = Optional[Union[Sequence[float], np.ndarray]]
 
 
-# Tableau 10 — colorblind-aware, distinct in print and on screen
+# Okabe-Ito: designed to stay distinguishable under the common forms of
+# colour vision deficiency and when printed in greyscale, which the previous
+# Tableau palette did not (its red and green converged in both cases).
 PALETTE = (
-    "#4E79A7",
-    "#F28E2B",
-    "#E15759",
-    "#76B7B2",
-    "#59A14F",
-    "#EDC948",
-    "#B07AA1",
-    "#FF9DA7",
-    "#9C755F",
-    "#BAB0AC",
+    "#0072B2",  # blue
+    "#D55E00",  # vermillion
+    "#009E73",  # bluish green
+    "#CC79A7",  # reddish purple
+    "#E69F00",  # orange
+    "#56B4E9",  # sky blue
+    "#F0E442",  # yellow
+    "#000000",  # black
+    "#8C8C8C",  # grey
+    "#7F3C8D",  # violet
 )
+
+#: The same palette with the hue taken out. Ordered so that neighbouring
+#: entries stay apart in value, which is what carries a distinction once
+#: there is no hue left to carry it.
+GREYSCALE_PALETTE = (
+    "#000000", "#5A5A5A", "#8C8C8C", "#B4B4B4", "#2E2E2E",
+    "#737373", "#A6A6A6", "#1A1A1A", "#C8C8C8", "#404040",
+)
+
+#: What a colour is *for*, so an analysis asks for a role and not for a hex
+#: value. Before this there were twenty-eight hardcoded colours across
+#: ``analysis/*.py``, and they did not agree with each other: `contacts` and
+#: `pl_hbonds` drew `#3a7ca5`, `pl_interactions` `#3fb0ac`, `ligand_rmsd` and
+#: `ligand_rmsf` `#b5651d`, `order_parameters` `#EE6677`, `water_sites`
+#: `#4E79A7` -- four different blues in one report, none of them from the
+#: palette this module installs, while its own docstring called itself "a
+#: single point of style configuration so every analysis figure looks
+#: consistent".
+#:
+#: ``SERIES`` is the measurement, ``ACCENT`` its error bars or a second
+#: series, ``GUIDE`` a reference the reader compares against, ``FAINT`` a
+#: subordinate one (window centres, a grid of positions), ``BAND`` a shaded
+#: region, ``ANNOTATION`` a footnote, ``WARN`` something asked for that was
+#: not achieved.
+_ROLES_IN_COLOUR = {
+    "SERIES": PALETTE[0],
+    "ACCENT": PALETTE[1],
+    "GUIDE": "#888888",
+    "FAINT": "#CCCCCC",
+    "BAND": PALETTE[5],
+    "ANNOTATION": "#666666",
+    "WARN": PALETTE[1],
+}
+
+_ROLES_IN_GREY = {
+    "SERIES": "#4D4D4D",
+    "ACCENT": "#111111",
+    "GUIDE": "#888888",
+    "FAINT": "#CCCCCC",
+    "BAND": "#D9D9D9",
+    "ANNOTATION": "#666666",
+    "WARN": "#111111",
+}
+
+#: Whether figures are drawn without hue. Off by default; a journal that
+#: wants greyscale, or an author who prefers shape and value to colour, sets
+#: it once and every analysis follows, because every analysis asks `colour()`
+#: rather than naming a hex value.
+_GREYSCALE = False
+
+
+#: What a figure can be asked to be drawn in. British and American spellings
+#: of both words are accepted, because this package has already had to settle
+#: "one thing, two words" four times -- `centres`/`centers` among them -- and
+#: refusing `grayscale` from an American user would be the fifth.
+FIGURE_COLOURS = ("colour", "greyscale", "both")
+
+_COLOUR_SPELLINGS = {
+    "colour": "colour", "color": "colour", "coloured": "colour",
+    "colored": "colour", "hue": "colour",
+    "greyscale": "greyscale", "grayscale": "greyscale",
+    "grey": "greyscale", "gray": "greyscale", "mono": "greyscale",
+    "both": "both", "all": "both",
+}
+
+
+def settle_figure_colours(value: Any) -> str:
+    """One spelling for what a figure is drawn in, from any of the usual.
+
+    Raises on anything else rather than falling back to a default: a figure
+    silently drawn in a mode nobody asked for is worse than a refusal that
+    names what is accepted.
+    """
+    if value is None:
+        return "colour"
+    key = str(value).strip().lower().replace("-", "").replace("_", "")
+    settled = _COLOUR_SPELLINGS.get(key)
+    if settled is None:
+        raise StudyError(
+            f"figure_colours does not accept {value!r}. It accepts "
+            f"{', '.join(FIGURE_COLOURS)} -- 'colour' plots the figure in "
+            "colour, 'greyscale' plots it without hue, and 'both' writes the "
+            "colour figure and a greyscale copy beside it. American "
+            "spellings are accepted."
+        , code="analysis.option.not_permitted")
+    return settled
+
+
+def use_greyscale(on: bool = True) -> None:
+    """Draw every figure without hue, using value and shape instead."""
+    global _GREYSCALE
+    _GREYSCALE = bool(on)
+    apply_style()
+
+
+@contextmanager
+def drawn_in(mode: str):
+    """Draw inside this block in ``colour`` or ``greyscale``, then restore.
+
+    A context manager rather than two calls, because the mode is process-wide
+    state and an exception between setting and restoring it would leave every
+    later figure in the wrong one. Analyses run sequentially, so process-wide
+    is safe; were that ever to change this is the thing that would break, and
+    it is the one place to fix.
+    """
+    global _GREYSCALE
+    previous = _GREYSCALE
+    _GREYSCALE = (mode == "greyscale")
+    apply_style()
+    try:
+        yield
+    finally:
+        _GREYSCALE = previous
+        apply_style()
+
+
+def greyscale_is_on() -> bool:
+    return _GREYSCALE
+
+
+#: How wide a figure is drawn, by where it is going. `page` is the default
+#: this package has always drawn (6.5 in, the text width of a manuscript page
+#: with its margins). The column widths are the ones journals set figures at:
+#: 89 mm for one column and 183 mm for two (Nature's; Cell's 85 and 174 mm,
+#: ACS's 3.25 and 7 in, and Science's 2- and 3-column widths fall within a few
+#: millimetres of one or the other). A figure drawn at the width it will be
+#: printed keeps its type at the size it was set in; one scaled down from the
+#: page width takes 9 pt ticks to about 5 pt at one column, which is below
+#: what most journals accept.
+FIGURE_WIDTHS_MM: dict[str, float] = {
+    "page": 165.1,
+    "single_column": 89.0,
+    "double_column": 183.0,
+}
+
+#: The type, lines and ticks for each width, in points. The page's are the
+#: package's own; one column's are 7-8 pt type, the size journals ask for at
+#: that width, with lines and ticks thinned to match; two columns keep the
+#: page's, being about as wide.
+_SIZED: dict[str, dict[str, float]] = {
+    "page": {"tick": 9.0, "label": 10.0, "title": 11.0, "line": 1.6, "axes": 0.8,
+             "major": 4.5, "minor": 2.5, "marker": 3.0, "pad": 5.0},
+    "single_column": {"tick": 7.0, "label": 7.5, "title": 8.0, "line": 1.0, "axes": 0.6,
+                      "major": 3.0, "minor": 1.8, "marker": 2.2, "pad": 3.0},
+    "double_column": {"tick": 9.0, "label": 10.0, "title": 11.0, "line": 1.6, "axes": 0.8,
+                      "major": 4.5, "minor": 2.5, "marker": 3.0, "pad": 5.0},
+}
+
+_WIDTH_SPELLINGS = {
+    "page": "page", "full": "page", "fullpage": "page", "default": "page",
+    "singlecolumn": "single_column", "single": "single_column", "onecolumn": "single_column",
+    "1column": "single_column", "column": "single_column",
+    "doublecolumn": "double_column", "double": "double_column", "twocolumn": "double_column",
+    "2column": "double_column",
+}
+
+#: The width figures are drawn at now; see :func:`sized_for`.
+_WIDTH = "page"
+
+
+def settle_figure_width(value: Any) -> str:
+    """One name for how wide a figure is drawn, from any of the usual."""
+    if value is None:
+        return "page"
+    key = str(value).strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+    settled = _WIDTH_SPELLINGS.get(key)
+    if settled is None:
+        raise StudyError(
+            f"figure_width does not accept {value!r}. It accepts "
+            f"{', '.join(FIGURE_WIDTHS_MM)}: the page (6.5 in), one journal "
+            "column (89 mm) or two (183 mm).",
+            code="analysis.option.not_permitted")
+    return settled
+
+
+def figure_width_inches(width: str | None = None) -> float:
+    return FIGURE_WIDTHS_MM[width or _WIDTH] / 25.4
+
+
+@contextmanager
+def sized_for(width: str):
+    """Draw inside this block at a width (and its type), then restore.
+
+    Process-wide for the reason :func:`drawn_in` gives, and restored the
+    same way, so an exception while drawing cannot leave later figures at a
+    column's width.
+    """
+    global _WIDTH
+    previous = _WIDTH
+    _WIDTH = settle_figure_width(width)
+    apply_style()
+    try:
+        yield
+    finally:
+        _WIDTH = previous
+        apply_style()
+
+
+#: The mark every figure drawn right now carries, or "".
+#:
+#: Ambient for the same reason the greyscale mode is: `save_figure` is the
+#: one place every figure passes through, and its own docstring says why
+#: that matters -- "a mark applied in twenty places is a mark missing from
+#: one of them". There are ten call sites, four of them inside analyses
+#: that draw supplementary figures of their own, and threading a parameter
+#: to all ten is the arrangement that docstring warns against.
+_MARK = ""
+
+
+@contextmanager
+def marked_as(mark: str):
+    """Stamp every figure drawn inside this block, then restore.
+
+    A context manager rather than two calls, for the reason given on
+    :func:`drawn_in`: this is process-wide state, and an exception between
+    setting and restoring it would leave every later figure carrying a mark
+    that does not belong to it -- which is worse than the reverse, because
+    a mark on a checked figure is a false warning and they are the ones
+    people learn to ignore.
+
+    Phases run sequentially, so process-wide is safe; were that to change
+    this is the thing that would break, and it is the one place to fix.
+    """
+    global _MARK
+    previous = _MARK
+    _MARK = mark or ""
+    try:
+        yield
+    finally:
+        _MARK = previous
+
+
+def current_mark() -> str:
+    """The mark in force, for a figure that does not go through
+    :func:`save_figure`."""
+    return _MARK
+
+
+def stamp_current(fig) -> None:
+    """Stamp a figure that saves itself.
+
+    Two report figures compose their own panels and call `fig.savefig`
+    directly, because they need `bbox_inches="tight"` and `save_figure`
+    does not offer it. Without this they would be the figures in the
+    report carrying no mark while every analysis panel inside them does.
+
+    Call after `tight_layout`, for the reason `save_figure` gives: before
+    it, the stamp counts as content and is squeezed into the plot area.
+    """
+    mark = current_mark()
+    if not mark:
+        return
+    from fastmdxplora.marking import stamp_figure
+
+    stamp_figure(fig, mark)
+
+
+def colour(role: str) -> str:
+    """The colour for a role, in whichever mode is in force.
+
+    Raises on an unknown role rather than returning a default: a silent
+    fallback is how a figure ends up drawn in a colour nobody chose.
+    """
+    table = _ROLES_IN_GREY if _GREYSCALE else _ROLES_IN_COLOUR
+    try:
+        return table[role]
+    except KeyError:
+        raise CodedKeyError(
+            f"No colour role named {role!r}. Roles are: "
+            f"{', '.join(sorted(_ROLES_IN_COLOUR))}."
+        , code="analysis.unknown") from None
+
+
+#: Shapes for categories drawn without hue, where value alone cannot keep
+#: ten of them apart.
+CATEGORY_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*", "<", ">")
+
+
+def category_style(index: int) -> tuple[str, str]:
+    """The colour and marker of the ``index``-th category (a cluster, a
+    state), in whichever mode is in force: the palette's colours with one
+    shape, or its greys with a shape each."""
+    colours = GREYSCALE_PALETTE if _GREYSCALE else PALETTE
+    marker = CATEGORY_MARKERS[index % len(CATEGORY_MARKERS)] if _GREYSCALE else "o"
+    return colours[index % len(colours)], marker
+
 
 PAPER_TICK_SIZE = 9.0
 PAPER_LABEL_SIZE = 10.0
@@ -72,47 +368,84 @@ def apply_style() -> None:
     Called automatically by :func:`new_figure`; safe to call again to
     reset after user customizations.
     """
+    size = _SIZED[_WIDTH]
     plt.rcParams.update(
         {
             "font.family": "sans-serif",
             "font.sans-serif": ["DejaVu Sans", "Arial", "Helvetica", "sans-serif"],
-            "font.size": PAPER_TICK_SIZE,
+            "font.size": size["tick"],
             "figure.facecolor": "white",
             "figure.edgecolor": "white",
             "axes.facecolor": "white",
-            "axes.edgecolor": "black",
+            # Set once. It was written twice in this literal -- "black" here
+            # and "#333333" below -- and a dict literal keeps the last, so
+            # this line had never taken effect. Removing the *later* one
+            # would have silently darkened every axis in every figure, which
+            # is why the dead line is the one that goes.
             "axes.labelcolor": "black",
             "text.color": "black",
             "xtick.color": "black",
             "ytick.color": "black",
-            "axes.labelsize": PAPER_LABEL_SIZE,
-            "axes.titlesize": PAPER_TITLE_SIZE,
+            "axes.labelsize": size["label"],
+            "axes.titlesize": size["title"],
             "axes.titleweight": "normal",
-            "axes.linewidth": 1.0,
-            "axes.spines.top": False,
-            "axes.spines.right": False,
+            "axes.linewidth": size["axes"],
+            # A closed frame with inward ticks is the convention in most
+            # physics and chemistry journals, and it reads as more finished
+            # than open axes at figure size.
+            "axes.spines.top": True,
+            "axes.spines.right": True,
+            "axes.edgecolor": "#333333",
+            "axes.labelpad": size["pad"],
             "axes.grid": True,
             "axes.axisbelow": True,
-            "axes.prop_cycle": plt.cycler(color=PALETTE),
-            "grid.color": "#DDDDDD",
-            "grid.linewidth": 0.6,
+            "axes.prop_cycle": plt.cycler(
+                color=GREYSCALE_PALETTE if _GREYSCALE else PALETTE),
+            "grid.color": "#E6E6E6",
+            "grid.linewidth": 0.5,
             "grid.linestyle": "--",
-            "xtick.labelsize": PAPER_TICK_SIZE,
-            "ytick.labelsize": PAPER_TICK_SIZE,
-            "legend.fontsize": PAPER_TICK_SIZE,
+            "xtick.labelsize": size["tick"],
+            "ytick.labelsize": size["tick"],
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+            "xtick.top": True,
+            "ytick.right": True,
+            "xtick.minor.visible": True,
+            "ytick.minor.visible": True,
+            "xtick.major.size": size["major"],
+            "ytick.major.size": size["major"],
+            "xtick.minor.size": size["minor"],
+            "ytick.minor.size": size["minor"],
+            "xtick.major.width": size["axes"],
+            "ytick.major.width": size["axes"],
+            "xtick.minor.width": 0.6,
+            "ytick.minor.width": 0.6,
+            "legend.fontsize": size["tick"],
             "legend.frameon": False,
             "figure.dpi": 100,
-            "figure.figsize": PAPER_FIGSIZE,
+            "figure.figsize": _default_figsize(),
             "savefig.dpi": 300,
             "savefig.bbox": "tight",
             "savefig.facecolor": "white",
             "savefig.edgecolor": "white",
             "savefig.transparent": False,
             "savefig.pad_inches": 0.08,
-            "lines.linewidth": 1.4,
-            "lines.markersize": 3.0,
+            "lines.linewidth": size["line"],
+            "lines.markersize": size["marker"],
         }
     )
+
+
+def _default_figsize() -> tuple[float, float]:
+    """The page's figure, at the width figures are drawn at now."""
+    return scaled_figsize(PAPER_FIGSIZE)
+
+
+def scaled_figsize(figsize: tuple[float, float]) -> tuple[float, float]:
+    """A figure sized for the page, at the width figures are drawn at now:
+    both sides in proportion, so an analysis's own shape is kept."""
+    scale = figure_width_inches() / PAPER_FIGSIZE[0]
+    return (float(figsize[0]) * scale, float(figsize[1]) * scale)
 
 
 def _clean_array(values: NumericSeq) -> np.ndarray | None:
@@ -258,9 +591,202 @@ def match_colorbar_font(colorbar: Colorbar, ax: Axes) -> None:
     getattr(colorbar.ax, f"{axis_name}axis").label.set_fontsize(label_size)
 
 
+def _tick_budget(ax: Axes, axis: str) -> int:
+    """How many major ticks fit on this axis without crowding.
+
+    Derived from the axes' physical size rather than a constant, so a wide
+    time series gets more ticks than a small square panel and neither ends up
+    with labels running into each other.
+    """
+    fig = ax.get_figure()
+    width_in, height_in = fig.get_size_inches()
+    box = ax.get_position()
+    inches = width_in * box.width if axis == "x" else height_in * box.height
+    # Roughly one tick per inch on x (labels are wide) and per 0.7in on y.
+    per_inch = 1.5 if axis == "x" else 2.0
+    return int(max(3, min(9, round(inches * per_inch))))
+
+
+def _has_categorical_ticks(ax: Axes, axis: str) -> bool:
+    """True when the axis carries fixed or text labels that must not be relocated.
+
+    Matrices, dendrograms, and bar charts label specific positions; replacing
+    their locator would silently mislabel the data.
+    """
+    target = ax.xaxis if axis == "x" else ax.yaxis
+    if isinstance(target.get_major_locator(), FixedLocator):
+        return True
+    return any(label.get_text() and not label.get_text().lstrip("-").replace(".", "", 1).isdigit()
+               for label in target.get_ticklabels())
+
+
+#: Step sizes for an axis whose full extent is one whole -- a fraction, an
+#: occupancy, a probability. Matplotlib's default set includes 1.5, 3, 4, 6
+#: and 8, and on a 0-1 axis with the tick budget these figures get it chooses
+#: 0.15: ticks at 0, 0.15 ... 0.90, and the end of the axis never labelled.
+#: That is how `pl_contacts` came to draw twelve bars reaching 1.00 above a
+#: scale whose last number was 0.90, with no way to read what the bars said.
+#:
+#: Restricted only here, and deliberately not everywhere: a torsion axis
+#: spanning -180 to 180 wants the 3 and 6 that this set drops, and would be
+#: made worse by it. The rule is about a whole, not about nice numbers.
+_STEPS_THAT_DIVIDE_A_WHOLE = [1, 2, 2.5, 5, 10]
+
+
+def _is_a_fraction_axis(ax: Axes, axis: str) -> bool:
+    """True when this axis runs from zero to one, so its end is a whole."""
+    low, high = ax.get_xlim() if axis == "x" else ax.get_ylim()
+    return bool(np.isclose(low, 0.0) and np.isclose(high, 1.0))
+
+
+def _finalise_axes(ax: Axes) -> None:
+    """Adaptive tick density and a legible legend, applied to every figure."""
+    for axis in ("x", "y"):
+        if _has_categorical_ticks(ax, axis):
+            continue
+        target = ax.xaxis if axis == "x" else ax.yaxis
+        scale = ax.get_xscale() if axis == "x" else ax.get_yscale()
+        if scale != "linear":
+            continue
+        bins = _tick_budget(ax, axis)
+        if _is_a_fraction_axis(ax, axis):
+            locator = MaxNLocator(
+                nbins=bins, steps=_STEPS_THAT_DIVIDE_A_WHOLE)
+        else:
+            locator = MaxNLocator(nbins=bins)
+        target.set_major_locator(locator)
+        target.set_minor_locator(AutoMinorLocator())
+
+    legend = ax.get_legend()
+    if legend is not None:
+        # `loc="best"` minimises overlap but cannot always avoid it on a full
+        # axes, so give the legend an opaque-enough backing to stay readable,
+        # and add headroom above the data for it to sit in.
+        frame = legend.get_frame()
+        frame.set_facecolor("white")
+        frame.set_edgecolor("none")
+        frame.set_alpha(0.85)
+        legend.set_frame_on(True)
+        if ax.get_yscale() == "linear":
+            low, high = ax.get_ylim()
+            if high > low:
+                ax.set_ylim(low, high + (high - low) * 0.12)
+
+
+def fit_legend(ax: Axes, *, floor: float = 6.0) -> None:
+    """Keep a legend inside the axes it belongs to.
+
+    `loc="best"` finds the emptiest corner and puts the legend there; it does
+    not check that the legend is narrower than the axes, and matplotlib will
+    happily draw one that runs past the frame into blank canvas. At full
+    width nothing notices. At a journal single-column width -- 3.3 inches --
+    a legend carrying a measured value and its sample count is wider than the
+    plot, and the overflow lands exactly where the label is most worth
+    reading.
+
+    The font is reduced until it fits, down to `floor` points, below which
+    shrinking further trades one unreadable figure for another. Nothing is
+    changed where the legend already fits, which is the common case.
+
+    Reaching the floor is not the end of it. The label a time series actually
+    carries -- "mean after equilibration 0.1143 nm" over "about 10
+    independent samples: too few for an error bar" -- is still 7% too wide at
+    six points in a 3.3-inch column, so a version that only shrank returned
+    having done nothing and left the overflow where it was. The remaining
+    width is taken out of the line rather than the type: the label is wrapped
+    at its own spaces, which costs height where there is room for it. A line
+    with nowhere to break is left alone; a legend cannot be made narrower
+    than its longest word.
+    """
+    legend = ax.get_legend()
+    if legend is None:
+        return
+    figure = ax.get_figure()
+    if figure is None or figure.canvas is None:
+        return
+    try:
+        renderer = figure.canvas.get_renderer()
+    except AttributeError:  # a backend without a renderer to ask
+        return
+
+    available = ax.get_window_extent(renderer=renderer).width
+    for _ in range(6):
+        width = legend.get_window_extent(renderer=renderer).width
+        if width <= available * 0.98:
+            return
+        size = max(t.get_fontsize() for t in legend.get_texts())
+        if size <= floor:
+            break
+        for text in legend.get_texts():
+            text.set_fontsize(max(floor, size - 0.75))
+        figure.canvas.draw_idle()
+
+    # At the floor and still over. Wrap, measuring after each pass rather
+    # than predicting: how many characters fit depends on which ones they
+    # are, and a budget computed from an average lands wrong on a label that
+    # is mostly digits or mostly "i".
+    for _ in range(4):
+        width = legend.get_window_extent(renderer=renderer).width
+        if width <= available * 0.98:
+            return
+        longest = max(
+            (len(line) for text in legend.get_texts()
+             for line in text.get_text().split("\n")),
+            default=0)
+        budget = max(8, int(longest * available / width))
+        changed = False
+        for text in legend.get_texts():
+            wrapped = "\n".join(
+                "\n".join(textwrap.wrap(
+                    line, budget,
+                    # A legend label carries measured values, and
+                    # `textwrap` breaks a long word mid-token by default:
+                    # "0.114327" wrapped to "0.1143" over "27" is a
+                    # different number, printed legibly, in a figure. It
+                    # breaks at spaces or it does not break.
+                    break_long_words=False, break_on_hyphens=False)) or line
+                for line in text.get_text().split("\n"))
+            if wrapped != text.get_text():
+                text.set_text(wrapped)
+                changed = True
+        if not changed:      # every line is one unbreakable word
+            return
+        figure.canvas.draw_idle()
+
+
 def _style_all_axes(fig: plt.Figure) -> None:
     for ax in fig.axes:
         apply_slide_style(ax)
+        _finalise_axes(ax)
+
+
+def figures_open() -> set[int]:
+    """The figures open right now, by number."""
+    return set(plt.get_fignums())
+
+
+def close_figures_opened_since(before: set[int]) -> None:
+    """Close the figures opened since `before` was taken, and no others: a
+    figure the caller had open already -- in a notebook, say -- is theirs."""
+    for number in figures_open() - before:
+        plt.close(number)
+
+
+@contextmanager
+def closes_what_it_opens():
+    """Figures opened inside this block are closed if it raises.
+
+    A figure is made, drawn, and closed by save_figure. When drawing or
+    saving raised in between, the figure was never closed: one analysis
+    whose plot failed left one open for the rest of the process, and a
+    sweep or a long GUI session accumulated them and their memory. Usable
+    as a decorator too."""
+    before = figures_open()
+    try:
+        yield
+    except BaseException:
+        close_figures_opened_since(before)
+        raise
 
 
 def new_figure(
@@ -290,7 +816,8 @@ def new_figure(
         normal conventions (array of axes).
     """
     apply_style()
-    fig, ax = plt.subplots(figsize=figsize or PAPER_FIGSIZE, **subplot_kwargs)
+    fig, ax = plt.subplots(figsize=scaled_figsize(figsize or PAPER_FIGSIZE),
+                           **subplot_kwargs)
     fig.patch.set_facecolor("white")
     for axis in np.atleast_1d(ax).ravel():
         if hasattr(axis, "set_facecolor"):
@@ -314,49 +841,72 @@ def save_figure(
     dpi: int = 300,
     close: bool = True,
     write_svg: bool = True,
+    mark: str = "",
 ) -> Path:
     """Save a figure to disk and (by default) close it.
 
     Closing is the safe default: leaving figures open eventually exhausts
     matplotlib's figure manager when many analyses run in sequence.
 
+    `mark` stamps the figure, and is set when the phase that produced it
+    worked outside the schema. It goes on here rather than at each call
+    site because this is the one place every figure passes through, and a
+    mark applied in twenty places is a mark missing from one of them.
+    See :mod:`fastmdxplora.marking`.
+
+    Left unset it is taken from :func:`marked_as`, which the orchestrator
+    opens around each phase. That is what makes the sentence above true
+    rather than aspirational: the parameter existed and no caller in the
+    package ever passed it, so nothing was stamped.
+
     Returns the resolved Path that was written.
     """
-    out = Path(path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    _style_all_axes(fig)
-    fig.tight_layout()
-    fig.patch.set_facecolor("white")
-    for ax in fig.axes:
-        ax.set_facecolor("white")
-    fig.savefig(
-        out,
-        dpi=dpi,
-        bbox_inches="tight",
-        facecolor="white",
-        edgecolor="white",
-        transparent=False,
-    )
+    # Closed whatever happens: a save that fails -- a folder that cannot be
+    # written, a backend refusing the format -- left the figure open, and a
+    # sweep of studies each failing to save one held them all.
+    try:
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        _style_all_axes(fig)
+        fig.tight_layout()
+        mark = mark or _MARK
+        if mark:
+            # After tight_layout, so the stamp is not counted as content and
+            # squeezed into the plot area.
+            from fastmdxplora.marking import stamp_figure
 
-    # Every publication figure also receives a true vector SVG companion.
-    # The SVG is written from the original Matplotlib figure (not converted
-    # from the PNG), so text, paths, and axes remain editable and scalable.
-    if write_svg and out.suffix.lower() != ".svg":
-        svg_out = out.with_suffix(".svg")
-        try:
-            fig.savefig(
-                svg_out,
-                format="svg",
-                bbox_inches="tight",
-                facecolor="white",
-                edgecolor="white",
-                transparent=False,
-            )
-            logger.debug("Saved SVG companion: %s", svg_out)
-        except Exception as exc:  # noqa: BLE001 - PNG remains the primary artifact
-            logger.warning("Could not save SVG companion %s: %s", svg_out, exc)
+            stamp_figure(fig, mark)
+        fig.patch.set_facecolor("white")
+        for ax in fig.axes:
+            ax.set_facecolor("white")
+        fig.savefig(
+            out,
+            dpi=dpi,
+            bbox_inches="tight",
+            facecolor="white",
+            edgecolor="white",
+            transparent=False,
+        )
 
-    if close:
-        plt.close(fig)
+        # Every publication figure also receives a true vector SVG companion.
+        # The SVG is written from the original Matplotlib figure (not converted
+        # from the PNG), so text, paths, and axes remain editable and scalable.
+        if write_svg and out.suffix.lower() != ".svg":
+            svg_out = out.with_suffix(".svg")
+            try:
+                fig.savefig(
+                    svg_out,
+                    format="svg",
+                    bbox_inches="tight",
+                    facecolor="white",
+                    edgecolor="white",
+                    transparent=False,
+                )
+                logger.debug("Saved SVG companion: %s", svg_out)
+            except Exception as exc:  # noqa: BLE001 - PNG remains the primary artifact
+                logger.warning("Could not save SVG companion %s: %s", svg_out, exc)
+    finally:
+        if close:
+            plt.close(fig)
     logger.debug("Saved figure: %s", out)
     return out

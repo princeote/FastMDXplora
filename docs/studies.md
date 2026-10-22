@@ -1,0 +1,956 @@
+# Studies beyond a box of water
+
+A soluble protein in water is the default. This page covers the rest: holding
+parts of a system still while the solvent equilibrates, putting a protein in a lipid
+bilayer, three ways of biasing a run along a coordinate you name, and what the
+software says when a run fails.
+
+Each is a setting on the `setup` or `simulation` block of a
+[Config](config.md), so each is available from the [GUI](gui.md), the
+[CLI](cli.md) and the [API](api.md) without anything further. The three biasing
+methods take a **block** of settings rather than one value, so they are
+Config-only in practice — the GUI gives them a box you write the block into,
+one setting per line, exactly as it appears in a file.
+
+---
+
+## Restraints
+
+A structure that has just been minimised is not at equilibrium. Heating it lets
+the solvent find its arrangement, and it also lets the solute move: side chains
+relax into the space crystal packing left, a ligand drifts out of the
+crystallographic pose, lipids thin around a protein that has not yet found its depth.
+
+The conventional remedy is to hold the solute while the solvent equilibrates
+around it, and then let go in stages.
+
+```bash
+fastmdx explore --system 181L \
+  --simulate-restrain "protein and not element H" \
+  --output runs/lysozyme
+```
+
+That is the short form and it is what most equilibrations want: position
+restraints on the given selection at 1000 kJ/mol/nm², released through 500 and
+100 to zero as equilibration proceeds. On a solvated peptide, heavy atoms move
+about a sixth as far under restraint as free.
+
+The long form takes a list, and four kinds are available:
+
+```yaml
+simulation:
+  restrain:
+    - kind: position
+      selection: "protein and not element H"
+      force_constant: 1000.0        # kJ/mol/nm²
+    - kind: distance
+      selection: "index 412 1055"
+      force_constant: 500.0
+      target: 0.35                  # nm
+    - kind: torsion
+      selection: "index 12 13 14 15"
+      force_constant: 50.0          # kJ/mol/rad²
+  restraint_release: [1000, 500, 100, 0]
+```
+
+Position and distance restraints are in kJ/mol/nm²; angle and torsion are in
+kJ/mol/rad². The units differ because the coordinate does, and one number for
+both is how an angle restraint ends up a thousand times too weak.
+
+Each restraint keeps its own force constant. The ladder in `restraint_release`
+is in kJ/mol/nm² and is what a restraint given no force constant runs at (the
+short form above); one with its own is stepped down in the same proportions,
+so the distance above runs at 500, 250, 50 and 0, and the torsion at 50, 25, 5
+and 0.
+
+A distance, angle or torsion with **no `target`** is held where it is in the
+prepared structure, the one position restraints hold to (minimisation runs
+with the restraints on), and the value it was held at is recorded with the
+run. In a periodic box every separation is the nearest image, as the forces
+measure it. A target is in nm or radians; one outside what the coordinate can
+be (an angle of 109.5, meant in degrees) is refused.
+
+A `restraint_release` other than the default cannot be given with
+`restrain_production`: kept through production, the restraints are never
+stepped down.
+An angle or torsion takes its atoms in the order an `index` selection writes
+them ("index 8 6 4" has its apex at atom 6); any other selection is a set and
+comes in index order.
+
+### What a restraint is, and is not
+
+Each is a spring rather than a wall, and every kind is written in one form:
+E = k x² with **no factor of one half** (the form AMBER and CHARMM use), x
+being the departure in nm or radians; a torsion is 2k(1 − cos x), the same
+near its target and continuous across π. GROMACS and PLUMED write ½ k x², so
+the same spring has twice the k there: GROMACS's usual 1000 kJ/mol/nm² is 500
+here. This package's umbrella and steered windows follow PLUMED. A
+constrained atom cannot move; a restrained one can, and the restraint says
+what it cost.
+
+**They are released before production.** A biased production run samples the
+bias, and quantities of flexibility computed from one — RMSF, clustering,
+dimensionality reduction — describe the restraint as much as the system.
+Keeping them is possible with `restrain_production: true`, which holds them
+at their full force constants from the first step to the last (letting go
+during equilibration only to take hold again when production starts is the
+sudden change the ladder exists to avoid), logs what it costs and records it
+with the results, so a reader comparing that trajectory against a free one
+can tell which they have. Otherwise production is free whatever the ladder's
+last step.
+
+### Two refusals
+
+A selection matching **no atoms** stops the run. A restraint on nothing holds
+nothing, and a run that applied it silently would look restrained and not be.
+
+A distance, angle or torsion restraint with **no force constant** stops the
+run. There is a conventional value for holding heavy atoms in place and there
+is none for a distance, and inventing one would be inventing the strength of a
+bias.
+
+---
+
+## Membrane systems
+
+A membrane protein simulated in water is not the protein: the hydrophobic belt
+that sits in the bilayer is exposed to solvent and the helices splay. So it has
+to be built as a membrane system.
+
+```bash
+fastmdx explore --system 1AFO \
+  --setup-forcefield amber14 \
+  --setup-membrane POPC --setup-membrane-orient \
+  --simulate-restrain "protein and not element H" \
+  --output runs/glycophorin
+```
+
+That is a membrane protein from a PDB identifier to a finished report in one
+command. Seven lipids are available — POPC, POPE, DLPC, DLPE, DMPC, DOPC and
+DPPC — and OpenMM packs the bilayer, so no external packing tool is needed.
+
+### Placement, the barostat, and checking the bilayer
+
+OpenMM builds the bilayer in the xy plane and takes the protein's frame as it
+is, so the protein is placed first: an OPM file keeps OPM's frame, and
+`setup.membrane_orient` rotates anything else onto a membrane normal fitted
+from where its lipid-facing surface is apolar. The fit was checked against
+OPM's orientations for 65 membrane proteins. A structure that is not a
+membrane protein, or one lying on its side with nothing said about it, is
+refused. The barostat is the membrane one, chosen from the topology, and three
+analyses characterise the bilayer itself: area per lipid, thickness and chain
+order.
+
+[Membrane proteins](membranes.md) has all of it: which lipid at which
+temperature, the four ways a protein is placed, what is refused, how long to
+equilibrate, and what to compare the bilayer against.
+
+---
+
+## The collective variables
+
+The `umbrella`, `steered` and `metadynamics` blocks share one
+collective-variable layer, so a variable is named the same way whichever method
+biases it. **Nine** are available.
+
+Choosing one is the decision every biasing method turns on. Metadynamics fills
+the free energy landscape along whatever you bias and reports a free energy as
+a function of it. If the variable does not distinguish the states that matter —
+if two genuinely different arrangements share a value — the surface converges
+and describes something that is not the system. It does not announce itself,
+and running longer does not fix it.
+
+So each variable states what it does **not** separate:
+
+| variable | separates | does not separate |
+|---|---|---|
+| `ligand_rmsd` | bound from unbound, one pose from another | two unbound arrangements at the same distance |
+| `ligand_distance` | depth of binding along one direction | leaving by one route from leaving by another |
+| `distance` | separation of two groups | arrangements putting the centres equally far apart |
+| `coordination` | bound from unbound, without breaking when the ligand rotates | one close contact from several distant ones, which is the price of that robustness |
+| `torsion` | rotameric states of one bond | anything coupled to that bond |
+| `angle` | a hinge open from a hinge closed | the two ways of reaching the same angle — an angle has no sign, and a torsion does |
+| `radius_of_gyration` | folded from extended | a correct fold from a compact wrong one |
+| `membrane_depth` | how deeply something sits in a bilayer, against the bilayer's own centre | the two leaflets, unless the sign is kept, or headgroups from passage through them |
+| `q` | folded from unfolded, through hundreds of contacts at once rather than one distance | two structures keeping the same contacts in a different arrangement, and anything the reference does not contain |
+
+`coordination` is the second most used variable after `distance`.
+`membrane_depth` is defined against the bilayer's own centre rather than a
+fixed plane — a membrane drifts, and depth against a fixed plane becomes depth
+against nothing. `q` is biased over exactly the contacts the
+[`qvalue` analysis](analyses.md) counts, so the coordinate a surface is plotted
+along is the one the run reports.
+
+Which selections each variable needs is in
+[Selections in a Config](selections.md#what-a-biased-coordinate-is-defined-between).
+
+---
+
+## Metadynamics
+
+PLUMED can express almost any enhanced-sampling scheme, and the cost of that is
+a language to learn before running the commonest one. Most metadynamics on a
+protein–ligand system biases one of a handful of things, and those do not need
+a language:
+
+```yaml
+simulation:
+  metadynamics:
+    collective_variable: ligand_distance
+    site_selection: "resid 84 to 121 and name CA"
+    sigma: 0.05
+    walls:
+      upper: 2.5          # nm; see "Bounding where the ligand goes"
+```
+
+The block becomes PLUMED input, written to `metadynamics.plumed` beside the
+results — with `plumed.dat`, the resolved script actually attached to the run,
+next to it — and the existing PLUMED integration runs it. Anything more elaborate is still
+written by hand and passed as `plumed` — this is a shorter path to the common
+case, not a replacement for the general one.
+
+Runs are **well-tempered by default.** Plain metadynamics deposits at full
+height forever, so the bias never converges and no free energy is recoverable.
+
+`sigma` — the hill width — has **no default and is refused if missing.** It
+should be about the size of the fluctuations within a single state: around
+0.05 nm for a distance or an RMSD, around 0.35 rad for a torsion. There is no
+value that is right for an arbitrary coordinate, and a wrong one either smears
+the surface flat or never fills it.
+
+The collective variable and the bias are written to `COLVAR` every deposition,
+because a run whose convergence cannot be checked has not estimated a free
+energy.
+
+**The bias is kept on a grid wherever the variable has a real bound.** Without
+one, PLUMED adds up every hill deposited so far at every step, and a long run
+slows without end: on one torsion run, the slowing measured over its first
+8,000 hills puts 100 ns at about 19 hours, against about 7 on a grid.
+A grid only works if the variable can never leave it, since PLUMED stops the
+run when it does, so the bound has to be one the variable cannot cross:
+
+| Variable | Grid |
+|---|---|
+| `torsion` | −π to π, periodic |
+| `angle` | 0 to π |
+| `q` | 0 to 1 |
+| `coordination` | 0 to the number of pairs |
+| `distance`, `ligand_distance` | 0 to the longest separation the minimum image allows in the cell (a cube's half diagonal), a tenth larger, set from the cell equilibration leaves |
+| `membrane_depth` | ± half the cell's height, a tenth larger, in a rectangular cell |
+| `ligand_rmsd`, `radius_of_gyration` | none: nothing bounds them |
+
+A distance is computed by the minimum image, so the periodic cell bounds it,
+and the tenth covers any growth of the cell under pressure. A grid that would
+need more than two million points is left out. Walls do not count as a bound:
+they are restraints, and a soft one is crossed. The grid is in `plumed.dat`.
+
+### Bounding where the ligand goes
+
+A run biasing a ligand's distance will, given time, push the ligand out into
+bulk solvent. There the landscape is flat and the accessible volume effectively
+infinite, so the bias fills a basin that never fills and the run never comes
+back to the question. Such a run is not wrong so much as unfinishable, and
+FastMDXplora refuses to start one: `ligand_distance` and `ligand_rmsd` need a
+bound, or `unbounded: true` to say you meant it.
+
+**A wall** bounds how far:
+
+```yaml
+    walls:
+      upper: 2.5           # nm
+      kappa: 1000          # kJ/mol/nm², how hard it pushes back
+```
+
+**A funnel** bounds *where*, and that is the difference that matters for a
+binding free energy. A flat wall still lets the ligand explore a whole shell of
+unbound positions at that distance, so the unbound state has no defined volume
+and the absolute free energy has no reference. A funnel gives it one: a cone
+over the binding site mouth, narrowing into a cylinder out in the solvent.
+
+```yaml
+    funnel:
+      axis_selection: "resid 210 to 214 and name CA"   # out towards solvent
+      alpha_rad: 0.55              # the cone's half-angle
+      switch_distance_nm: 1.5      # where the cone becomes a cylinder
+      cylinder_radius_nm: 0.1
+```
+
+**The axis has to be given.** It is the direction the ligand leaves by, and
+nothing here can work that out from the structure — a funnel pointed the wrong
+way blocks the exit instead of following it. Pick atoms on the far side of the
+exit channel from the site.
+
+The funnel is built from `COM`, `DISTANCE`, `CUSTOM` and `UPPER_WALLS`, so it
+needs only a standard PLUMED rather than the optional FUNNEL module. The
+generated input is in `metadynamics.plumed`, and reading it is the way to check
+the geometry is what you meant.
+
+### Two variables at once
+
+A `variables` list of exactly two entries biases both under one deposition,
+which is what makes the result a surface rather than two profiles. Each entry
+takes the same keys a single-variable block does:
+
+```yaml
+metadynamics:
+  variables:
+    - collective_variable: torsion
+      selection: "index 4 6 8 14"
+      sigma: 0.35
+    - collective_variable: torsion
+      selection: "index 6 8 14 16"
+      sigma: 0.35
+  height_kjmol: 1.2
+  pace_steps: 500
+```
+
+Deposition settings given at the top level apply to both, because they describe
+the hills and there is only one set of those. Each variable keeps its own
+selections, its own `sigma` and its own walls.
+
+**The surface is judged one dimension at a time**, on the free energy along
+each variable with the other integrated out. That is the point of doing it that
+way: a run can fill a torsion thoroughly while the distance it was also biasing
+never left one basin, and a single verdict would either pass it — hiding the
+stuck coordinate — or fail it, burying the good one. A refusal names the
+dimension it is about.
+
+Periodicity is per variable too. A torsion biased against a distance is
+circular in one and not the other, and it is read from each variable's own
+definition rather than from a single flag.
+
+### What the analyses do with it
+
+Every analysis still runs on a metadynamics trajectory, and every mean they
+report is an average over the flattened ensemble rather than the real one. The
+analysis phase corrects the ones a weighted average is meaningful for and
+labels the rest — see
+[Averages on a biased run](analyses.md#averages-on-a-biased-run).
+
+### What PLUMED is still needed for
+
+This covers well-tempered metadynamics on one or two of the nine variables,
+with walls or a funnel. Beyond that, write PLUMED input and pass it as
+`plumed`:
+
+- **Three or more collective variables** — a surface across three coordinates
+  is not something to read off a page, and this does not generate one.
+- **Reweighting to a variable that was not biased** — averages over the biased
+  run are corrected automatically, but projecting the free energy onto a
+  *different* coordinate is PLUMED's job.
+- **Multiple walkers**, path collective variables, and the rest of PLUMED.
+
+The two mechanisms are the same underneath. `plumed` takes the script text
+itself — which then travels inside the Config — or a path to a `.dat` file.
+
+---
+
+## Steered molecular dynamics
+
+Some things do not happen on their own within reach of a simulation. Steered MD
+attaches a spring to a coordinate and moves the anchor, dragging the system
+whether or not it wants to go:
+
+```yaml
+simulation:
+  steered:
+    collective_variable: ligand_distance
+    site_selection: "resid 84 to 121 and name CA"
+    from: 0.4          # nm — where the coordinate starts
+    to: 3.0            # where to pull it
+    steps: 5000000     # over which the anchor travels
+```
+
+The same nine variables, resolved the same way.
+
+**This gives a pathway and the work done along it, not a free energy.** The
+work depends on how fast you pull: drag a ligand out in a nanosecond and most
+of the work goes into pushing water aside and straining the protein, not into
+breaking the interactions you meant to probe. A single fast pull
+overestimates a barrier, sometimes by a great deal. Jarzynski's equality
+recovers a free energy from an ensemble of pulls, but the average is dominated
+by rare low-work trajectories, so it needs many repeats and converges badly
+when the pulling is fast.
+
+FastMDXplora reports the pulling rate and the work, and does not claim a free
+energy from a steered run.
+
+`from` has to be the value the coordinate **actually has** at the start. It is
+refused rather than guessed, because a pull that begins somewhere the molecule
+is not spends its first half hauling the system to the anchor and reports work
+that means nothing. Compute it before writing the Config:
+
+```bash
+fastmdx analyze --trajectory equilibrated.dcd --topology system.pdb --analyses rg
+```
+
+On a correct pull the work profile starts at zero and increases; work that goes
+negative early is the anchor being in the wrong place.
+
+**What a pull is genuinely good for is generating starting structures.** Pull
+once, take frames along the way, and each is a window for umbrella sampling —
+which does give a free energy, from equilibrium sampling at each position
+rather than from work done in a hurry.
+
+A run can be steered **or** biased with metadynamics, not both: they are two
+ways of moving the same coordinate, and their forces would add.
+
+---
+
+## Umbrella sampling
+
+A free energy along a coordinate, from equilibrium sampling at a series of
+positions.
+
+```yaml
+systems:
+  - system: 181L
+simulation:
+  duration_ns: 5
+  umbrella:
+    collective_variable: ligand_distance
+    site_selection: "resid 84 to 121 and name CA"
+    from: 0.4          # nm
+    to: 2.0
+    n_windows: 17
+    force_constant: 1000
+```
+
+**Each window becomes a run.** They are scheduled by the same machinery that
+runs a multi-system campaign, so `execution.workers` and `execution.devices`
+place them exactly as they would separate systems.
+
+With several cards, `devices: [0, 1]` pins one window per GPU. With one card,
+`workers` on its own puts that many windows on it at once, and for umbrella
+sampling that is usually worth doing: a window is a small system and one of
+them rarely keeps a large GPU busy. Thirty windows of trypsin and benzamidine,
+three at a time on one RTX 4090, ran at about 390 ns/day aggregate — a little
+over 21 hours for a study that would otherwise have gone one window after
+another. How many fit depends on the system and the card, so try two or three
+on a short run and read the ns/day the log reports before committing a long
+one.
+
+```yaml
+execution:
+  mode: parallel
+  workers: 3            # three windows sharing one GPU
+  continue_on_error: false
+```
+
+### Overlap is what makes it work
+
+Recombination stitches the windows' histograms together. Where two neighbours
+never visit the same value there is nothing to stitch: the free energy on one
+side cannot be placed relative to the other, and a curve continued across the gap
+is interpolation presented as a result.
+
+So overlap is computed and **a gap is reported rather than bridged**, naming
+which windows and by how much. What closes a gap is more windows between them,
+or a softer force constant so each wanders further. Sampling for longer does
+not.
+
+How much is enough is `minimum_overlap`, three per cent by default. That is
+enough to stitch and it is thin — on a real study, pairs sharing seven per cent
+passed while a reader might reasonably want fifteen. Raise it where the free
+energy matters:
+
+```yaml
+    minimum_overlap: 0.15
+```
+
+The refusal states the threshold it applied, so a genuine gap can be told from
+a strict setting.
+
+The curve's interval comes from resampling each window's sampling, two hundred
+times by default, and a binding free energy's with it. That determines an
+interval to a few per cent and is the part of recombination that takes time:
+on seventeen windows the curve took a twentieth of a second and its interval
+fourteen seconds. `bootstrap_resamples` sets the count, fewer for a quick look,
+more for a figure, 0 for the curve alone; the count used is in `pmf.json`.
+
+```yaml
+    bootstrap_resamples: 50
+```
+
+`force_constant` therefore has **no default**: it decides how far a window
+wanders and so whether neighbours meet. Too stiff and they do not; too soft and
+the system escapes towards the nearest minimum.
+
+### When one force constant will not do
+
+A restraint at `k` keeps a window within two sigma of its centre against a
+free-energy gradient of `2·sqrt(k·kT)`, and no further. On a coordinate with a
+steep stretch — a ligand leaving a salt bridge, a torsion crossing a barrier —
+that number decides whether the windows there hold their centres at all:
+
+| k (kJ/mol/nm²) | sigma (nm) | holds against |
+| --- | --- | --- |
+| 3000 | 0.029 | 173 kJ/mol/nm |
+| 6000 | 0.020 | 245 |
+| 13000 | 0.014 | 360 |
+
+Raising it everywhere does not work, because sigma falls as `sqrt(kT/k)`: the
+windows narrow, the overlap goes with them, and the study refuses for a gap the
+stiffening opened. So `force_constant` takes a list as well as a number, one
+per window, and `centres` takes the spacing those windows need:
+
+```yaml
+  umbrella:
+    collective_variable: ligand_distance
+    select_atoms: "resSeq 189 to 195 and name CA"
+    centres: [0.40, 0.46, 0.51, 0.83, 0.86, 0.89, 0.91, 1.10, 1.16]
+    force_constant: [3000, 3000, 3000, 13000, 13000, 13000, 13000, 3000, 3000]
+```
+
+Windows held at different constants recombine correctly — each window's bias is
+built from its own — so the only thing to get right is the overlap, and half
+the spacing buys back what twice the stiffness costs.
+
+**How to know which windows need it, and what to set.** Run the study. A window
+that could not be held reports the surface that beat it — it comes
+to rest where the restraint's pull matches the free energy's, so its
+displacement times its force constant is the gradient there — and the refusal
+does that arithmetic for you, per window:
+
+```
+  window   held at    sat at    needs k    at spacing
+       0    0.8966    0.8276       4286        0.0482
+       1    0.9517    0.8319      12944        0.0278
+```
+
+Both columns matter. Raising the constant and leaving the windows where they
+are trades a refusal for drift for a refusal for a gap the stiffening opened.
+
+One thing to check before believing the numbers: **a window that did not start
+at its centre is not reporting a gradient.** If the windows were not seeded from
+a pull near their own centres, fix that first. The refusal says so before it
+shows the table.
+
+### Sizing a study from a short pilot
+
+The gradient is what fixes both settings, and every window reports the
+gradient where it sits. So a handful of windows, run briefly, size the study
+that follows: spread six or so over the range and give each a few hundred
+picoseconds.
+
+```yaml
+simulation:
+  production_steps: 150000        # 300 ps a window
+  umbrella:
+    collective_variable: ligand_distance
+    select_atoms: "resSeq 189 to 195 and name CA"
+    from: 0.40
+    to: 2.00
+    n_windows: 6
+    force_constant: 3000
+```
+
+Every umbrella study writes the design its own windows imply into `pmf.json`
+under `next_study`, and prints it when the study refused or when a window
+drifted:
+
+```
+Next study:     34 windows from these windows' own gradients, 0.4 to 2,
+                worst overlap 0.18 predicted
+    centres: [
+      0.4000, 0.4565, 0.5059, 0.5486, 0.5844, 0.6153, 0.6431, 0.6710, …
+    ]
+    force_constant: [
+      4870, 5530, 7320, 9840, 12750, 16140, 18050, 19960, 20000, 20000, …
+    ]
+```
+
+Those two lists go into the Config as they are.
+
+**The arithmetic.** A window comes to rest where the restraint's pull matches
+the free energy's, so `k` times its displacement is the gradient `G` there. Two
+requirements then fix the design together: a window has to stay within half the
+distance to its neighbour, which sets the constant from below, and neighbours
+have to overlap — `d ≤ 2.5·sigma` — which sets it from above. Asking a window
+to use four fifths of the room it is allowed and solving both at once leaves
+
+    d = 2.5 kT / G        k = G² / kT
+
+with `kT = 2.494 kJ/mol` at 300 K. A stretch with a gradient of 223 kJ/mol/nm gets
+windows 0.028 nm apart held at 20,000; a flat stretch at 10 gets the
+widest spacing the pilot's own softest constant still overlaps at. Neither
+setting is ever loosened past what the pilot ran, since a window sitting on its
+centre reports nothing and, unbounded, would ask for infinitely wide windows.
+
+Three things worth reading beside the answer, all in `next_study`:
+
+- `predicted` says, for every window it proposes, where that window would come
+  to rest, how much of its allowance that uses, and the area it would share
+  with its neighbour. The design is checked against the gates it will be judged
+  by before it runs.
+- `measured_over` is where the readings are. A window on a rising surface comes
+  to rest below its centre, so the readings stop short of the far end of the
+  range, and the stretch beyond them is held at the last slope read.
+- `crossed` names windows that came to rest past one another. That stretch was
+  too steep for the pilot's constant to resolve; the design takes the steeper
+  reading, and running it again at what it recommends resolves it.
+
+Three hundred picoseconds is enough: a displacement converges like a mean, and
+1,500 samples fix the gradient to about 6 kJ/mol/nm.
+
+### The sphere a distance coordinate leaves open
+
+A window on a distance holds the ligand at a radius and leaves it free to be
+anywhere on the sphere of that radius. That is what the `−2kT ln r` in the bulk
+reference is about: the room at radius r is `4πr²`, so a free ligand is more
+likely to be found at 2 nm than at 1 nm for no energetic reason at all.
+
+Two things have to be true for that reference to mean anything, and on a real
+site neither is:
+
+- **The sphere has to be open.** A coordinate defined to a group of backbone
+  atoms has its origin inside the protein. On trypsin's S1 site, 12% of the
+  sphere at 1.0 nm is outside the protein and 50% at 2.0 — so the room grows as
+  `r^4.3`, not `r²`, and no length of run makes `−2kT ln r` the right shape.
+- **The ligand has to visit it.** A sphere of radius 2 nm has 50 nm² of
+  surface. A ligand held there crosses a few nm² in ten nanoseconds, so one
+  window sees a patch.
+
+`cone` answers both. It puts a flat-bottomed wall on the angle between the
+site-to-ligand line and an axis fixed in the protein, so the ligand is confined
+to a cap:
+
+```yaml
+  umbrella:
+    collective_variable: ligand_distance
+    ligand_name: BEN
+    select_atoms: "resSeq 189 to 195 and name CA"
+    centres: [...]
+    force_constant: [...]
+    cone: auto
+    seed_from: runs/earlier-study/seed_pull
+```
+
+The cap's area is `Ω r²` with `Ω = 2π(1 − cos θ)`, still exactly proportional
+to `r²` — so the reference is right by construction — and at 30° the cap is 7%
+of a sphere, which a ligand covers in a fraction of the time.
+
+#### Where the axis and the angle come from
+
+`auto` determines both from the pull that seeds the windows. That pull is the one
+continuous trajectory the study has from the site to bulk, and every window
+starts on it, so a cone determined there is a cone every window begins inside.
+
+Both numbers are results rather than preferences:
+
+- **The axis** is the direction the ligand leaves by, which is rarely the line
+  out of the protein's centre — on trypsin's S1 site the two are 42–61° apart.
+  It is found by searching four thousand directions for the one that holds the
+  path in the smallest cone, *not* by averaging the path: a route that leaves a
+  pocket sideways and then swings into bulk has a mean far from both of its
+  ends, and on that study the mean gave 107° where the search gave 61°.
+- **The group** is the backbone alpha carbons lying opposite that direction,
+  within 0.4–2.0 nm of the site. Several group sizes are tried and the one that
+  holds the path in the smallest angle is kept, so the size is a result too.
+- **The half-angle** is computed through that group — frame by frame, exactly
+  the angle PLUMED will restrain — at the 98th percentile of the path, widened
+  by a fifth.
+
+The result is written to `seeds/cone.json`, which carries what the wall
+was sized against: `held_within_deg` is how far the path strays from the axis,
+`bound_end_deg` the same for the bound end — the half that decides whether the
+wall bites — and `worst_deg` the single worst frame.
+
+`keep` and `margin` adjust the last step, and `axis_selection` names the group
+yourself and leaves only the angle to be determined:
+
+```yaml
+    cone:
+      keep: 98              # percentile of the path the cone must hold
+      margin: 1.2           # how much wider than that to open it
+      force_constant: 5000  # kJ/mol/rad², the wall
+```
+
+A study can also state the angle outright, and then nothing is determined from the pull:
+
+```yaml
+    cone:
+      half_angle_deg: 30
+      axis_selection: protein   # what the cone points away from
+```
+
+The axis is the direction from `axis_selection`'s centre to the site, so
+"straight out" is away from the protein and the cone turns with the molecule
+rather than pointing at a fixed corner of the box.
+
+Two refusals rather than a number that looks like one. A named group sitting
+where the ligand goes, instead of behind the site, asks for a cone of most of a
+sphere — that is refused, naming the group, rather than clipped to something
+shaped like a restraint. So is a pull that leaves in no consistent direction: a
+ligand taking several routes out needs a coordinate that follows one of them,
+not a wall around all of them.
+
+**The pull itself runs without a cone, on purpose.** The axis and the angle are
+*determined from* that pull, so restraining it would mean reading the restraint
+rather than the ligand's way out. A wall on an unverified axis would also be a
+wall on a ligand already being dragged by a moving anchor, which can force it
+along a route it would never take and finish without complaint. The pull's
+value here is that it is the one trajectory with nothing telling it which way
+to go.
+
+That freedom costs something, and the margin is what pays it. A steered pull is
+fast and does not explore angle the way equilibrium sampling does, so it
+*under-reports* the spread: on the trypsin study the pull put the bound end
+within 55°, and 30 ns of restrained sampling reached 62°. Opening the cone by a
+fifth is what covers the difference.
+
+**Every seed is checked against the wall it will run under.** A seed is chosen
+for its *distance* from the site and inherits whatever angle that frame
+happened to have, so the two have to be reconciled before a window starts. A
+window beginning outside its own cone is pushed by the wall from its first
+step: it does not crash, no later gate sees it, the window equilibrates somewhere
+the seeding did not intend — and a cone excluding where the ligand was is a
+cone cutting the state the binding free energy is computed over.
+
+A cone determined from the pull contains the path it came from, so this passes by
+construction. It is the other two ways of asking that need it: a
+`half_angle_deg` written into a Config can be narrower than the path, and a
+hand-named `axis_selection` need not point along the path at all. Either way
+the study is refused before it runs, naming the windows and how far outside
+they sit.
+
+**Flat-bottomed, not harmonic.** Inside the cone there is no bias at all, so
+what happens there is the system's own. A harmonic restraint on the angle would
+pull the ligand towards the axis everywhere, including in the bound state.
+
+**What it costs.** The bulk state under a cone is `4π/Ω` smaller than a free
+ligand's, while a bound pose that fits inside the cone loses nothing — so a
+binding free energy computed this way is too negative by `kT ln(4π/Ω)` until
+that is added back. The study records the number: the plan's `cone` block
+carries `share_of_a_sphere` and `correction_kjmol`, computed by integrating the
+wall's own Boltzmann factor rather than assuming a hard edge, because the wall
+is soft and the ligand leans on it.
+
+**What the correction rests on, and how that is checked.** The bulk state gives
+up room; the bound state gives up none — *provided the bound pose fits inside
+the cone*. A cone too narrow for it has removed part of the population the
+binding integral is taken over, and no analytic term puts that back. So every
+window writes the wall's bias beside its coordinate, and the binding free
+energy is **refused** where the wall carried more than 0.25 kJ/mol in the
+windows holding the bound state, naming the number and asking for a wider
+angle. Where no such column exists the result says `cone_wall_checked: false`
+rather than implying the check passed.
+
+`pmf.json` carries both numbers: `delta_g_before_the_cone_kjmol` is what the
+curve says, `delta_g_kjmol` is what it means, and `cone_correction_kjmol` is
+the step between them.
+
+**The check that comes with it.** The correction depends on the angle and the
+answer must not. Run two cone angles and compare: 20° and 45° differ by
+3.8 kJ/mol in the correction, so if the corrected binding free energies agree
+the correction is being applied properly, and if they do not, it is not.
+
+### What else a binding free energy rests on
+
+A smooth curve and a tail of the right shape do not make the standard-state
+conversion valid. Once the windows have run, the study computes four more
+quantities from their trajectories and records them under `binding.reference` in
+`pmf.json`:
+
+- **Whether the shell is open where the curve is read as bulk.** In each of
+  the outer windows the ligand, in the pose it held, is placed at every point
+  of the sphere at its radius (of the cap, under a cone) and counted as free
+  where none of its heavy atoms comes within 0.4 nm of anything that is not
+  solvent. The reference assumes all of it is open, so a share `f` that is
+  not makes the answer too negative by `kT ln(1/f)`. Where that exceeds the
+  0.6 kJ/mol the tail's shape is allowed, the number is **withheld**, with the
+  radius, the share and the cost. On trypsin with benzamidine the cap was 18%
+  to 58% open across the outer range, about 3 kJ/mol; no length of run
+  changes that.
+- **Whether the system has a membrane.** Bulk is then a slab of water. Without
+  a cone the number is withheld; with one, the cap is computed as above, the
+  bilayer counting as something the ligand is not free beside.
+- **Whether the pull went through the protein.** Each window between the bound
+  state and bulk has its ligand placed, as the window began, in the bound
+  state's protein. Where it overlaps backbone in every frame of that state, the
+  window is sampling a protein the pull deformed, and a **warning** names it.
+- **Whether the ligand's orientation was sampled.** A distance restrains where
+  the ligand is and not how it is turned. Where a window's ligand turned too
+  slowly for it to see ten independent orientations, a **warning** names the
+  window.
+
+Beside the four, a **charged ligand** is said. The free energy is taken in a
+periodic box, and nothing corrects it for the ligand's and the receptor's
+interaction with each other's images and with the background that neutralises
+them. To leading order that shifts the curve by
+`k q_L q_R / eps * 2 pi (r_u^2 - r_b^2) / (3 V)` between the bound state and
+bulk; the warning gives both charges (read from the prepared system), the
+number for this box with water's dielectric constant, and how many ions there
+are to screen it. It is an estimate of size and sign, not a correction, and it
+shrinks with the box's volume.
+
+The console says the binding free energy, or why it was withheld, and each
+warning, below the line naming `pmf.json`.
+
+### Running windows again in place
+
+A study that refused because a window slid off its centre, or sampled too
+little, does not need running again whole. Give that window what it needs in
+the Config (a stiffer spring in its place in the `force_constant` list, say),
+then name it:
+
+```bash
+fastmdx explore --config study.yml --rerun-window 9
+```
+
+Window 9 runs again in `runs/window-09`, from the same prepared system and the
+same starting structure; every other window is kept as it is, and the free energy is
+recombined from the whole set. The earlier run of window 9 is moved to
+`superseded/`, not deleted. From Python, `explore(rerun_windows=[9])`.
+
+A stiffer spring for the windows named, without writing the list by hand:
+
+```bash
+fastmdx explore --config study.yml --rerun-window 9 --rerun-force-constant 6000
+```
+
+Window 9 is held at 6,000 kJ/mol per unit of the variable squared (nm² for a
+distance, rad² for an angle) and every other window keeps its own. The study's
+`resolved_config.yml` records the list, so run later windows again from it
+(`--config <study>/resolved_config.yml`): the first Config still gives window
+9 its old spring and is refused for it. From Python,
+`fastmdxplora.simulation.umbrella.windows_held_at(config, [9], 6000)` gives
+the Config.
+
+Before anything moves, the study checks that each kept window has finished
+and ran with the centre and spring the Config now gives it, since a window is
+unbiased with the spring it is given. The same check stands before every
+recombination: a Config edited after its windows ran is refused by name
+rather than recombined with the wrong springs.
+
+### One system, many windows
+
+The windows are the same molecule held at different points along the
+coordinate, so FastMDXplora prepares it **once** — into `shared_setup/` — and
+every window simulates from that.
+
+This matters beyond the minutes saved. Unseeded, setup does not place
+hydrogens and ions the same way twice: preparing each window separately gave
+each its own system, and a
+seven-window study came out with 37,212, 37,254, 37,436 and 37,445 atoms. Four
+different systems for one calculation, and the difference between windows is
+then partly where the solvent happened to land rather than the restraint.
+
+A sweep over `setup` settings turns the sharing off, because the windows are
+being asked to be prepared differently and quietly ignoring that would be worse
+than preparing seven times.
+
+A study run again reuses its shared system only when it is the one asked for.
+`shared_setup/prepared_for.json` records the structure (by the SHA-256 of its
+file, where it is one) and the setup settings it was prepared from; a system
+prepared before that record existed is checked against its own
+`setup/setup_parameters.json`. Anything different is refused
+(`setup.prepared.mismatch`), as is a system with neither record
+(`setup.prepared.unverifiable`); `--force-overwrite` prepares it again.
+
+The same setting is available on its own, for a system prepared elsewhere:
+
+```yaml
+simulation:
+  setup_from: runs/reference
+```
+
+It names a run that completed: the `setup` directory holding `system.xml`,
+`state.xml` and `topology.pdb`, or a directory with `setup/` or
+`shared_setup/setup/` under it.
+
+**Naming one turns preparation off.** Anything taken from the named run — a
+frame to start from, or the seeds from a pull run in it — belongs to that
+molecule, and preparing a second one gives a second set of atoms. A study that
+said `setup_from` and prepared anyway stopped ten seconds later with *"the
+prepared system has 36075 particles and the pull's trajectory has 36087"*. A
+`setup_from` pointing at no prepared system is refused rather than quietly
+prepared around.
+
+**The run records which system it was, not only where.** Its
+`simulation_parameters.json` names the prepared system as given, as resolved,
+relative to the run, and by the SHA-256 of its `system.xml`. Move or copy the
+study with the prepared system beside it and re-analysis and the report still
+find it; a different preparation at the old path is refused
+(`analysis.data.not_this_system`) rather than read. A campaign's
+`batch_manifest.json` lists each member relative to the campaign as well.
+
+### Where the windows start
+
+Windows started from a single structure are strained at the far end of the
+range, and the strain relaxes into the sampling as drift. The usual source is a
+steered run: pull once, take a frame near each window's centre, and each window
+begins near where it will sit.
+
+Each window's start is written to `seeds/window-NN/`: a copy of the prepared
+system, the chosen frame as `state.xml`, and `seeded_from.json`, which names the
+preparation it was taken from relative to the seed and by the SHA-256 of its
+`system.xml`. A window's setup record (force field, box, the ligand's chemistry)
+is read through it, so it is found after the study has moved, and a different
+preparation in its place is refused.
+
+The first fifth of each window is discarded before recombination, because a
+window begins away from where it equilibrates and counting the approach biases the
+histogram towards where the run started.
+
+A recombination is only attempted once the histograms have something in them.
+Below `minimum_samples` — 200 values per window, after equilibration is
+discarded — the overlaps are reported as observations and nothing is concluded
+from them: an overlap is the area two histograms share, and from tens of points
+that number is noise. A smoke test that wants to reach the recombination can
+lower the threshold.
+
+A misspelled setting is refused rather than ignored, with the spelling it was
+probably meant to be. Accepting `minimum_ovelap` and dropping it would let a
+study stitch at the three per cent default while believing otherwise.
+
+**If the windows never reach their centres, the recombination says so** rather
+than reporting the gap that leaves. A study seeded from one bound structure came
+back with four windows held at 0.3, 0.5, 0.7 and 0.9 nm all sampling below 0.5,
+and two more held at 1.1 and 1.3 both equilibrated at 1.19 — the restraints had
+lost, and the hole between 1.24 and 1.41 was the symptom. The remedy there is
+to seed from a steered run or hold harder; a softer force constant, which is
+what a genuine gap wants, would make it worse.
+
+A short run puts windows away from their centres too — a restraint needs time
+to pull a system to where it is held — so where the sampling is also thin the
+two cannot be told apart, and the message says so rather than choosing.
+
+---
+
+## When a run fails
+
+A simulation that ends with "the coordinates are not finite" has said almost
+nothing, and the advice that usually follows — lower the timestep, lower the
+temperature, raise the friction — is a list of things that sometimes help,
+offered without knowing which applies.
+
+The state at failure says more. Which atoms went non-finite, and what they
+belong to, distinguishes:
+
+- **A ligand alone**: its parameters, or a pose that was already clashing. No
+  timestep is small enough to fix a wrong parameter, so that advice is not
+  given here.
+- **Lipids, or protein next to them**: the bilayer packing, which is what
+  restrained equilibration exists to survive.
+- **Most of the system at once**: an integration failure, which is the case the
+  usual advice is actually for.
+- **One residue type**: something local — a strained ring, or an atom that
+  preparation added in a poor position.
+
+Where the evidence points nowhere, the message says so. That is more useful
+than a confident list that happens not to apply.
+
+**Nothing is retried.** A run that exploded because its ligand is wrong will
+explode again more slowly at half the timestep, and a rescue that produces a
+trajectory from a broken system is worse than a failure — the failure is
+visible.
+
+---
+
+## See also
+
+- **[Worked examples](examples.md)** — complete Configs for each of these
+- **[Selections in a Config](selections.md)** — what each variable needs named
+- **[The FastMDXplora analyses](analyses.md)** — what `pmf`, `metad_surface` and `steered_work` read
+- **[Production runs and GPUs](production.md)** — scheduling a study of many windows

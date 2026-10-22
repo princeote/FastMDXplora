@@ -1,0 +1,1454 @@
+/* The frame: three columns, a side panel, a settings popup, a theme.
+ *
+ * None of this knows what page is in the middle. The sidebar is the study,
+ * the side panel is the run's own narration and files, and both are the
+ * same whatever task is showing. That is the point: you never lose the run
+ * to look at the molecule.
+ *
+ * Column widths and the theme are remembered in localStorage, which is
+ * right for a preference and wrong for anything about a study -- nothing
+ * about a run is kept here.
+ */
+(function () {
+  "use strict";
+
+  function el(id) { return document.getElementById(id); }
+  // The page shown, as its address names it.
+  function currentPage() { return (location.hash || "#overview").slice(1).split("/")[0] || "overview"; }
+  function $$(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
+
+  var store = {
+    get: function (key, fallback) {
+      try { var v = localStorage.getItem("fmx." + key); return v === null ? fallback : v; }
+      catch (e) { return fallback; }
+    },
+    set: function (key, value) {
+      try { localStorage.setItem("fmx." + key, String(value)); } catch (e) { /* private mode */ }
+    }
+  };
+
+  /* ---- Theme -------------------------------------------------------- */
+  /* System, Light or Dark. System, the default, follows the operating
+   * system as it changes; Light or Dark is kept once chosen. Graphite and
+   * Ink, the dark schemes chosen before, are Dark, and Paper is Light. */
+  var CHOICES = { system: 1, light: 1, dark: 1 };
+  var FORMER = { graphite: "dark", ink: "dark", paper: "light" };
+
+  function chosenScheme() {
+    var kept = store.get("theme", null);
+    if (kept && FORMER[kept]) { kept = FORMER[kept]; store.set("theme", kept); }
+    return CHOICES[kept] ? kept : "system";
+  }
+
+  function systemScheme() {
+    try {
+      if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
+        return "light";
+      }
+    } catch (e) { /* no media queries */ }
+    return "dark";
+  }
+
+  /* `choice` is system, light or dark (a former name is read as its
+   * scheme); the page is drawn in light or dark. Kept only when chosen:
+   * stored every time, the scheme the system asked for on a first visit
+   * was remembered as though chosen, and a system that went dark at
+   * sunset left the page light for good. */
+  function applyTheme(choice, chosen) {
+    choice = FORMER[choice] || (CHOICES[choice] ? choice : "system");
+    var name = choice === "system" ? systemScheme() : choice;
+    document.documentElement.dataset.theme = name;
+    document.body.dataset.theme = name;
+    $$(".seg-btn[data-theme]").forEach(function (b) {
+      var on = b.dataset.theme === choice;
+      b.classList.toggle("active", on);
+      b.setAttribute("aria-pressed", String(on));
+    });
+    if (chosen) store.set("theme", choice);
+    document.dispatchEvent(new CustomEvent("fmx:theme", { detail: name }));
+  }
+
+  /* ---- Accent ------------------------------------------------------ */
+  /* One of five (theme.css), set as data-accent on the root element; Cyan,
+   * the default, as none. Kept once chosen, over the service's default,
+   * which theme-first.js applied before the first paint. */
+  var ACCENTS = ["cyan", "blue", "violet", "magenta", "graphite"];
+
+  function accentShown() {
+    var named = document.documentElement.getAttribute("data-accent");
+    return ACCENTS.indexOf(named) >= 0 ? named : "cyan";
+  }
+
+  function applyAccent(name, chosen) {
+    if (ACCENTS.indexOf(name) < 0) name = "cyan";
+    if (name === "cyan") document.documentElement.removeAttribute("data-accent");
+    else document.documentElement.setAttribute("data-accent", name);
+    $$(".accent-swatch[data-accent]").forEach(function (b) {
+      b.setAttribute("aria-pressed", String(b.dataset.accent === name));
+    });
+    if (chosen) store.set("accent", name);
+    document.dispatchEvent(new CustomEvent("fmx:accent", { detail: name }));
+  }
+
+  /* With System chosen, the page follows the system as it changes. */
+  function followTheSystem() {
+    try {
+      var query = window.matchMedia("(prefers-color-scheme: light)");
+      var follow = function () {
+        if (chosenScheme() === "system") applyTheme("system", false);
+      };
+      if (query.addEventListener) query.addEventListener("change", follow);
+      else if (query.addListener) query.addListener(follow);
+    } catch (e) { /* no media queries */ }
+  }
+
+  /* ---- Column widths ------------------------------------------------ */
+  var LIMITS = { sidebar: [180, 320], panel: [280, 640] };
+  /* The log's width until someone drags it. It was 560, which left the page
+   * itself 640 pixels of a 1440-pixel window, and the viewer's canvas 240. */
+  var PANEL_WIDTH = 420;
+
+  function setWidth(which, px) {
+    var lim = LIMITS[which];
+    px = Math.max(lim[0], Math.min(lim[1], px));
+    document.documentElement.style.setProperty("--" + which + "-width", px + "px");
+    store.set(which + "Width", px);
+  }
+
+  function wireHandle(handle) {
+    var which = handle.dataset.handle;
+    handle.addEventListener("mousedown", function (down) {
+      down.preventDefault();
+      var startX = down.clientX;
+      var startW = parseFloat(getComputedStyle(document.documentElement)
+        .getPropertyValue("--" + which + "-width")) || (which === "sidebar" ? 232 : PANEL_WIDTH);
+      handle.classList.add("dragging");
+      document.body.classList.add("col-dragging");
+      var moved = false;
+      function move(e) {
+        // The sidebar grows to the right; the panel grows to the left.
+        var delta = e.clientX - startX;
+        if (!moved && !delta) return;
+        // Widened or narrowed by the person: kept, as they made it; a press
+        // or a double-click that moves nothing is not a width chosen.
+        moved = true;
+        widened[which === "sidebar" ? "sidebar" : "panel"] = true;
+        setWidth(which, which === "sidebar" ? startW + delta : startW - delta);
+      }
+      function up() {
+        handle.classList.remove("dragging");
+        document.body.classList.remove("col-dragging");
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        // Widened, the column is the person's; the other folds to make room.
+        fitThePage();
+      }
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+    });
+    // Double-click puts it back, and the column is fitted again as any.
+    handle.addEventListener("dblclick", function () {
+      setWidth(which, which === "sidebar" ? 232 : PANEL_WIDTH);
+      // Its width is no longer the person's; opened by hand, it still is.
+      widened[which === "sidebar" ? "sidebar" : "panel"] = false;
+      fitThePage();
+    });
+  }
+
+  /* ---- Side panel: tabs and collapse -------------------------------- */
+  function showTab(name) {
+    $$(".side-tab").forEach(function (t) {
+      var on = t.dataset.sideTab === name;
+      t.classList.toggle("active", on);
+      t.setAttribute("aria-selected", String(on));
+    });
+    $$(".side-pane").forEach(function (p) { p.hidden = p.dataset.sidePane !== name; });
+    store.set("sideTab", name);
+    if (name === "files") loadFiles();
+  }
+
+  /* What each column is off the Viewer, and on it. The Viewer gives the
+   * molecule the window: both columns close as it opens, and come back as
+   * they were when another page opens. Brought back on the Viewer with
+   * their button, they stay there, on the Viewer, until closed again. */
+  var sidebarClosed = false;
+  var panelClosed = false;
+  var onTheViewer = false;
+  var keptOnTheViewer = { sidebar: false, panel: false };
+  /* The Config Builder has the study's summary where the side panel is,
+   * so the panel is closed there, and opened there only with its button. */
+  var onTheBuilder = false;
+  var keptOnTheBuilder = false;
+
+  /* The page fitted to the window (user, 10-15: "the Whole GUI that the
+   * user is seeing should be responsive to the current view and adjust
+   * unless user insist otherwise"). Each page says the least width its
+   * content needs (`--page-least` in dashboard.css: the Viewer's tools and
+   * the Config Builder's summary stay beside the page down to it, and go
+   * under it below). Where the window leaves the page less, the columns
+   * beside it fold, in this order: the sidebar to its strip of icons, then
+   * the side panel. The Agent beside a page with its own right panel
+   * (`--own-right-panel`) folds the sidebar too, whatever the room
+   * (user, 10-12). A column a person opens, closes or widens is theirs
+   * until the page changes (and, for the sidebar folded for the Agent,
+   * until the Agent closes). */
+  var fitFold = { sidebar: false, panel: false };
+  var heldOpen = { sidebar: false, panel: false };
+  // A column whose seam the person dragged: its width theirs, on this page.
+  var widened = { sidebar: false, panel: false };
+  /* The Agent's fold is apart from the person's own choice: opened beside
+   * a page with its own right panel, the Agent folds the sidebar, opened
+   * by hand before or not; reopened by the person then, it is open until
+   * the Agent closes; and as the Agent closes, the sidebar is as it was. */
+  var agentFold = false;
+  var reopenedBeside = false;
+  var fitting = false;
+
+  function agentBeside() { return document.body.classList.contains("agent-beside"); }
+
+  function shownPage() {
+    var name = document.documentElement.getAttribute("data-page");
+    return document.querySelector('.page[data-page="' + name + '"]');
+  }
+
+  // The width the page's container queries read, to the fraction of a
+  // pixel: its box less its borders, a scroll bar and its padding.
+  function pageRoom(page) {
+    var style = getComputedStyle(page);
+    return page.getBoundingClientRect().width - (page.offsetWidth - page.clientWidth)
+      - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0);
+  }
+
+  function fitThePage() {
+    var page = shownPage();
+    fitFold = { sidebar: false, panel: false };
+    agentFold = false;
+    if (!page || window.innerWidth <= 800) { showTheColumns(); return; }
+    var style = getComputedStyle(page);
+    var least = parseFloat(style.getPropertyValue("--page-least")) || 0;
+    var ownRight = style.getPropertyValue("--own-right-panel").trim() === "1";
+    agentFold = agentBeside() && ownRight && !reopenedBeside;
+    /* Each fold tried and checked in one go, shown once it is decided: a
+     * column shown by the pointer (a peek) is left to the pointer. */
+    fitting = true;
+    try {
+      showTheColumns();
+      ["sidebar", "panel"].forEach(function (which) {
+        if (heldOpen[which] || widened[which] || (which === "sidebar" && reopenedBeside)) return;
+        if (document.body.classList.contains(which + "-collapsed")) return;
+        if (pageRoom(page) >= least) return;
+        fitFold[which] = true;
+        showTheColumns();
+      });
+      // The side panel folded, the sidebar may have room again: no column
+      // stays folded that the page does not need folded.
+      if (fitFold.sidebar && fitFold.panel) {
+        fitFold.sidebar = false;
+        showTheColumns();
+        if (pageRoom(page) < least) {
+          fitFold.sidebar = true;
+          showTheColumns();
+        }
+      }
+    } finally {
+      fitting = false;
+    }
+    showTheColumns();
+  }
+
+  var fitPending = 0;
+  function fitSoon() {
+    if (fitPending) return;
+    fitPending = requestAnimationFrame(function () { fitPending = 0; fitThePage(); });
+  }
+
+  function showTheColumns() {
+    var sidebar = !reopenedBeside && ((onTheViewer ? !keptOnTheViewer.sidebar : sidebarClosed)
+      || (fitFold.sidebar && !heldOpen.sidebar && !widened.sidebar) || agentFold);
+    var panel = (onTheViewer ? !keptOnTheViewer.panel
+      : onTheBuilder ? !keptOnTheBuilder : panelClosed)
+      || (fitFold.panel && !heldOpen.panel && !widened.panel);
+    document.body.classList.toggle("sidebar-collapsed", sidebar);
+    document.body.classList.toggle("panel-collapsed", panel);
+    var expand = el("sidebar-expand");
+    if (expand) expand.hidden = !sidebar;
+    expand = el("side-expand");
+    if (expand) expand.hidden = !panel;
+    if (fitting) return;
+    if (!sidebar && document.body.classList.contains("sidebar-peek")) peek("sidebar", false);
+    if (!panel && document.body.classList.contains("panel-peek")) peek("panel", false);
+  }
+
+  function setCollapsed(yes, chosen) {
+    // Opened by the person: theirs, on this page, not folded to fit.
+    if (chosen !== false) heldOpen.panel = !yes;
+    if (onTheBuilder && !onTheViewer && chosen !== false) {
+      keptOnTheBuilder = !yes;
+      store.set("builderPanelOpen", yes ? "0" : "1");
+    } else if (onTheViewer && chosen !== false) {
+      keptOnTheViewer.panel = !yes;
+      store.set("viewerPanelOpen", yes ? "0" : "1");
+    } else {
+      panelClosed = yes;
+      if (chosen !== false) store.set("panelCollapsed", yes ? "1" : "0");
+    }
+    fitThePage();
+  }
+
+  /* Pointing at a closed column's button shows it over the page for as
+   * long as the pointer stays on the button or the column; a click on the
+   * button keeps it. Leaving it is given a moment, so the pointer can
+   * cross from the button to the column. */
+  var peekTimers = {};
+  function peek(which, on) {
+    clearTimeout(peekTimers[which]);
+    document.body.classList.toggle(which + "-peek", on);
+    var button = el(which === "sidebar" ? "sidebar-expand" : "side-expand");
+    var name = which === "sidebar" ? "sidebar" : "panel";
+    if (button) button.title = on ? "Keep the " + name + " open" : "Show " + name;
+  }
+  function peekWhilePointedAt(which, button, column, keep) {
+    if (!button || !column) return;
+    var cls = which === "sidebar" ? "sidebar-collapsed" : "panel-collapsed";
+    var enter = function () {
+      if (document.body.classList.contains(cls)) peek(which, true);
+    };
+    /* The column keeps a column shown, but does not show it: the folded
+     * sidebar is a strip of icons to be used as it is, and pointing at one
+     * opened the whole sidebar over the page. */
+    var stay = function () {
+      if (document.body.classList.contains(which + "-peek")) clearTimeout(peekTimers[which]);
+    };
+    var leave = function () {
+      clearTimeout(peekTimers[which]);
+      peekTimers[which] = setTimeout(function () { peek(which, false); }, 250);
+    };
+    /* Shown by the pointer moved onto the button, not by the button
+     * appearing under a pointer at rest: the folded sidebar's mark is in
+     * the window's corner, where a pointer often is as the Viewer opens,
+     * and the sidebar came over the page by itself. */
+    button.addEventListener("mousemove", function (e) {
+      if (e.movementX || e.movementY) enter();
+    });
+    column.addEventListener("mouseenter", stay);
+    [button, column].forEach(function (node) {
+      node.addEventListener("mouseleave", leave);
+    });
+    /* A click on the column shown, anywhere but on something of its own
+     * to use, keeps it, as its button does: the button alone was a small
+     * place to find with the column already open under the pointer. */
+    column.addEventListener("click", function (e) {
+      if (!document.body.classList.contains(which + "-peek") || !keep) return;
+      if (e.target.closest("a, button, input, select, textarea, label, summary, details, [role='button'], [tabindex]")) return;
+      keep();
+    });
+  }
+
+  var pageFollowed = null;
+  function followThePage() {
+    var page = document.documentElement.getAttribute("data-page");
+    var viewer = page === "viewer";
+    var builder = page === "run";
+    // Another page: what the person chose on the last one is theirs there.
+    if (page !== pageFollowed) {
+      heldOpen = { sidebar: false, panel: false };
+      widened = { sidebar: false, panel: false };
+      reopenedBeside = false;
+    }
+    pageFollowed = page;
+    onTheViewer = viewer;
+    onTheBuilder = builder;
+    fitThePage();
+  }
+
+  /* Until someone opens or closes the log, it is open while a study runs,
+   * when it is the running commentary, and closed once it has finished,
+   * when it is a record the Files and Report pages hold better and the
+   * page wants the width. A choice made with the buttons is kept. */
+  var panelChosen = false;
+  var studyLive = null;
+  function followTheStudy(live) {
+    if (panelChosen || live === studyLive) return;
+    studyLive = live;
+    setCollapsed(!live, false);
+  }
+
+  /* A study with no live record, nothing going and nothing narrated (a
+   * trajectory analysed) has no narration to show: the panel is closed,
+   * not open and empty. Either may be learned first, so both ask here. */
+  var noLiveRecord = false;
+  var nothingNarrated = false;
+  var processGoing = false;
+  function closeIfSilent() {
+    if (noLiveRecord && nothingNarrated && !processGoing) followTheStudy(false);
+  }
+
+  function setSidebarCollapsed(yes, chosen) {
+    if (chosen !== false) {
+      // Reopened while the Agent holds it folded: open until the Agent
+      // closes, then as it was before, nothing of it kept.
+      if (!yes && agentFold) {
+        reopenedBeside = true;
+        fitThePage();
+        return;
+      }
+      // Folded again while the Agent is beside: the Agent's fold, as before
+      // the person reopened it; nothing of it kept for after.
+      if (yes && reopenedBeside) {
+        reopenedBeside = false;
+        fitThePage();
+        return;
+      }
+      reopenedBeside = false;
+      heldOpen.sidebar = !yes;
+    }
+    if (onTheViewer && chosen !== false) {
+      keptOnTheViewer.sidebar = !yes;
+      store.set("viewerSidebarOpen", yes ? "0" : "1");
+    } else {
+      sidebarClosed = yes;
+      if (chosen !== false) store.set("sidebarCollapsed", yes ? "1" : "0");
+    }
+    fitThePage();
+  }
+
+  /* ---- The log ------------------------------------------------------ */
+  var logFilter = "all";
+  var lastSeen = 0;
+
+  /* What the CLI prints, sorted into what a reader wants to filter on.
+   * The explain text -- the "why" blocks -- arrives as ordinary info
+   * events with a citation on the end, and a refusal arrives as an error
+   * whose message names its code. Neither is tagged; this reads the shape. */
+  function classify(ev) {
+    var msg = String(ev.message || "");
+    var level = String(ev.level || "info").toLowerCase();
+    if (level === "explain") return { kind: "why", level: "info" };
+    if (level === "error" || /refused|Refusal|\b[a-z]+\.[a-z_]+\.[a-z_]+\b.*(?:refus|cannot|must)/.test(msg)) {
+      return { kind: "refused", level: "error" };
+    }
+    if (/^QUALIFIED|qualif/i.test(msg) && level !== "info") return { kind: "qualified", level: "warning" };
+    if (/→ .+ \d{4}|\(doi:|et al\./.test(msg)) return { kind: "why", level: level };
+    if (/complete|Resumed from|✓/.test(msg) && level !== "error") return { kind: "line", level: "success" };
+    return { kind: "line", level: level };
+  }
+
+  function stamp(iso) {
+    if (!iso) return "";
+    var d = new Date(iso);
+    if (isNaN(d)) return "";
+    var pad = function (n) { return String(n).padStart(2, "0"); };
+    return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+  }
+
+  /* An explanation is folded behind the line it explains, as "why", and
+   * opened there: printed in full under every stage, the narration of a
+   * short run was 420 pixels of prose for each line of what happened.
+   * Under the "why" filter, the explanations are what was asked for and
+   * stand open. A refusal or a qualification is never folded. Which were
+   * opened is kept across the panel's redraws, by the line's place. */
+  var openWhy = {};
+
+  function lineOf(ev, c) {
+    var line = document.createElement("div");
+    line.className = "side-log-line";
+    line.dataset.level = c.level;
+    var ts = document.createElement("span");
+    ts.className = "side-log-ts";
+    ts.textContent = stamp(ev.timestamp);
+    var text = document.createElement("span");
+    text.className = "side-log-text";
+    text.textContent = String(ev.message || "");
+    line.appendChild(ts);
+    line.appendChild(text);
+    return line;
+  }
+
+  function renderLog(events) {
+    var box = el("side-log");
+    if (!box) return;
+    var wasAtBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+    box.innerHTML = "";
+    var shown = 0;
+    var lastLine = null;   // {row, key, folded}: where the next explanation goes
+    events.forEach(function (ev) {
+      var c = classify(ev);
+      if (logFilter === "refusals" && c.kind !== "refused") return;
+      if (logFilter === "why" && c.kind !== "why" && c.kind !== "qualified") return;
+      shown += 1;
+      /* An explanation with no line before it to explain (the first of
+       * the window, or one after a refusal) stands open on its own. */
+      if (c.kind === "why" && logFilter !== "why" && lastLine) {
+        if (!lastLine.folded) {
+          var fold = document.createElement("details");
+          fold.className = "side-log-entry";
+          fold.dataset.key = lastLine.key;
+          fold.open = Boolean(openWhy[lastLine.key]);
+          var summary = document.createElement("summary");
+          summary.className = "side-log-summary";
+          lastLine.row.replaceWith(fold);
+          summary.appendChild(lastLine.row);
+          var mark = document.createElement("span");
+          mark.className = "side-log-why-mark";
+          mark.textContent = "why";
+          lastLine.row.appendChild(mark);
+          fold.appendChild(summary);
+          var body = document.createElement("div");
+          body.className = "side-log-block";
+          body.dataset.kind = "why";
+          fold.appendChild(body);
+          fold.addEventListener("toggle", function () {
+            if (fold.open) openWhy[fold.dataset.key] = true;
+            else delete openWhy[fold.dataset.key];
+          });
+          lastLine.folded = body;
+        }
+        var said = document.createElement("p");
+        said.textContent = String(ev.message || "");
+        lastLine.folded.appendChild(said);
+        return;
+      }
+      if (c.kind === "why" || c.kind === "refused" || c.kind === "qualified") {
+        var block = document.createElement("div");
+        block.className = "side-log-block";
+        block.dataset.kind = c.kind;
+        if (c.kind !== "why") {
+          var kind = document.createElement("span");
+          kind.className = "side-log-kind";
+          kind.textContent = c.kind;
+          block.appendChild(kind);
+        }
+        block.appendChild(document.createTextNode(String(ev.message || "")));
+        box.appendChild(block);
+        lastLine = null;
+      } else {
+        var row = lineOf(ev, c);
+        box.appendChild(row);
+        /* Kept by what the line says and when: the panel shows the last
+         * hundred events, so a place in the list moves as a run writes. */
+        lastLine = { row: row, key: String(ev.timestamp || "") + "|" + String(ev.message || "") };
+      }
+    });
+    if (!shown) {
+      var empty = document.createElement("div");
+      empty.className = "side-log-empty";
+      empty.textContent = events.length
+        ? "Nothing matches this filter."
+        : "Nothing yet. The run's narration appears here as it happens.";
+      box.appendChild(empty);
+    }
+    var follow = el("side-follow");
+    if ((follow && follow.checked) || wasAtBottom) box.scrollTop = box.scrollHeight;
+  }
+
+  var cachedEvents = [];
+  function loadLog() {
+    return fetch("/api/events").then(function (r) { return r.json(); }).then(function (d) {
+      cachedEvents = Array.isArray(d.events) ? d.events : [];
+      renderLog(cachedEvents);
+      nothingNarrated = !cachedEvents.length;
+      closeIfSilent();
+    }).catch(function () { /* the panel is not load-bearing */ });
+  }
+
+  /* ---- Files -------------------------------------------------------- */
+  var filesLoaded = false;
+  var lastArtifacts = [];
+
+  function human(size) {
+    var n = Number(size);
+    if (!isFinite(n)) return "";
+    if (n < 1024) return n + " B";
+    if (n < 1048576) return (n / 1024).toFixed(0) + " KB";
+    return (n / 1048576).toFixed(1) + " MB";
+  }
+
+  /* ---- The file preview ------------------------------------------------
+   *
+   * Two modes. Code is the bytes, with line numbers, and it is the
+   * default for anything scientific: a person checking a config wants
+   * the file, not a rendering of it. View is the convenience, and means
+   * something different per type -- a table for CSV, structure for JSON
+   * and YAML, a document for Markdown, a header summary for a structure
+   * file, levels coloured for a log. The choice is remembered.
+   * -------------------------------------------------------------------- */
+
+  var VIEWABLE = {
+    md: "doc", markdown: "doc",
+    csv: "table", tsv: "table", dat: "table",
+    json: "tree", yml: "tree", yaml: "tree", toml: "tree", ini: "tree", cfg: "tree",
+    xml: "tree",                     /* OpenMM's state.xml and system.xml fold by their indentation */
+    log: "log", txt: "log", sha256: "log",
+    pdb: "structure", cif: "structure",
+    sdf: "molecule", mol2: "molecule",  /* a ligand: name, atoms and bonds before the text */
+    /* .py has no View: Code is the view. */
+  };
+
+  function escapeText(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function renderCode(host, data) {
+    var wrap = document.createElement("div");
+    wrap.className = "file-code";
+    var lines = String(data.text || "").split("\n");
+    var gutter = document.createElement("div");
+    gutter.className = "gutter";
+    gutter.textContent = lines.map(function (_, i) { return i + 1; }).join("\n");
+    var pre = document.createElement("pre");
+    pre.className = "lines";
+    pre.textContent = data.text || "";
+    wrap.appendChild(gutter);
+    wrap.appendChild(pre);
+    host.appendChild(wrap);
+  }
+
+  function renderFileLog(host, text) {
+    text.split("\n").slice(0, 5000).forEach(function (line) {
+      var div = document.createElement("div");
+      var upper = line.toUpperCase();
+      div.className = "log-line" + (/ERROR|REFUS|FAIL|TRACEBACK/.test(upper) ? " error"
+        : /WARN/.test(upper) ? " warn"
+        : /\u2713|DONE|COMPLETE|WROTE/.test(upper) ? " ok" : "");
+      div.textContent = line;
+      host.appendChild(div);
+    });
+  }
+
+  function renderStructure(host, text) {
+    /* What the file holds, before the file: atoms, residues, chains,
+     * models. A structure file is thousands of lines that all look the
+     * same, and the counts are what a person is checking. */
+    var atoms = 0, models = 0;
+    var residues = {}, chains = {};
+    text.split("\n").forEach(function (line) {
+      if (line.indexOf("ATOM") === 0 || line.indexOf("HETATM") === 0) {
+        atoms += 1;
+        chains[line.substr(21, 1)] = true;
+        residues[line.substr(21, 1) + line.substr(22, 5)] = true;
+      } else if (line.indexOf("MODEL") === 0) { models += 1; }
+    });
+    if (atoms) {
+      var note = document.createElement("div");
+      note.className = "summary";
+      note.textContent = atoms.toLocaleString() + " atoms \u00b7 "
+        + Object.keys(residues).length.toLocaleString() + " residues \u00b7 "
+        + Object.keys(chains).length + " chain(s)"
+        + (models > 1 ? " \u00b7 " + models + " models" : "");
+      host.appendChild(note);
+    }
+    var pre = document.createElement("pre");
+    pre.textContent = text;
+    host.appendChild(pre);
+  }
+
+  function renderMolecule(host, text, suffix) {
+    /* An SDF's header is three lines then a counts line, "  9  8" for
+     * atoms and bonds; a MOL2 says @<TRIPOS>MOLECULE, then the name, then
+     * the counts. The counts are what a person is checking. */
+    var lines = text.split("\n");
+    var name = "", atoms = null, bonds = null;
+    if (suffix === "sdf") {
+      name = (lines[0] || "").trim();
+      var counts = (lines[3] || "").trim().split(/\s+/);
+      atoms = parseInt(counts[0], 10); bonds = parseInt(counts[1], 10);
+    } else {
+      var at = lines.findIndex(function (l) { return l.indexOf("@<TRIPOS>MOLECULE") === 0; });
+      if (at !== -1) {
+        name = (lines[at + 1] || "").trim();
+        var c2 = (lines[at + 2] || "").trim().split(/\s+/);
+        atoms = parseInt(c2[0], 10); bonds = parseInt(c2[1], 10);
+      }
+    }
+    var note = document.createElement("div");
+    note.className = "summary";
+    note.textContent = (name ? name + " \u00b7 " : "")
+      + (isNaN(atoms) || atoms === null ? "" : atoms + " atoms")
+      + (isNaN(bonds) || bonds === null ? "" : " \u00b7 " + bonds + " bonds");
+    if (note.textContent) host.appendChild(note);
+    var pre = document.createElement("pre");
+    pre.textContent = text;
+    host.appendChild(pre);
+  }
+
+  function renderDoc(host, data) {
+    /* The server renders Markdown with the same library the report page
+     * uses, so a .md reads the same on both and nothing is vendored. On
+     * an install without the library the text is shown as written,
+     * exactly as the report page does. */
+    var div = document.createElement("div");
+    div.className = "report-document";
+    if (data.html) {
+      div.innerHTML = data.html;
+    } else {
+      var pre = document.createElement("pre");
+      pre.textContent = data.text || "";
+      div.appendChild(pre);
+    }
+    host.appendChild(div);
+  }
+
+  /* ---- A collapsible tree for JSON, and for YAML by its indentation ---- */
+
+  function treeNode(key, value, depth) {
+    var row = document.createElement("div");
+    row.className = "tree-row";
+    row.style.paddingLeft = (depth * 14 + 4) + "px";
+    var isObj = value && typeof value === "object";
+    var isArr = Array.isArray(value);
+    if (isObj) {
+      var n = isArr ? value.length : Object.keys(value).length;
+      var toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "tree-toggle";
+      toggle.textContent = depth < 1 ? "\u25be" : "\u25b8";
+      var label = document.createElement("span");
+      label.className = "tree-key";
+      label.textContent = key === null ? "" : key;
+      var meta = document.createElement("span");
+      meta.className = "tree-meta";
+      meta.textContent = (isArr ? "[" + n + "]" : "{" + n + "}");
+      row.appendChild(toggle); row.appendChild(label); row.appendChild(meta);
+      var kids = document.createElement("div");
+      kids.className = "tree-kids";
+      kids.hidden = depth >= 1;
+      (isArr ? value.map(function (v, i) { return [i, v]; })
+             : Object.keys(value).map(function (k) { return [k, value[k]]; }))
+        .forEach(function (pair) { kids.appendChild(treeNode(pair[0], pair[1], depth + 1)); });
+      toggle.addEventListener("click", function () {
+        kids.hidden = !kids.hidden;
+        toggle.textContent = kids.hidden ? "\u25b8" : "\u25be";
+      });
+      var wrap = document.createElement("div");
+      wrap.appendChild(row); wrap.appendChild(kids);
+      return wrap;
+    }
+    var k = document.createElement("span");
+    k.className = "tree-key";
+    k.textContent = key === null ? "" : key;
+    var v = document.createElement("span");
+    v.className = "tree-val " + (value === null ? "null" : typeof value);
+    v.textContent = value === null ? "null" : typeof value === "string" ? value : String(value);
+    row.appendChild(k); row.appendChild(v);
+    return row;
+  }
+
+  function renderJsonTree(host, text) {
+    var data;
+    try { data = JSON.parse(text); } catch (e) { return false; }
+    var tree = document.createElement("div");
+    tree.className = "file-tree";
+    if (data && typeof data === "object") {
+      (Array.isArray(data) ? data.map(function (v, i) { return [i, v]; })
+                           : Object.keys(data).map(function (k) { return [k, data[k]]; }))
+        .forEach(function (pair) { tree.appendChild(treeNode(pair[0], pair[1], 0)); });
+    } else {
+      tree.appendChild(treeNode(null, data, 0));
+    }
+    host.appendChild(tree);
+    return true;
+  }
+
+  function renderYamlTree(host, text) {
+    /* YAML is its indentation. Each line becomes a row at its depth; a
+     * line whose next line is deeper gets a toggle that folds what is
+     * under it. No parser, so what is shown is what the file says. */
+    var lines = text.split("\n");
+    var tree = document.createElement("div");
+    tree.className = "file-tree";
+    var rows = [];
+    lines.forEach(function (line, i) {
+      if (!line.trim() || line.trim().indexOf("#") === 0) return;
+      var indent = line.match(/^ */)[0].length;
+      var next = null;
+      for (var j = i + 1; j < lines.length; j++) {
+        if (lines[j].trim() && lines[j].trim().indexOf("#") !== 0) { next = lines[j].match(/^ */)[0].length; break; }
+      }
+      rows.push({ text: line.trim(), depth: indent, parent: next !== null && next > indent });
+    });
+    var stack = [];
+    rows.forEach(function (r) {
+      while (stack.length && stack[stack.length - 1].depth >= r.depth) stack.pop();
+      var row = document.createElement("div");
+      row.className = "tree-row";
+      row.style.paddingLeft = (r.depth * 7 + 4) + "px";  /* a space of YAML is 7px of tree */
+      var parts = r.text.match(/^(-?\s*[^:]+?:)(\s.*)?$/);
+      if (r.parent) {
+        var toggle = document.createElement("button");
+        toggle.type = "button"; toggle.className = "tree-toggle"; toggle.textContent = "\u25be";
+        row.appendChild(toggle);
+      }
+      var k = document.createElement("span"); k.className = "tree-key";
+      var v = document.createElement("span"); v.className = "tree-val string";
+      if (parts) { k.textContent = parts[1]; v.textContent = (parts[2] || "").trim(); }
+      else { k.textContent = r.text; }
+      row.appendChild(k); row.appendChild(v);
+      var kids = document.createElement("div");
+      kids.className = "tree-kids";
+      var wrap = document.createElement("div");
+      wrap.appendChild(row); wrap.appendChild(kids);
+      (stack.length ? stack[stack.length - 1].kids : tree).appendChild(wrap);
+      if (r.parent) {
+        var t = row.querySelector(".tree-toggle");
+        t.addEventListener("click", function () {
+          kids.hidden = !kids.hidden; t.textContent = kids.hidden ? "\u25b8" : "\u25be";
+        });
+        stack.push({ depth: r.depth, kids: kids });
+      }
+    });
+    host.appendChild(tree);
+    return true;
+  }
+
+  /* ---- A table that sorts on a click of its header ---------------------- */
+
+  function renderTable(host, text, sep) {
+    var rows = text.trim().split("\n").slice(0, 5000).map(function (r) { return r.split(sep); });
+    if (!rows.length) return false;
+    var table = document.createElement("table");
+    table.className = "file-table";
+    var thead = document.createElement("thead");
+    var head = document.createElement("tr");
+    var body = document.createElement("tbody");
+    var data = rows.slice(1);
+    function fill() {
+      body.innerHTML = "";
+      data.forEach(function (r) {
+        var tr = document.createElement("tr");
+        r.forEach(function (c) { var td = document.createElement("td"); td.textContent = String(c).trim(); tr.appendChild(td); });
+        body.appendChild(tr);
+      });
+    }
+    rows[0].forEach(function (c, i) {
+      var th = document.createElement("th");
+      th.textContent = String(c).trim();
+      th.title = "Sort by " + th.textContent;
+      var asc = true;
+      th.addEventListener("click", function () {
+        data.sort(function (a, b) {
+          var x = a[i], y = b[i];
+          var nx = parseFloat(x), ny = parseFloat(y);
+          var cmp = (!isNaN(nx) && !isNaN(ny)) ? nx - ny : String(x).localeCompare(String(y));
+          return asc ? cmp : -cmp;
+        });
+        asc = !asc;
+        Array.prototype.forEach.call(head.children, function (h) { h.classList.remove("sorted"); });
+        th.classList.add("sorted");
+        fill();
+      });
+      head.appendChild(th);
+    });
+    thead.appendChild(head);
+    table.appendChild(thead);
+    table.appendChild(body);
+    fill();
+    host.appendChild(table);
+    return true;
+  }
+
+  function showText(body, data, mode) {
+    body.innerHTML = "";
+    if (data.truncated) {
+      var cut = document.createElement("div");
+      cut.className = "cut";
+      cut.textContent = "Shown: the start and the end of the file. The middle is "
+        + "not here; download it to read the whole.";
+      body.appendChild(cut);
+    }
+    if (mode === "code") { renderCode(body, data); return; }
+    var host = document.createElement("div");
+    host.className = "file-view";
+    var kind = VIEWABLE[data.suffix] || "log";
+    var text = data.text || "";
+    if (kind === "table") {
+      if (!renderTable(host, text, data.suffix === "tsv" ? "\t" : data.suffix === "dat" ? /\s+/ : ",")) {
+        renderFileLog(host, text);
+      }
+    } else if (kind === "tree") {
+      var ok = data.suffix === "json" ? renderJsonTree(host, text) : renderYamlTree(host, text);  /* yaml, toml, ini, xml: by indentation */
+      if (!ok) renderFileLog(host, text);
+    } else if (kind === "structure") {
+      renderStructure(host, text);
+    } else if (kind === "molecule") {
+      renderMolecule(host, text, data.suffix);
+    } else if (kind === "doc") {
+      renderDoc(host, data);
+    } else {
+      renderFileLog(host, text);
+    }
+    body.appendChild(host);
+  }
+
+  /* The file last opened in the reader, and the study it is of: what the
+   * Agent is told the person has open (`agent-panel.js` `pageHints`). */
+  var previewed = null;
+  function studyOpen() {
+    var dash = window.FastMDXDashboard && window.FastMDXDashboard.state;
+    return (dash && dash.appState && dash.appState.active_run) || null;
+  }
+  /* The file open in the reader, by its path in the study open: only while
+   * the reader is on screen (the Files tab shown, the panel open or peeking),
+   * and none once another study is open. The reader stays filled when the
+   * panel turns to the Log or folds, and a file read an hour ago is not what
+   * is looked at. A folded panel is hidden by visibility, so its own class
+   * says so, not the reader's layout. */
+  function previewing() {
+    var pane = el("side-preview");
+    if (!previewed || !pane || pane.hidden || pane.offsetParent === null) return null;
+    var body = document.body.classList;
+    if (body.contains("panel-collapsed") && !body.contains("panel-peek")) return null;
+    // With no study open there is no file of it to read (one opened from a
+    // list of a study closed reads as not found).
+    var open = studyOpen();
+    return open && previewed.study === open ? previewed.path : null;
+  }
+
+  function preview(item) {
+    var pane = el("side-preview");
+    var body = el("side-preview-body");
+    if (!pane || !body) return;
+    var kept = previewed = { path: item.path, study: studyOpen() };
+    pane.hidden = false;
+    var seam = el("side-seam");
+    if (seam) seam.hidden = false;
+    el("side-preview-name").textContent = item.path;
+    el("side-preview-facts").textContent = "";
+    el("side-preview-download").href = item.download_href || item.href;
+    el("side-preview-open").href = item.href;
+    body.innerHTML = "";
+    var modes = el("side-preview-modes");
+    if (modes) modes.hidden = true;
+    var ext = (item.name || "").split(".").pop().toLowerCase();
+    /* Open shows the file the way the browser would: a PDF in its
+     * viewer, an image at full size, an HTML report. For text it is
+     * pointless -- you are reading it -- so it is offered only where it
+     * means something. Download stays: the study may be on a machine
+     * the browser is not. */
+    el("side-preview-open").hidden = ["png", "jpg", "jpeg", "gif", "svg", "webp", "pdf", "html"].indexOf(ext) === -1;
+    if (["png", "jpg", "jpeg", "gif", "svg", "webp"].indexOf(ext) !== -1) {
+      var img = document.createElement("img");
+      img.src = item.href;
+      img.alt = item.name;
+      body.appendChild(img);
+      return;
+    }
+    if (ext === "pdf" || ext === "html") {
+      var frame = document.createElement("iframe");
+      /* A page from the study runs as a page from nowhere: its scripts
+       * work, and it cannot reach this one or act as it. The server sends
+       * the same sandbox, for Open. A PDF is left out because Chrome will
+       * not show one in a sandboxed frame, and a PDF runs no page script. */
+      if (ext === "html") frame.setAttribute("sandbox", "allow-scripts");
+      frame.src = item.href;
+      frame.title = item.name;
+      body.appendChild(frame);
+      return;
+    }
+    /* Everything the Agent's + accepts, read by the same reader over the
+     * same list of types. The old preview had a shorter list of its own
+     * and a 512 KB cliff with no explanation. */
+    fetch("/api/file-text?path=" + encodeURIComponent(item.path))
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        // Another file opened since, or this one again: an answer late
+        // shows nothing over it, and says nothing of it.
+        if (previewed !== kept) return;
+        // Of the study the server read it from: on a page just loaded the
+        // page may not know its study yet (the file was kept as of none, and
+        // never said), and the study may change as the list is read.
+        if (data && data.ok && data.study) kept.study = data.study;
+        if (!data || !data.ok) {
+          var note = document.createElement("div");
+          note.className = "side-preview-note";
+          note.textContent = (data && data.error)
+            || "Could not read it here. Open or download it instead.";
+          body.appendChild(note);
+          return;
+        }
+        el("side-preview-facts").textContent =
+          (data.size < 1024 ? data.size + " B"
+           : data.size < 1048576 ? (data.size / 1024).toFixed(1) + " KB"
+           : (data.size / 1048576).toFixed(1) + " MB")
+          + " \u00b7 " + data.lines.toLocaleString() + " lines \u00b7 " + data.sha256;
+        var canView = Object.prototype.hasOwnProperty.call(VIEWABLE, data.suffix);
+        var mode = canView ? (store.get("previewMode", "code") === "view" ? "view" : "code") : "code";
+        if (modes && canView) {
+          modes.hidden = false;
+          Array.prototype.forEach.call(modes.querySelectorAll(".mode-btn"), function (b) {
+            b.setAttribute("aria-pressed", String(b.dataset.mode === mode));
+            b.onclick = function () {
+              mode = b.dataset.mode;
+              store.set("previewMode", mode);
+              Array.prototype.forEach.call(modes.querySelectorAll(".mode-btn"), function (o) {
+                o.setAttribute("aria-pressed", String(o.dataset.mode === mode));
+              });
+              showText(body, data, mode);
+            };
+          });
+        }
+        showText(body, data, mode);
+      })
+      .catch(function () {
+        if (previewed !== kept) return;
+        var note = document.createElement("div");
+        note.className = "side-preview-note";
+        note.textContent = "Could not read it here. Open or download it instead.";
+        body.appendChild(note);
+      });
+  }
+
+  function renderFiles(items) {
+    var box = el("side-files");
+    if (!box) return;
+    box.innerHTML = "";
+    if (!items.length) {
+      var empty = document.createElement("div");
+      empty.className = "side-log-empty";
+      empty.textContent = "Nothing written yet.";
+      box.appendChild(empty);
+      return;
+    }
+    // Group by top-level directory, in the order a study runs, with what
+    // is kept aside last. The live view's snapshots, two hundred of them,
+    // are one line: the Files page lists them, folded.
+    var order = ["", "setup", "simulation", "analysis", "report", "scenes", "movies", "deposit",
+                 "previous", "superseded", "viewer_runs", "viewer_beside"];
+    var groups = {};
+    var snapshots = 0;
+    items.forEach(function (it) {
+      if (it.path.indexOf("/live_frames/") !== -1) { snapshots += 1; return; }
+      var top = it.path.indexOf("/") === -1 ? "" : it.path.split("/")[0];
+      (groups[top] = groups[top] || []).push(it);
+    });
+    if (snapshots) {
+      groups.simulation = groups.simulation || [];
+      groups.simulation.push({ path: "simulation/live_frames/", name: "live_frames/",
+                               snapshots: snapshots });
+    }
+    Object.keys(groups).sort(function (a, b) {
+      var ia = order.indexOf(a), ib = order.indexOf(b);
+      return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib) || a.localeCompare(b);
+    }).forEach(function (top) {
+      if (top) {
+        var dir = document.createElement("div");
+        dir.className = "side-file side-file-dir";
+        dir.innerHTML = '<span class="side-file-name"></span><span class="side-file-meta"></span>';
+        dir.querySelector(".side-file-name").textContent = top + "/";
+        dir.querySelector(".side-file-meta").textContent = groups[top].length + " files";
+        box.appendChild(dir);
+      }
+      groups[top].forEach(function (it) {
+        if (it.snapshots) {
+          var line = document.createElement("div");
+          line.className = "side-file side-file-dir";
+          line.style.paddingLeft = "24px";
+          line.innerHTML = '<span class="side-file-name"></span><span class="side-file-meta"></span>';
+          line.querySelector(".side-file-name").textContent = it.name;
+          line.querySelector(".side-file-meta").textContent = it.snapshots + " live view snapshots";
+          box.appendChild(line);
+          return;
+        }
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "side-file";
+        btn.dataset.path = it.path;
+        btn.style.paddingLeft = top ? "24px" : "10px";
+        btn.innerHTML = '<span class="side-file-name"></span><span class="side-file-meta"></span>';
+        btn.querySelector(".side-file-name").textContent = it.name;
+        btn.querySelector(".side-file-meta").textContent = human(it.size);
+        btn.addEventListener("click", function () {
+          $$(".side-file.active").forEach(function (b) { b.classList.remove("active"); });
+          btn.classList.add("active");
+          preview(it);
+        });
+        box.appendChild(btn);
+      });
+    });
+  }
+
+  function loadFiles() {
+    return fetch("/api/artifacts").then(function (r) { return r.json(); }).then(function (d) {
+      filesLoaded = true;
+      lastArtifacts = Array.isArray(d.artifacts) ? d.artifacts : [];
+      renderFiles(lastArtifacts);
+    }).catch(function () { /* not load-bearing */ });
+  }
+
+  /* ---- Settings popup ----------------------------------------------- */
+  function setPopup(open) {
+    var popup = el("settings-popup");
+    var trigger = el("settings-open");
+    if (!popup || !trigger) return;
+    popup.hidden = !open;
+    trigger.setAttribute("aria-expanded", String(open));
+  }
+
+  /* Whose AI the Agent asks, by the provider's name, or none. Never the AI
+   * model: it is said only in the Agent's own settings (user, 10-18). */
+  function loadAgentStatus() {
+    fetch("/api/agent/model", {
+      method: "POST", headers: {"content-type": "application/json"}, body: "{}"
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      var cur = d && d.current;
+      var engine = el("settings-engine");
+      if (!engine) return;
+      var spec = cur ? (d.providers || []).filter(function (p) {
+        return p.id === cur.provider;
+      })[0] : null;
+      engine.textContent = cur ? (spec ? spec.label : cur.provider) : "none";
+    }).catch(function () { /* fine */ });
+  }
+
+  /* ---- Wire it up --------------------------------------------------- */
+  document.addEventListener("DOMContentLoaded", function () {
+    if (!el("side-panel")) return;
+
+    applyTheme(chosenScheme(), false);
+    followTheSystem();
+    $$(".seg-btn[data-theme]").forEach(function (b) {
+      b.addEventListener("click", function () { applyTheme(b.dataset.theme, true); });
+    });
+    applyAccent(accentShown(), false);
+    $$(".accent-swatch[data-accent]").forEach(function (b) {
+      b.addEventListener("click", function () { applyAccent(b.dataset.accent, true); });
+    });
+
+    var sw = parseInt(store.get("sidebarWidth", "232"), 10);
+    var pw = parseInt(store.get("panelWidth", String(PANEL_WIDTH)), 10);
+    if (sw) setWidth("sidebar", sw);
+    if (pw) setWidth("panel", pw);
+    $$(".col-handle").forEach(wireHandle);
+
+    keptOnTheViewer.sidebar = store.get("viewerSidebarOpen", "0") === "1";
+    keptOnTheViewer.panel = store.get("viewerPanelOpen", "0") === "1";
+    keptOnTheBuilder = store.get("builderPanelOpen", "0") === "1";
+    var remembered = store.get("panelCollapsed", null);
+    panelChosen = remembered !== null;
+    setCollapsed(remembered === "1", false);
+    el("side-collapse").addEventListener("click", function () {
+      panelChosen = true;
+      setCollapsed(true);
+    });
+    function keepThePanel() {
+      panelChosen = true;
+      setCollapsed(false);
+    }
+    el("side-expand").addEventListener("click", keepThePanel);
+    if (window.FastMDXDashboard && window.FastMDXDashboard.on) {
+      window.FastMDXDashboard.on("app-state", function (s) {
+        processGoing = !!(s && s.process_running);
+        if (processGoing) followTheStudy(true);
+      });
+      window.FastMDXDashboard.on("status-updated", function (update) {
+        var status = String(((update || {}).status || {}).status || "").toLowerCase();
+        noLiveRecord = !status;
+        if (!status) { closeIfSilent(); return; }
+        followTheStudy(processGoing || status === "running" || status === "starting");
+      });
+    }
+    setSidebarCollapsed(store.get("sidebarCollapsed", "0") === "1", false);
+    el("sidebar-collapse").addEventListener("click", function () { setSidebarCollapsed(true); });
+    el("sidebar-expand").addEventListener("click", function () { setSidebarCollapsed(false); });
+    peekWhilePointedAt("sidebar", el("sidebar-expand"), document.querySelector(".sidebar"),
+                       function () { setSidebarCollapsed(false); });
+    peekWhilePointedAt("panel", el("side-expand"), el("side-panel"), keepThePanel);
+    followThePage();
+    new MutationObserver(followThePage).observe(document.documentElement,
+      { attributes: true, attributeFilter: ["data-page"] });
+    window.addEventListener("resize", fitSoon);
+    // The centre column's width changes with nothing else changing where
+    // scroll bars take room: a page grown long enough to scroll loses the
+    // bar's width. Fitted again then too; not while a seam is dragged.
+    var centre = document.querySelector(".main");
+    if (centre && window.ResizeObserver) {
+      new ResizeObserver(function () {
+        if (!document.body.classList.contains("col-dragging")) fitSoon();
+      }).observe(centre);
+    }
+    document.addEventListener("fmx:agent-beside", function () {
+      reopenedBeside = false;
+      fitThePage();
+    });
+    fitThePage();
+
+    $$(".side-tab").forEach(function (t) {
+      t.addEventListener("click", function () { showTab(t.dataset.sideTab); });
+    });
+    showTab(store.get("sideTab", "log"));
+
+    $$(".side-filter").forEach(function (f) {
+      f.addEventListener("click", function () {
+        logFilter = f.dataset.logFilter;
+        $$(".side-filter").forEach(function (g) { g.classList.toggle("active", g === f); });
+        renderLog(cachedEvents);
+      });
+    });
+
+    el("settings-open").addEventListener("click", function (e) {
+      e.stopPropagation();
+      setPopup(el("settings-popup").hidden);
+    });
+    document.addEventListener("click", function (e) {
+      var popup = el("settings-popup");
+      if (popup && !popup.hidden && !popup.contains(e.target)) setPopup(false);
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") setPopup(false);
+    });
+    /* The version is in the Cite dialog, filled in by the server. Read it
+     * from there rather than asking for a second copy. */
+    /* One button. Open opens the folder where the browser can, and the
+     * path goes to the clipboard either way, so the button is useful on
+     * a machine the browser is not on. Four buttons in a 232px sidebar
+     * was too many. */
+    var openOut = el("open-output");
+    if (openOut) {
+      openOut.addEventListener("click", function () {
+        openOut._fmxCopied = null;
+        var path = (el("sidebar-output-folder") || {}).textContent || "";
+        if (!path || path === "\u2014") return;
+        // The menu closes on the click: the card that opened it ticks.
+        // Copied here, in the click, where a page with no clipboard can
+        // still copy; the folder's answer comes later, and says this.
+        openOut._fmxCopied = {
+          path: path.trim(),
+          done: window.FastMDXIcons.copy(el("study-card"), path.trim(), "Path copied",
+                                         "Could not copy the path"),
+        };
+      }, true);
+    }
+
+    /* The study card opens the studies to switch to; Escape, a click
+     * elsewhere or a choice closes it, and focus goes back to the card. */
+    var studyCard = el("study-card");
+    var studyMenu = el("study-menu");
+    function setStudyMenu(open) {
+      if (!studyCard || !studyMenu) return;
+      studyMenu.hidden = !open;
+      studyCard.setAttribute("aria-expanded", String(open));
+      if (open) {
+        var first = studyMenu.querySelector(".study-menu-item");
+        if (first) first.focus();
+      }
+    }
+    if (studyCard && studyMenu) {
+      studyCard.addEventListener("click", function (e) {
+        e.stopPropagation();
+        setStudyMenu(studyMenu.hidden);
+      });
+      studyMenu.addEventListener("click", function (e) {
+        var item = e.target.closest(".study-menu-item");
+        var page = item && item.getAttribute("data-menu-page");
+        if (page && window.FastMDXDashboard && window.FastMDXDashboard.navigate) {
+          e.preventDefault();
+          window.FastMDXDashboard.navigate(page);
+        }
+        // The folder picker opens over the page; the menu goes first.
+        if (item) setStudyMenu(false);
+        e.stopPropagation();
+      });
+      // A menu's keys: the arrows move between its items, round from the
+      // last to the first, Home and End to either end, Tab leaves it.
+      studyMenu.addEventListener("keydown", function (e) {
+        var items = Array.prototype.filter.call(
+          studyMenu.querySelectorAll(".study-menu-item"),
+          function (item) { return !item.hidden && item.offsetParent !== null; });
+        if (!items.length) return;
+        var at = items.indexOf(document.activeElement);
+        var to = null;
+        if (e.key === "ArrowDown") to = (at + 1) % items.length;
+        else if (e.key === "ArrowUp") to = at < 0 ? items.length - 1 : (at - 1 + items.length) % items.length;
+        else if (e.key === "Home") to = 0;
+        else if (e.key === "End") to = items.length - 1;
+        else if (e.key === "Tab") { setStudyMenu(false); return; }
+        if (to == null) return;
+        e.preventDefault();
+        items[to].focus();
+      });
+      document.addEventListener("click", function () {
+        if (!studyMenu.hidden) setStudyMenu(false);
+      });
+      document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && !studyMenu.hidden) {
+          setStudyMenu(false);
+          studyCard.focus();
+        }
+      });
+    }
+
+    /* The skip link moves the keyboard into the page without touching the
+     * address, which names the page. */
+    $$("[data-skip-to]").forEach(function (a) {
+      a.addEventListener("click", function (e) {
+        var to = el(a.getAttribute("data-skip-to"));
+        if (!to) return;
+        e.preventDefault();
+        to.focus();
+      });
+    });
+
+    /* "What would fix it" in the progress card: the Overview, at its card. */
+    $$("[data-fix-link]").forEach(function (a) {
+      a.addEventListener("click", function () {
+        setTimeout(function () {
+          var card = el("fixes-card");
+          if (card && !card.hidden) card.scrollIntoView({ block: "start" });
+        }, 60);
+      });
+    });
+
+    /* Every way to another study asks first whether a switch would lose
+     * work here; the dashboard says why it is held. One that goes on is
+     * marked as in flight (the strip is busy) until it is answered. */
+    function switchHeld() {
+      var dashboard = window.FastMDXDashboard;
+      return Boolean(dashboard && dashboard.beginStudySwitch && dashboard.beginStudySwitch());
+    }
+    function switchEnded() {
+      var dashboard = window.FastMDXDashboard;
+      if (dashboard && dashboard.endStudySwitch) dashboard.endStudySwitch();
+    }
+    /* Asked of the server by folder; opened as a step of its own. */
+    function switchToFolder(folder, page, refused) {
+      if (switchHeld()) return false;
+      fetch("/api/explore/switch", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ folder: folder })
+      }).then(function (r) { return r.json(); }).then(function (d) {
+        if (d && d.ok) { window.FastMDXDashboard.studyOpened(d, page); return; }
+        switchEnded();
+        if (refused) refused((d && d.error) || "Could not open that study.");
+        else window.FastMDXDashboard.toast((d && d.error) || "Could not open that study.", "warning");
+      }).catch(function () {
+        switchEnded();
+        if (refused) refused("Could not reach the server.");
+        else window.FastMDXDashboard.toast("Could not reach the server.", "warning");
+      });
+      return true;
+    }
+
+    var loadStudy = el("load-study");
+    var loadPath = el("load-study-path");
+    if (loadStudy && loadPath && window.FastMDXPicker) {
+      loadStudy.addEventListener("click", function () {
+        // The same folder picker the builder uses, opening into a hidden
+        // input. When it writes a folder, load that study.
+        window.FastMDXPicker.open({ into: "load-study-path", mode: "folder" });
+      });
+      loadPath.addEventListener("change", function () {
+        var folder = loadPath.value.trim();
+        if (!folder) return;
+        loadPath.value = "";
+        // Work a switch would lose holds it, with the reason said. The new
+        // study is read at once, on its overview, as a step of its own.
+        var asked = switchToFolder(folder, undefined, function (why) {
+          loadStudy.disabled = false;
+          loadStudy.textContent = "Load study";
+          window.alert(why === "Could not open that study." ? "Could not load that folder." : why);
+        });
+        if (!asked) return;
+        loadStudy.disabled = true;
+        loadStudy.textContent = "Loading\u2026";
+      });
+    }
+
+    /* The seam between the file list and the preview. Drag it; either
+     * side can take the whole panel. Double-click resets. Remembered,
+     * as the column seams are. */
+    var seam = el("side-seam");
+    var files = el("side-files");
+    if (seam && files) {
+      function setFilesHeight(pct) {
+        var bounded = Math.max(0, Math.min(100, pct));
+        document.documentElement.style.setProperty("--side-files-height", bounded + "%");
+        store.set("sideFilesHeight", String(bounded));
+      }
+      setFilesHeight(parseFloat(store.get("sideFilesHeight", "45")) || 45);
+      seam.addEventListener("mousedown", function (e) {
+        e.preventDefault();
+        seam.classList.add("dragging");
+        var pane = files.parentElement;
+        function move(ev) {
+          var box = pane.getBoundingClientRect();
+          if (box.height <= 0) return;
+          setFilesHeight(((ev.clientY - box.top) / box.height) * 100);
+        }
+        function up() {
+          seam.classList.remove("dragging");
+          document.removeEventListener("mousemove", move);
+          document.removeEventListener("mouseup", up);
+        }
+        document.addEventListener("mousemove", move);
+        document.addEventListener("mouseup", up);
+      });
+      seam.addEventListener("dblclick", function () { setFilesHeight(45); });
+    }
+
+    var version = el("settings-version");
+    var cite = el("cite-version");
+    if (version && cite) {
+      version.textContent = cite.textContent.trim();
+      version.title = version.textContent;
+    }
+
+    /* "Agent settings…" opens the Agent's own dialog. Landing on the page
+     * and leaving somebody to find the button was the same as not
+     * linking it. */
+    var agentLink = el("settings-agent-link");
+    if (agentLink) {
+      agentLink.addEventListener("click", function (e) {
+        e.preventDefault();
+        setPopup(false);
+        // Focus goes back to the gear when the dialog closes.
+        el("settings-open").focus();
+        /* No navigation. The dialog is at body level and opens over
+         * whatever page is showing; changing the page to open a
+         * settings dialog is a detour nobody asked for. */
+        if (window.FastMDXAgent && window.FastMDXAgent.openSettings) {
+          window.FastMDXAgent.openSettings();
+        }
+      });
+    }
+
+    loadLog();
+    loadAgentStatus();
+    // Follow the run. The dashboard already polls app-state; the log rides
+    // the same cadence rather than adding its own.
+    if (window.FastMDXDashboard && window.FastMDXDashboard.on) {
+      window.FastMDXDashboard.on("app-state", function () {
+        loadLog();
+        if (filesLoaded && !el("side-pane-files-hidden")) loadFiles();
+      });
+    } else {
+      setInterval(loadLog, 5000);
+    }
+  });
+
+  /* Open a file in the panel's reader by its path, for the centre Files
+   * page's View button. The panel's tab shows, the list loads if it has
+   * not, the row is marked, and the file opens. */
+  function previewPath(path) {
+    /* Asked for, so kept: the study's first status, arriving after (a
+     * study finished, or silent), closed the panel under the file (CI on
+     * 99b21cc6). */
+    panelChosen = true;
+    setCollapsed(false);
+    showTab("files");
+    var open = function () {
+      var item = lastArtifacts.find(function (it) { return it.path === path; });
+      if (!item) return false;
+      $$(".side-file.active").forEach(function (b) { b.classList.remove("active"); });
+      $$("#side-files .side-file").forEach(function (b) {
+        if (b.dataset.path === path) { b.classList.add("active"); b.scrollIntoView({ block: "nearest" }); }
+      });
+      preview(item);
+      return true;
+    };
+    if (!open()) loadFiles().then(open);
+  }
+
+  window.FastMDXFrame = { showTab: showTab, setCollapsed: setCollapsed, applyTheme: applyTheme,
+                          applyAccent: applyAccent, fitThePage: fitThePage,
+                          previewPath: previewPath, previewing: previewing };
+})();

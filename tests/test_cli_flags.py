@@ -19,6 +19,7 @@ from fastmdxplora.cli.main import (
     _PHASE_SPEC,
     _build_parser,
     _harvest_phase_options,
+    _normalize_analysis_options,
 )
 
 
@@ -235,9 +236,58 @@ class TestMultiValuedFlags:
         assert kwargs["force_field"] == ["amber14-all.xml", "amber14/tip3pfb.xml"]
 
 
-# ===========================================================================
-# Choices enforcement (argparse-level)
-# ===========================================================================
+class TestThereIsNoCompatibilityProfile:
+    """A profile that writes the answers is not a reproduction.
+
+    ``--compat v1`` set a table of analysis options said to be version 1's.
+    Three of them were this software's own defaults; two were not settings of
+    either implementation. The hydrogen-bond entry multiplied the per-frame
+    count by two, and neither version 1 nor MDTraj counts a bond twice --
+    version 1 takes ``len(baker_hubbard(frame))``, one row per
+    donor-hydrogen-acceptor triplet. The clustering entry asked for six
+    clusters, which is neither version 1's fallback of three nor this
+    software's five, and could not have reproduced version 1 at any number,
+    because version 1 clusters raw Cartesian coordinates while this clusters a
+    pairwise RMSD matrix.
+
+    Reproducing a result means running the same method and finding the same
+    number. A flag that supplies the number instead removes the thing being
+    checked.
+    """
+
+    def test_the_flag_is_gone(self):
+        parser = _build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args([
+                "analyze", "-system", "/tmp/bpti.pdb", "--compat", "v1",
+            ])
+
+    def test_no_option_table_offers_it(self):
+        from fastmdxplora.cli.main import _ANALYSIS_OPTIONS
+
+        assert not any(kwarg == "compat" for _f, kwarg, _kw in _ANALYSIS_OPTIONS)
+
+    def test_settings_given_explicitly_still_reach_the_analysis(self):
+        """What replaces it: stating the settings, which is the exercise."""
+        parser = _build_parser()
+        args = parser.parse_args([
+            "analyze", "-system", "/tmp/bpti.pdb",
+            "--scope", "protein", "--selection", "protein", "--stride", "2",
+            "--cluster-methods", "hierarchical", "--cluster-n-clusters", "3",
+            "--cluster-linkage", "ward",
+        ])
+        from fastmdxplora.cli.main import _ANALYSIS_OPTIONS
+
+        kwargs = _normalize_analysis_options(
+            _harvest_phase_options(args, _ANALYSIS_OPTIONS)
+        )
+        assert kwargs["scope"] == "protein"
+        assert kwargs["selection"] == "protein"
+        assert kwargs["stride"] == 2
+        assert kwargs["options"]["cluster"] == {
+            "methods": ["hierarchical"], "n_clusters": 3, "linkage": "ward"
+        }
+
 class TestChoicesValidation:
     def test_platform_choice_rejects_invalid(self):
         parser = _build_parser()

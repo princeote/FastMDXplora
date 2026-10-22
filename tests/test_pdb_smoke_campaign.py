@@ -65,8 +65,25 @@ class FakeFastMDXploraSuccess:
         (setup / "system.xml").write_text("<System><Particle/></System>", encoding="utf-8")
         (setup / "state.xml").write_text("<State/>", encoding="utf-8")
         (setup / "topology.pdb").write_text(
-            "ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N\n"
-            "END\n",
+            # A tripeptide rather than a lone residue: one amino acid is
+        # simultaneously N- and C-terminal, which AMBER has no template for.
+        # These fixtures test pipeline mechanics, not force-field edge cases.
+                "ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N\n"
+                "ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      3  C   ALA A   1       2.009   1.420   0.000  1.00  0.00           C\n"
+        "ATOM      4  O   ALA A   1       1.251   2.390   0.000  1.00  0.00           O\n"
+        "ATOM      5  CB  ALA A   1       1.988  -0.773  -1.199  1.00  0.00           C\n"
+        "ATOM      6  N   GLY A   2       3.332   1.549   0.000  1.00  0.00           N\n"
+        "ATOM      7  CA  GLY A   2       3.972   2.849   0.000  1.00  0.00           C\n"
+        "ATOM      8  C   GLY A   2       5.486   2.705   0.000  1.00  0.00           C\n"
+        "ATOM      9  O   GLY A   2       6.008   1.593   0.000  1.00  0.00           O\n"
+        "ATOM     10  N   ALA A   3       6.171   3.845   0.000  1.00  0.00           N\n"
+        "ATOM     11  CA  ALA A   3       7.623   3.845   0.000  1.00  0.00           C\n"
+        "ATOM     12  C   ALA A   3       8.174   5.265   0.000  1.00  0.00           C\n"
+        "ATOM     13  O   ALA A   3       7.416   6.235   0.000  1.00  0.00           O\n"
+        "ATOM     14  CB  ALA A   3       8.153   3.072  -1.199  1.00  0.00           C\n"
+        "ATOM     15  OXT ALA A   3       9.400   5.400   0.000  1.00  0.00           O\n"
+        "END\n",
             encoding="utf-8",
         )
         (setup / "setup_parameters.json").write_text(
@@ -130,7 +147,7 @@ def test_summary_csv_and_json_are_written(tmp_path: Path) -> None:
     assert data[0]["pdb_id"] == "1L2Y"
 
 
-def test_run_one_uses_local_pdb_path_and_gentle_by_default(tmp_path: Path) -> None:
+def test_run_one_uses_local_pdb_path_and_a_short_run(tmp_path: Path) -> None:
     local_pdb = tmp_path / "local.pdb"
     local_pdb.write_text("END\n", encoding="utf-8")
     with patch("fastmdxplora.FastMDXplora", FakeFastMDXploraSuccess), patch.object(
@@ -141,7 +158,16 @@ def test_run_one_uses_local_pdb_path_and_gentle_by_default(tmp_path: Path) -> No
     assert row["status"] == "ok"
     assert row["input_path"] == str(local_pdb.resolve())
     assert FakeFastMDXploraSuccess.captured_system == str(local_pdb)
-    assert FakeFastMDXploraSuccess.captured_options["simulation"]["preset"] == "gentle"
+    # A campaign runs short at the conditions a real run uses. It used to
+    # pass a gentle preset that also dropped the temperature to 100 K, so
+    # every campaign was asking whether structures survive as ice -- which is
+    # not the question a campaign exists to answer.
+    simulation = FakeFastMDXploraSuccess.captured_options["simulation"]
+    assert "preset" not in simulation
+    assert simulation["production_steps"] > 0
+    assert "temperature_K" not in simulation, (
+        "a campaign should not override the temperature"
+    )
 
 
 def test_missing_file_is_classified_without_crashing(tmp_path: Path) -> None:

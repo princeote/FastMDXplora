@@ -21,12 +21,33 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable, ParamSpec, TypeVar
+
+if TYPE_CHECKING:
+    # For editors and type checkers only: what each phase method accepts,
+    # generated from the schema. Nothing here is imported when running.
+    import sys
+
+    from fastmdxplora.config.phase_settings_types import (
+        AnalyzeSettings,
+        ReportSettings,
+        SetupSettings,
+        SimulateSettings,
+    )
+
+    if sys.version_info >= (3, 11):
+        from typing import Unpack
+    else:
+        from typing_extensions import Unpack
 
 from fastmdxplora.utils.logging import get_logger
+from fastmdxplora.refusals import refusal_of
+from fastmdxplora.refusals import OutputExistsError
+from fastmdxplora.refusals import RunStopped, StudyError, StudyFailed
 
 logger = get_logger("project")
 
@@ -35,6 +56,39 @@ logger = get_logger("project")
 # The canonical phase list. This is the only place phase order is defined.
 # ---------------------------------------------------------------------------
 PHASES: tuple[str, ...] = ("setup", "simulation", "analysis", "report")
+
+
+class PhaseSkipped(Exception):
+    """Raised by a phase that has nothing to do, and says why.
+
+    Recorded as ``skipped`` with the reason, not as ``ok``: an analysis of a
+    study that ran no production wrote "Phase 'analysis' completed." over a
+    manifest saying it had deferred, and a reader of the record could not
+    tell it from one that measured something.
+    """
+
+    def __init__(self, reason: str, artifacts: list[str] | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.artifacts = list(artifacts or [])
+
+
+def _how_it_ended(result: "PhaseResult") -> dict[str, Any]:
+    """The line a finished phase is shown with.
+
+    A setup that could not prepare a system (no OpenMM or PDBFixer, a
+    sequence given as the system) is recorded as done, since not installing
+    an optional backend is a choice, and was shown as "setup complete" over
+    a folder with no ``system.xml``. It is shown as finishing with a warning,
+    the reason having been said above it.
+    """
+    if result.status == "skipped":
+        return {"status": "skipped", "message": f"{result.name} skipped: {result.message}"}
+    if (result.name == "setup" and result.status == "ok"
+            and not result.taken_from and "system.xml" not in result.artifacts):
+        return {"status": "warning",
+                "message": "setup finished without preparing a system (see above)"}
+    return {"status": result.status}
 
 
 @dataclass
@@ -48,9 +102,43 @@ class PhaseResult:
     finished_at: str = ""
     message: str = ""
     artifacts: list[str] = field(default_factory=list)
+    refusal: dict[str, Any] = field(default_factory=dict)
+    """What this phase refused, as a record rather than as a sentence.
+
+    Present on an errored phase, empty otherwise. ``message`` holds the
+    prose and always did; this holds the same fact in the form a program
+    can branch on -- the stable code, its kind, whether it is worth
+    retrying, and the particulars the sentence interpolated.
+
+    Written into the manifest, so a reader opening the run afterwards
+    sees what an in-process caller saw. A refusal is a result, and a
+    study that stopped should record why it stopped in the same place it
+    would have recorded what it found.
+    """
+    produced_by: dict[str, Any] = field(default_factory=dict)
+    """Version, host and package environment that produced *this* phase.
+
+    The manifest's top-level `version`, `environment` and `source` describe
+    whichever session wrote the file last. Once a manifest can carry phases
+    from more than one session -- a run simulated on the cluster and then
+    analysed on a workstation, or re-analysed after an upgrade -- those
+    top-level fields stop describing the phases beneath them. This says who
+    produced each one.
+
+    Empty for a phase recorded before this field existed. That is the
+    honest value: we do not know what produced it, and guessing the current
+    session would be worse than saying nothing.
+    """
+    taken_from: str = ""
+    """Where a phase that did not run here took its output from.
+
+    Set on the setup phase of a run whose `setup_from` names a prepared
+    system: nothing was prepared, and this says which system was simulated
+    instead, so the run's own record points at the one that describes it.
+    """
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        record = {
             "name": self.name,
             "status": self.status,
             "output_dir": str(self.output_dir) if self.output_dir else None,
@@ -59,6 +147,13 @@ class PhaseResult:
             "message": self.message,
             "artifacts": self.artifacts,
         }
+        if self.refusal:
+            record["refusal"] = self.refusal
+        if self.produced_by:
+            record["produced_by"] = self.produced_by
+        if self.taken_from:
+            record["taken_from"] = self.taken_from
+        return record
 
 
 @dataclass
@@ -91,6 +186,16 @@ class RunResult:
             "error_type": self.error_type,
         }
 
+    def raise_for_status(self) -> None:
+        """Raise :class:`~fastmdxplora.refusals.StudyFailed` if this run failed.
+
+        Its refusal is the failed phase's, so ``exc.code`` is what that phase
+        recorded. A run that finished, or did not start, returns quietly.
+        """
+        failure = StudyFailed.from_results([self])
+        if failure is not None:
+            raise failure
+
     # Convenience: treat a RunResult a bit like its phase list, so common
     # patterns (iterating phases, checking a phase status) stay ergonomic.
     def phase(self, name: str) -> PhaseResult | None:
@@ -99,6 +204,49 @@ class RunResult:
             if p.name == name:
                 return p
         return None
+
+
+
+def _phases_recorded_in(root: Path) -> list[PhaseResult]:
+    """The phases a study's Manifest records, as results."""
+    try:
+        manifest = json.loads((Path(root) / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    known = set(PhaseResult.__dataclass_fields__)
+    out = []
+    for record in manifest.get("phases") or []:
+        if isinstance(record, dict) and record.get("name") and record.get("status"):
+            fields = {k: v for k, v in record.items() if k in known}
+            if fields.get("output_dir"):
+                fields["output_dir"] = Path(fields["output_dir"])
+            out.append(PhaseResult(**fields))
+    return out
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _logging_to_its_folder(method: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Log to the study's own file for the length of one call, and no longer.
+
+    The file log was attached when the object was made and never taken off,
+    so whatever the process logged after a study ended went into that
+    study's folder, and moving the folder broke logging for the rest of the
+    process. Nested calls share the outer call's attachment. Typed so the
+    method keeps its signature for a type checker.
+    """
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        study = args[0]
+        study._attach_its_log()  # type: ignore[attr-defined]
+        try:
+            return method(*args, **kwargs)
+        finally:
+            study._detach_its_log()  # type: ignore[attr-defined]
+    return wrapper
 
 
 class FastMDXplora:
@@ -111,8 +259,8 @@ class FastMDXplora:
 
         - Path to a PDB / CIF file (e.g. ``"protein.pdb"``)
         - 4-character PDB ID (e.g. ``"1L2Y"``), fetched from RCSB
-        - One-letter amino-acid sequence, if structure prediction is
-          available (future)
+        A one-letter amino-acid sequence is recognised and refused: it
+        needs a structure predictor, which this software does not carry.
 
         Mutually exclusive with ``config``.
     config : str | os.PathLike | None
@@ -121,7 +269,7 @@ class FastMDXplora:
         is the same either way. Mutually exclusive with ``system``.
     output_dir : str | os.PathLike | None
         Where to write project outputs. Defaults to
-        ``./fastmdxplora_output_<timestamp>``.
+        ``./fastmdxplora_<system>_study_<timestamp>``.
     options : dict[str, dict] | None
         Per-phase keyword arguments, e.g.
         ``{"simulation": {"duration_ns": 100}}``.
@@ -154,10 +302,17 @@ class FastMDXplora:
         config_data: dict[str, Any] | None = None,
         output_dir: str | os.PathLike | None = None,
         options: dict[str, dict[str, Any]] | None = None,
+        study_options: dict[str, Any] | None = None,
         verbose: bool = False,
+        include_phase: list[str] | None = None,
+        exclude_phase: list[str] | None = None,
         include: list[str] | None = None,
         exclude: list[str] | None = None,
+        _expanded_from_a_validated_study: bool = False,
+        _system_id: str | None = None,
     ) -> None:
+        include, exclude = _phase_selection(
+            include_phase, exclude_phase, include, exclude)
         # FastMDXplora is the single user-facing entry point. Ways to
         # construct it:
         #   - config=...      : a YAML config path (one system or many, with
@@ -170,52 +325,110 @@ class FastMDXplora:
         # config/config_data execution is deferred to explore().
         n_config = sum(x is not None for x in (config, config_data))
         if n_config and system is not None:
-            raise ValueError(
+            raise StudyError(
                 "Pass either `system=` (a single study) or a config "
                 "(`config=` / `config_data=`), not both."
-            )
+            , code="config.option.conflicting")
 
         self._config_path: str | None = (
             str(config) if config is not None else None
         )
+        # The `id` the study gave this system, which the batch layer knows
+        # and its resolved config is written with. Without it every run's
+        # resolved_config.yml said `id: s1`, whatever the study called it.
+        self._system_id = str(_system_id) if _system_id else None
         self._config_data: dict[str, Any] | None = config_data
         self._deferred_output_dir = output_dir
         self._deferred_verbose = verbose
 
         if n_config:
-            # Config-driven: defer everything to explore(). We don't create
+            # Config-driven: defer everything to explore(). Nothing creates
             # an output directory or banner here because the batch machinery
             # owns the layout (flat for one run, runs/<id>/ for many).
             self.system = None  # resolved per-run by the batch layer
             self.options = options or {}
+            self.study_options: dict[str, Any] = dict(study_options or {})
             self.verbose = bool(verbose)
             self._config_include = include
             self._config_exclude = exclude
             self.results = []
+            # Declared, not omitted. This branch used to return without
+            # setting it at all, so the same class had two shapes depending
+            # on which argument it was given -- and any code asking "where
+            # is the output" had to know which, or discover it through an
+            # AttributeError.
+            #
+            # That is not a hypothetical. An attempt to fix a logging leak
+            # landed on the other branch and did nothing, because every
+            # caller affected was on this one, and the difference was
+            # invisible until traced. None says the same thing the absence
+            # did -- the location is not settled yet -- in a way that can be
+            # read rather than caught. explore() fills it in from the batch
+            # layer, as it already did.
+            self.output_dir = None
             return
 
         # ---- Direct single-study path -----------------------------------
         if system is None:
-            raise ValueError(
+            raise StudyError(
                 "FastMDXplora requires either a `system` input (a PDB/CIF "
-                "file path, a 4-character PDB ID, or a one-letter sequence) "
-                "or a `config` file."
-            )
+                "file path or a 4-character PDB ID) or a `config` file."
+            , code="config.option.missing_companion")
 
         self.system: str = str(system)
+
+        # The same validation every other route passes, except for the runs
+        # the batch layer makes from a study it has validated already: their
+        # settings are that study expanded -- an umbrella window's `centre`
+        # in place of `from`, `to` and `n_windows` -- which is not what a
+        # person writes, and every umbrella window was refused as though it
+        # were. A system given here
+        # with its options reached the phases unchecked, so a misspelled
+        # `duraton_ns` ran the default million production steps without a
+        # word, and a temperature of -50 K was planned as given. Before
+        # anything is created, so a refused study leaves nothing behind.
+        if (not _expanded_from_a_validated_study
+                and ((options or {}).get("simulation") or {}).get("stop_when") is not None):
+            # Applied by a study around its runs, which one system given
+            # without a config does not have: ignored, it would run the
+            # first piece and stop as if that were the answer.
+            raise StudyError(
+                "simulation.stop_when runs a study until it is determined, and is applied to a "
+                "study given as a config: FastMDXplora(config_data={'systems': [...], "
+                "'simulation': {'stop_when': ...}}), a config file, the command line or "
+                "the GUI.", code="config.option.inapplicable",
+                option="simulation.stop_when", context="a run given without a config")
+        if (options or study_options) and not _expanded_from_a_validated_study:
+            from fastmdxplora.config.loader import validate_config
+
+            validate_config({"systems": [{"system": self.system}],
+                             **dict(study_options or {}), **dict(options or {})},
+                            require_systems=True)
 
         # Phase selection (the batch layer passes the config's include/exclude)
         self._config_include: list[str] | None = include
         self._config_exclude: list[str] | None = exclude
 
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        self.output_dir: Path = (
+        from fastmdxplora.naming import default_output_name, system_of
+
+        self.output_dir: Path | None = (
             Path(output_dir) if output_dir
-            else Path(f"fastmdxplora_output_{timestamp}")
+            else Path(default_output_name(system_of(
+                {"systems": [{"id": self._system_id, "system": self.system}]})))
         )
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Which process this study is, so a GUI opened on the folder later
+        # can adopt the run: show it as running and stop it if asked. The
+        # file goes when the process exits; a crash leaves it, and an
+        # adopter checks the process is alive and is this run before
+        # believing it.
+        _record_run_process(self.output_dir)
 
         self.options: dict[str, dict[str, Any]] = options or {}
+        # Study-level settings (`agent`, `agent_model`), which describe the
+        # config as a whole rather than a phase. The batch layer passes them
+        # down from the config; a direct `system=` study has none.
+        self.study_options: dict[str, Any] = dict(study_options or {})
         self.verbose: bool = bool(verbose)
 
         # Per-phase output subdirectories (created lazily by each phase)
@@ -232,10 +445,26 @@ class FastMDXplora:
         # Display the opening banner once the session is ready.
         from fastmdxplora import __version__
 
+        # The settings this run will use, not the ones a command line
+        # mentioned. The banner reconstructed them from sys.argv, so a run
+        # driven by a config file showed the defaults for everything -- the
+        # step counts, the timestep, the temperature -- while using the
+        # config's values. A banner that reports different settings from the
+        # ones in force is worse than no banner.
+        simulation = dict(self.options.get("simulation") or {})
+        # And setup's, which it read only from a config named on the command
+        # line: a study given from Python announced pH 7.4 and the automatic
+        # force field while it prepared at pH 7.0 with CHARMM36.
+        setup = dict(self.options.get("setup") or {})
         self._presenter.banner(
             System=self.system,
             Output=str(self.output_dir),
             Version=__version__,
+            **{key: str(value) for key, value in simulation.items()
+               if isinstance(value, (int, float, str, bool))},
+            **{f"setup_{key}": str(setup[key])
+               for key in ("ph", "ion_concentration_M", "forcefield")
+               if setup.get(key) is not None},
         )
 
         # The banner already shows system/output to the user; this log
@@ -247,14 +476,21 @@ class FastMDXplora:
     # ------------------------------------------------------------------
     # Orchestration entry point
     # ------------------------------------------------------------------
+    @_logging_to_its_folder
     def explore(
         self,
         *,
-        include: list[str] | None = None,
-        exclude: list[str] | None = None,
+        include_phase: list[str] | None = None,
+        exclude_phase: list[str] | None = None,
         options: dict[str, dict[str, Any]] | None = None,
         report: bool = True,
         dry_run: bool = False,
+        force: bool = False,
+        include: list[str] | None = None,
+        exclude: list[str] | None = None,
+        rerun_windows: list[int] | None = None,
+        check: bool = False,
+        keep_previous: bool = False,
     ) -> list[RunResult]:
         """Run the full pipeline, end to end.
 
@@ -275,6 +511,26 @@ class FastMDXplora:
             If True, print the plan — every run, its system, swept values,
             output directory, and the phases that would execute — and
             return without running anything.
+        rerun_windows : list of int, optional
+            For an umbrella study that has run: the windows to run again, in
+            place, with whatever the config now gives them (a stiffer
+            spring, a longer run). Every other window is kept, and the free
+            energy is recombined from the whole set. The earlier runs of the
+            windows named are moved to ``superseded/``.
+        force : bool, default False
+            Run phases whose output the folder already holds: that output,
+            and the output of any phase after it this run does not do again
+            (it was written from what is being replaced), is removed first.
+            Without it such a run is refused.
+        keep_previous : bool, default False
+            As ``force``, keeping what is replaced in the study's
+            ``previous/<phase>`` (one copy of each, in place of the one kept
+            before) rather than removing it: ``--rerun``.
+        check : bool, default False
+            Raise :class:`~fastmdxplora.refusals.StudyFailed` if any run
+            failed, rather than returning the failure in the results. The
+            study still runs to where it would have stopped, and its records
+            are written; the exception carries the results as ``results``.
 
         Returns
         -------
@@ -289,13 +545,46 @@ class FastMDXplora:
         config file passed to the constructor, the config-file values are
         used. Explicit arguments to this method always win.
         """
+        if check:
+            # The same call, then the same results looked at: every path
+            # below returns, and this is the one place they all come back to.
+            results = self.explore(
+                include_phase=include_phase, exclude_phase=exclude_phase,
+                options=options, report=report, dry_run=dry_run, force=force,
+                include=include, exclude=exclude, rerun_windows=rerun_windows,
+                keep_previous=keep_previous)
+            failure = StudyFailed.from_results(results)
+            if failure is not None:
+                raise failure
+            return results
+        include, exclude = _phase_selection(
+            include_phase, exclude_phase, include, exclude)
+        force = bool(force or keep_previous)
+        # This call's results, and only this call's. `self.results` was set
+        # in __init__ and appended to here, so a second explore() on the same
+        # object inherited the first one's phase records -- and since the
+        # returned status is "error if any result is an error", a retry after
+        # a failed setup came back as an error with everything succeeding.
+        # The manifest survived it (the writer de-duplicates by phase name),
+        # so the wrong answer reached only the Python API's return value,
+        # which is the API's only signal. Retrying on the same object is the
+        # obvious idiom for an interface the README advertises as
+        # `FastMDXplora(config="study.yml").explore()`.
+        self.results = []
+
         # Config-driven runs (one system or many) go through the batch
         # machinery internally. The user always sees the same FastMDXplora
         # interface; the batch layer is an implementation detail.
         if self._config_path is not None or self._config_data is not None:
             return self._explore_config(
                 include=include, exclude=exclude, report=report, dry_run=dry_run,
+                force=force, rerun_windows=rerun_windows, keep_previous=keep_previous,
             )
+        if rerun_windows:
+            raise StudyError(
+                "`rerun_windows` names umbrella windows, and a study of one "
+                "system given without a config has none.",
+                code="config.option.inapplicable")
 
         # Config-file phase selection is the fallback when this call omits it.
         if include is None and exclude is None:
@@ -303,6 +592,22 @@ class FastMDXplora:
             exclude = self._config_exclude
 
         plan = self._build_plan(include=include, exclude=exclude, want_report=report)
+        if options:
+            # Checked before anything reads them, and before the dry run,
+            # which is how a study is checked without running it.
+            self._merge_options(options)
+        prepared = self._prepared_system_named(options)
+        if prepared is not None and "setup" in plan:
+            # The simulation reads the named system whatever setup does, so
+            # preparing here solvates a box nothing simulates -- and its
+            # record, the one beside this run, describes a different set of
+            # atoms from the ones simulated. Every run of a replica sweep did
+            # this, each with its own unused box.
+            plan.remove("setup")
+            logger.info(
+                "Preparing nothing: `setup_from` names %s, and this run "
+                "simulates that system. A second preparation would solvate "
+                "a box that is never simulated.", prepared)
 
         # Dry run: report the plan and return without executing.
         if dry_run:
@@ -312,9 +617,30 @@ class FastMDXplora:
                 output_dir=self.output_dir, phases=[],
             )]
 
+        if not dry_run:
+            self._refuse_to_overwrite(plan, force=force)
+            if force:
+                # What the plan writes, and what it leaves stale after it,
+                # cleared before the first phase: a phase written over in
+                # place kept the files a run before made and this one did
+                # not (an analysis left out stayed beside the new ones), and
+                # a report from the analyses before stayed beside new ones.
+                from fastmdxplora.replaced import make_way
+                from fastmdxplora.simulation.resume import _still_running
+
+                # Not while a run of the study is going: its phase would be
+                # moved from under it, or the stale ones written again after.
+                if _still_running(Path(self.output_dir)):
+                    raise StudyError(
+                        f"{self.output_dir} is still running. Run its phases "
+                        "again once it has stopped.",
+                        code="environment.workspace.run_going")
+                make_way(self.output_dir, plan, keep=keep_previous,
+                         say=self._presenter.info)
+
         merged_options = self._merge_options(options)
-        dashboard_writer = self._dashboard_writer(merged_options)
-        if dashboard_writer is not None:
+        dashboard_writer = self._dashboard_writer(merged_options, plan)
+        if dashboard_writer is not None and not dashboard_writer.phases_only:
             self._initialize_dashboard_timeline(dashboard_writer, plan)
 
         # Remember the resolved phase selection + merged options so the
@@ -322,12 +648,46 @@ class FastMDXplora:
         # any per-call overrides), not just the construction-time config.
         self._resolved_include = include
         self._resolved_exclude = exclude
+        self._recorded_phases = None
+        if "simulation" not in plan and _a_simulation_recorded(self.output_dir):
+            # The analysis or report run again over a recorded simulation,
+            # from the GUI, the command line or Python: the study is still
+            # the run it recorded, so its record keeps the phases it ran
+            # (written as `[analysis, report]`, it read as a trajectory
+            # analysed, and reproduced only the analysis).
+            self._recorded_phases = self._recorded_phase_selection(plan)
         self._resolved_options = {
             p: opts for p, opts in merged_options.items() if opts
         }
+        # Written now, before the first phase, and again at the end. A run
+        # in progress or one that was stopped had no resolved_config.yml,
+        # because it was written only after the loop: the one record of
+        # what a study was became available only once it was over, and a
+        # question about a running study's settings had nothing to read.
+        # What was decided is known here; writing it here is the record.
+        self._write_resolved_config()
 
         # Plan goes to file/audit; the presenter shows headers visually.
         logger.debug("Plan: %s", " -> ".join(plan))
+
+        if prepared is not None and not _same_directory(
+                prepared, self.output_dir / "setup"):
+            # Recorded as this run's setup, so the manifest names the system
+            # that was simulated and readers of the setup record can find it.
+            now = datetime.now(timezone.utc).isoformat()
+            self.results.append(PhaseResult(
+                name="setup", status="skipped", output_dir=prepared,
+                started_at=now, finished_at=now,
+                message=(f"Not run here: the system simulated was prepared "
+                         f"in {prepared}, which `setup_from` names."),
+                taken_from=str(prepared),
+            ))
+
+        # Before the expensive part, not after. The setup phase says these
+        # things too, and by then the person who would have changed
+        # something has walked away -- on a cluster, gone home. Said here
+        # they are still choices.
+        self._say_what_is_worth_knowing(merged_options)
         for phase in plan:
             self._mark_dashboard_phase_start(
                 dashboard_writer, phase, merged_options.get(phase, {})
@@ -335,25 +695,38 @@ class FastMDXplora:
             self._presenter.phase_start(phase)
             result = self._run_phase(phase, merged_options.get(phase, {}))
             self.results.append(result)
-            self._presenter.phase_end(phase, status=result.status)
-            self._mark_dashboard_phase_end(dashboard_writer, phase, result)
+            self._presenter.phase_end(phase, **_how_it_ended(result))
+            self._mark_dashboard_phase_end(dashboard_writer, phase, result,
+                                           merged_options.get(phase, {}))
             if result.status == "error":
                 logger.error("Phase '%s' failed: %s", phase, result.message)
                 break
 
         if dashboard_writer is not None:
             failed = next((item for item in self.results if item.status == "error"), None)
+            # A stop is not a failure: the page says where it stopped and
+            # offers to carry it on, as the study's records do.
+            ended = ("stopped" if _was_a_stop(failed) else "failed") if failed else "completed"
             dashboard_writer.write_status(
-                status="failed" if failed else "completed",
+                status=ended,
                 latest_error=failed.message if failed else None,
             )
             dashboard_writer.event(
-                "FastMDXplora workflow failed" if failed else "FastMDXplora workflow completed",
-                level="error" if failed else "info",
+                {"stopped": "FastMDXplora exploration stopped",
+                 "failed": "FastMDXplora exploration failed"}.get(
+                    ended, "FastMDXplora exploration completed"),
+                level="error" if ended == "failed" else "info",
             )
 
         self._write_manifest()
         self._write_resolved_config()
+        # Only now can the bundle hold them. It is built during the report
+        # phase, and these two are written once every phase has finished, so
+        # the archive went out with the outputs and without the record of what
+        # produced them or the file that reproduces it -- a recipient got 13 MB
+        # of results and no way to trace them. The bundle is refreshed rather
+        # than rebuilt: everything else in it is already correct.
+        self._add_run_record_to_bundle()
         self._presenter.done()
 
         # Wrap the phase results into a single RunResult (a study of one).
@@ -381,6 +754,9 @@ class FastMDXplora:
         exclude: list[str] | None,
         report: bool,
         dry_run: bool = False,
+        force: bool = False,
+        rerun_windows: list[int] | None = None,
+        keep_previous: bool = False,
     ) -> list[RunResult]:
         """Run a config-driven study through the internal batch machinery.
 
@@ -389,24 +765,38 @@ class FastMDXplora:
         is private.
         """
         from fastmdxplora.batch import BatchExplorer
+        from fastmdxplora.simulation.resume import study_to_continue
+
+        if self._config_data is not None:
+            config = self._config_data
+        else:
+            from fastmdxplora.config import load_config_file
+
+            config = load_config_file(self._config_path)
+        continued = study_to_continue(config)
+        if continued is not None:
+            return self._continue_study(continued, config, dry_run=dry_run)
 
         batch = BatchExplorer(
             config=self._config_path,
             config_data=self._config_data,
             output_dir=self._deferred_output_dir,
             verbose=self._deferred_verbose,
+            force=force,
+            **({"rerun_windows": rerun_windows} if rerun_windows else {}),
+            **({"keep_previous": True} if keep_previous else {}),
         )
         # explore()-level phase overrides win over the config file.
         if include is not None:
-            batch._raw["include"] = include
-            batch._raw["exclude"] = None
+            batch._raw["include_phase"] = include
+            batch._raw["exclude_phase"] = None
         elif exclude is not None:
-            batch._raw["exclude"] = exclude
-            batch._raw["include"] = None
+            batch._raw["exclude_phase"] = exclude
+            batch._raw["include_phase"] = None
         if not report:
-            existing = batch._raw.get("exclude") or []
-            if "report" not in existing and not batch._raw.get("include"):
-                batch._raw["exclude"] = [*existing, "report"]
+            existing = batch._raw.get("exclude_phase") or []
+            if "report" not in existing and not batch._raw.get("include_phase"):
+                batch._raw["exclude_phase"] = [*existing, "report"]
 
         if dry_run:
             run_results = batch.dry_run()
@@ -420,22 +810,91 @@ class FastMDXplora:
         self.results = run_results
         return run_results
 
+    def _continue_study(self, study: Path, config: dict[str, Any], *,
+                        dry_run: bool = False) -> list[RunResult]:
+        """Extend a study in place: its next segment, the join, and the
+        analyses and report over the whole, as ``fastmdx explore`` does.
+
+        `simulation.resume_from` naming a study was continued only by the
+        command line. From Python the same config reached the batch layer,
+        which read the study directory as a checkpoint to start a new,
+        separate run from, or refused it for naming no system. The lengths
+        mean what they mean there: `duration_ns` the total production the
+        study should end with, `extra_ns` an amount more.
+        """
+        from fastmdxplora.simulation.resume import extend_study, extension_of
+
+        simulation = dict(config.get("simulation") or {})
+        total, more = simulation.get("duration_ns"), simulation.get("extra_ns")
+        root = study.resolve()
+        self.output_dir = root
+        manifest = {}
+        try:
+            manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        system = str(manifest.get("system") or root.name)
+        if dry_run:
+            plan = extension_of(root, total_ns=total, more_ns=more)
+            result = RunResult(
+                run_id="s1", system=system, output_dir=root,
+                status="planned" if plan.possible else "error",
+                message=(f"Would extend {root.name}: {plan.as_text()}"
+                         if plan.possible else str(plan.refusal)))
+            self.results = [result]
+            return self.results
+        answer = extend_study(root, total_ns=total, more_ns=more)
+        if not answer.get("ok"):
+            result = RunResult(run_id="s1", system=system, status="error",
+                               output_dir=root, message=str(answer.get("error")),
+                               error_type=str(answer.get("stage") or "") or None)
+        else:
+            joined = answer.get("joined") or {}
+            said = (f"Ran {Path(answer['segment']).name} and joined segments "
+                    f"{joined.get('segments') or '?'}.")
+            if answer.get("analysed"):
+                said += f" Analyses and report rerun over {answer['trajectory']}."
+            result = RunResult(run_id="s1", system=system, status="ok",
+                               output_dir=root, message=said,
+                               phases=_phases_recorded_in(root))
+        self.results = [result]
+        return self.results
+
     # Convenience: per-phase entry points (also called by the CLI)
-    def setup(self, **kwargs: Any) -> PhaseResult:
+    @_logging_to_its_folder
+    def setup(self, **kwargs: Unpack[SetupSettings]) -> PhaseResult:
         """Run only the setup phase."""
-        return self._run_phase("setup", kwargs)
+        return self._run_phase("setup", self._validated("setup", kwargs))
 
-    def simulate(self, **kwargs: Any) -> PhaseResult:
+    @_logging_to_its_folder
+    def simulate(self, **kwargs: Unpack[SimulateSettings]) -> PhaseResult:
         """Run only the simulation phase."""
-        return self._run_phase("simulation", kwargs)
+        return self._run_phase("simulation", self._validated("simulation", kwargs))
 
-    def analyze(self, **kwargs: Any) -> PhaseResult:
+    @_logging_to_its_folder
+    def analyze(self, **kwargs: Unpack[AnalyzeSettings]) -> PhaseResult:
         """Run only the analysis phase."""
-        return self._run_phase("analysis", kwargs)
+        return self._run_phase("analysis", self._validated("analysis", kwargs))
 
-    def report(self, **kwargs: Any) -> PhaseResult:
+    @_logging_to_its_folder
+    def report(self, **kwargs: Unpack[ReportSettings]) -> PhaseResult:
         """Run only the report phase."""
-        return self._run_phase("report", kwargs)
+        return self._run_phase("report", self._validated("report", kwargs))
+
+    def _validated(self, phase: str, settings: dict[str, Any]) -> dict[str, Any]:
+        """The settings one phase is asked to run with, through the validator.
+
+        Running one phase -- ``simulate(temperature_K=...)`` here, ``fastmdx
+        simulate`` on the command line -- passed its settings straight to
+        the phase. A misspelled ``duraton_ns`` and a temperature of -50 K
+        were both taken, where a configuration holding them is refused.
+        """
+        if settings:
+            from fastmdxplora.config.loader import validate_config
+
+            validate_config({"systems": [{"system": str(self.system)}], phase: dict(settings)},
+                            require_systems=True)
+        return settings
 
     def compare(self, *, output_dir: str | os.PathLike | None = None) -> Path | None:
         """(Re)build the cross-run comparison report for a multi-run study.
@@ -464,10 +923,10 @@ class FastMDXplora:
             self, "output_dir", None
         )
         if target is None:
-            raise ValueError(
+            raise StudyError(
                 "compare() needs an output directory — pass output_dir=, or "
                 "call it after explore() so the run's output is known."
-            )
+            , code="config.option.missing_companion")
         return build_comparison_report(target)
 
     # ------------------------------------------------------------------
@@ -476,6 +935,7 @@ class FastMDXplora:
     def _dashboard_writer(
         self,
         merged_options: dict[str, dict[str, Any]] | None = None,
+        plan: list[str] | None = None,
     ):
         """Return the project-level telemetry writer when a dashboard is active."""
 
@@ -499,20 +959,43 @@ class FastMDXplora:
             except (OSError, RuntimeError):
                 dashboard_matches_run = False
 
+        # Resolved the way the simulation runner resolves it, through the
+        # schema, rather than by reading the config dict directly. Merged
+        # options carry only what a config states, so a run leaving
+        # `live_telemetry` at its default got telemetry from the runner and no
+        # project-level writer here -- and this writer is the only thing that
+        # marks the setup phase, marks analysis and report, and records that
+        # the run finished. Without it a completed run described itself as
+        # running with stale telemetry, and Setup never lit on the timeline.
+        from fastmdxplora.config.schema import PHASE_SCHEMAS
+
+        field = PHASE_SCHEMAS.get("simulation", {}).get("live_telemetry")
+        default = bool(getattr(field, "default", False))
+        # Telemetry lives under `simulation/`, so a run that does not
+        # simulate should not create that folder or claim to have recorded
+        # anything. An analysis-only run watched from the browser still gets a
+        # writer, because then somebody is reading it.
+        simulates = plan is None or "simulation" in plan
         active = bool(
-            simulation_options.get("live_telemetry")
+            (simulation_options.get("live_telemetry", default) and simulates)
             or dashboard_matches_run
         )
 
         if not active:
             return None
+        # Analysed or reported again: the record is the simulation's, and
+        # writing this run's phases into it called every stage before them
+        # skipped, its time the hours since the run began and its date
+        # today's. Only the phases run now are marked in it.
+        phases_only = not simulates and _a_simulation_recorded(self.output_dir)
 
         try:
-            from fastmdxplora.live.telemetry import TelemetryWriter
+            from fastmdxplora.gui.telemetry import TelemetryWriter
 
             return TelemetryWriter(
                 self.output_dir / "simulation",
                 enabled=True,
+                phases_only=phases_only,
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug(
@@ -557,11 +1040,16 @@ class FastMDXplora:
             return
 
         if phase == "simulation":
-            first_stage = (
-                "minimization"
-                if options.get("minimize", True)
-                else "nvt"
-            )
+            # The first stage the run takes: a piece carried on from a
+            # checkpoint neither minimises nor equilibrates, and was marked
+            # in NVT, where its record then ended.
+            first_stage = "production"
+            if options.get("minimize", True):
+                first_stage = "minimization"
+            elif options.get("nvt_steps") != 0:
+                first_stage = "nvt"
+            elif options.get("npt_steps") != 0:
+                first_stage = "npt"
             writer.mark_stage(
                 first_stage,
                 "current",
@@ -581,6 +1069,7 @@ class FastMDXplora:
         writer: Any,
         phase: str,
         result: PhaseResult,
+        options: dict[str, Any] | None = None,
     ) -> None:
         if writer is None:
             return
@@ -592,8 +1081,15 @@ class FastMDXplora:
         else:
             state = "failed"
 
+        if _was_a_stop(result):
+            # Where it stopped stays the stage it was in, so the page shows
+            # how far it got; nothing after it failed.
+            writer.write_status(status="stopped", latest_error=result.message)
+            writer.event(f"{phase.title()} phase stopped", level="warning")
+            return
+
         if phase == "simulation":
-            from fastmdxplora.live.telemetry import read_status
+            from fastmdxplora.gui.telemetry import read_status
 
             status = read_status(writer.root.parent)
             stages = (
@@ -602,27 +1098,45 @@ class FastMDXplora:
                 else {}
             )
             stages = stages if isinstance(stages, dict) else {}
-
-            for name in (
-                "minimization",
-                "nvt",
-                "npt",
-                "production",
-            ):
-                current_state = str(
-                    stages.get(name, "waiting")
-                ).lower()
-
-                if current_state in {"waiting", "current"}:
-                    writer.mark_stage(
-                        name,
-                        state,
-                        status=(
-                            "failed"
-                            if state == "failed"
-                            else "running"
-                        ),
-                    )
+            stepped = ("minimization", "nvt", "npt", "production")
+            said = {name: str(stages.get(name, "waiting")).lower() for name in stepped}
+            going = [name for name in stepped if said[name] == "current"]
+            if state == "failed" and not going and "failed" not in said.values():
+                # Failed before any stage began: where it failed is the
+                # first stage it was to take.
+                going = [name for name in stepped if said[name] == "waiting"][:1]
+            # Only the stage it was in ends as the phase did, and the record
+            # stays on it. A stage it was not to take was not completed (a
+            # piece carried on from a checkpoint read "NVT" when it ended),
+            # and one it never reached did not fail (a run that blew up in
+            # NVT read "Production failed").
+            options = options if isinstance(options, dict) else {}
+            # How long each equilibration stage runs; zero steps is a stage
+            # not taken (unset is its default length). Nothing here asks
+            # which ensemble production runs in.
+            stage_steps = {"nvt": options.get("nvt_steps"), "npt": options.get("npt_steps")}
+            not_taken = {name for name, steps in stage_steps.items() if steps == 0}
+            if options.get("minimize", True) is False:
+                not_taken.add("minimization")
+            for name in going:
+                writer.mark_stage(
+                    name,
+                    state,
+                    status="failed" if state == "failed" else "running",
+                    **({"latest_error": result.message}
+                       if state == "failed" and not status.get("latest_error") else {}),
+                )
+            if state == "completed":
+                never = [name for name in stepped if said[name] == "waiting"
+                         and name not in going]
+                if never:
+                    # A run without live telemetry marks no stage of its
+                    # own: what it was to take, it took.
+                    now = read_status(writer.root.parent).get("stage_states")
+                    merged = dict(now) if isinstance(now, dict) else dict(stages)
+                    merged.update({name: "skipped" if name in not_taken else "completed"
+                                   for name in never})
+                    writer.write_status(stage_states=merged)
         else:
             writer.mark_stage(
                 phase,
@@ -652,17 +1166,17 @@ class FastMDXplora:
         want_report: bool,
     ) -> list[str]:
         if include is not None and exclude is not None:
-            raise ValueError("Specify either `include` or `exclude`, not both.")
+            raise StudyError("Specify either `include` or `exclude`, not both.", code="config.option.conflicting")
 
         if include is not None:
             unknown = set(include) - set(PHASES)
             if unknown:
-                raise ValueError(f"Unknown phase(s): {sorted(unknown)}. Valid: {PHASES}")
+                raise StudyError(f"Unknown phase(s): {sorted(unknown)}. Valid: {PHASES}", code="config.phase.unknown")
             plan = [p for p in PHASES if p in include]
         elif exclude is not None:
             unknown = set(exclude) - set(PHASES)
             if unknown:
-                raise ValueError(f"Unknown phase(s): {sorted(unknown)}. Valid: {PHASES}")
+                raise StudyError(f"Unknown phase(s): {sorted(unknown)}. Valid: {PHASES}", code="config.phase.unknown")
             plan = [p for p in PHASES if p not in exclude]
         else:
             plan = list(PHASES)
@@ -672,6 +1186,63 @@ class FastMDXplora:
 
         return plan
 
+    def _prepared_system_named(
+        self, override: dict[str, dict[str, Any]] | None
+    ) -> Path | None:
+        """The prepared system `setup_from` names for this run, if one is there.
+
+        Resolved as the simulation phase resolves it, so the system found
+        here is the one that will be simulated. None where the setting is
+        unset or names no prepared system: then setup runs as asked, and the
+        simulation phase refuses a name that points at nothing, as before.
+        """
+        simulation = {**(self.options.get("simulation") or {}),
+                      **((override or {}).get("simulation") or {})}
+        named = simulation.get("setup_from") or simulation.get("prepared_from")
+        if not named:
+            return None
+        from fastmdxplora.simulation.pipeline import (
+            _a_prepared_system_sits_in,
+            _where_the_system_was_prepared,
+        )
+
+        where, _ = _where_the_system_was_prepared(self, named)
+        return where if _a_prepared_system_sits_in(where) else None
+
+    def _refuse_to_overwrite(self, plan: list[str], *, force: bool) -> None:
+        """Stop a second run from writing over the first one's output.
+
+        Nothing prevented it. A run started into a directory that already held
+        one overwrote the science files as it produced them, appended to the
+        metrics CSV and the event log, and merged its status forward from the
+        previous run's -- so the page showed one run's platform and step count
+        against another's charts, with the two traces drawn as one.
+
+        Only the phases this run will produce are checked, so the phase-by-
+        phase workflow still works: `analyze` into a directory holding a
+        finished `simulation` is exactly the intended use.
+        """
+        if force:
+            return
+        # One construction path defers the output directory; nothing has been
+        # written yet in that case, so there is nothing to refuse over.
+        if getattr(self, "output_dir", None) is None:
+            return
+        occupied = [
+            phase
+            for phase in plan
+            if (self.output_dir / phase).is_dir()
+            and any((self.output_dir / phase).iterdir())
+        ]
+        if not occupied:
+            return
+        raise OutputExistsError(
+            f"{self.output_dir} already holds output from "
+            f"{', '.join(occupied)}. Choose another --output directory, "
+            f"delete this one, or pass --force-overwrite to overwrite it "
+            f"(--rerun keeps what it replaces in previous/)."
+        , code="environment.path.exists")
+
     def _merge_options(
         self, override: dict[str, dict[str, Any]] | None
     ) -> dict[str, dict[str, Any]]:
@@ -679,11 +1250,114 @@ class FastMDXplora:
         if override:
             for phase, opts in override.items():
                 if phase not in PHASES:
-                    raise ValueError(
+                    raise StudyError(
                         f"Unknown phase '{phase}' in options. Valid: {PHASES}"
-                    )
+                    , code="config.phase.unknown")
                 merged[phase].update(opts)
+            # Settings given to explore() pass the validator, as those given
+            # anywhere else do. They were merged over the constructor's
+            # unchecked, so explore(options={"simulation": {"duraton_ns": 50}})
+            # ran the default duration without a word.
+            from fastmdxplora.config.loader import validate_config
+
+            validate_config({"systems": [{"system": str(self.system)}],
+                             **{phase: opts for phase, opts in merged.items() if opts}},
+                            require_systems=True)
         return merged
+
+    def _say_what_is_worth_knowing(self, options: dict[str, Any]) -> None:
+        """Warn about what this run will do, while it can still be changed.
+
+        Not a refusal, and nothing here stops a run: every case describes
+        something that runs perfectly well and produces a result worth
+        doubting. A validator answers "will this run", which is a different
+        question and already answered elsewhere.
+
+        The structure is read as text -- a couple of milliseconds, no OpenMM
+        -- so this costs nothing beside a run of any length.
+        """
+        try:
+            from fastmdxplora.advisories import advise
+            from fastmdxplora.structure_info import count_structure
+        except ImportError:  # pragma: no cover - a trimmed install
+            return
+
+        settings: dict[str, Any] = {}
+        for phase in ("setup", "simulation"):
+            block = options.get(phase)
+            if isinstance(block, dict):
+                settings.update(block)
+
+        structure: dict[str, Any] = {}
+        source = getattr(self, "system", None)
+        if source:
+            candidate = Path(str(source))
+            if candidate.is_file():
+                try:
+                    structure = dict(count_structure(candidate))
+                except Exception:  # noqa: BLE001 - a structure that will not read
+                    structure = {}
+
+        try:
+            found = advise(structure, settings)
+        except Exception:  # noqa: BLE001 - advice must never stop a run
+            return
+
+        for said in found:
+            logger.warning("%s %s %s", said.summary, said.detail, said.remedy)
+
+    @staticmethod
+    def _phase_provenance() -> dict[str, Any]:
+        """What produced a phase: version, host, and package environment."""
+        import socket
+
+        from fastmdxplora import __version__
+        from fastmdxplora.provenance import environment_record
+
+        try:
+            host = socket.gethostname()
+        except OSError:  # pragma: no cover - hostname is never load-bearing
+            host = ""
+        return {
+            "version": __version__,
+            "host": host,
+            "environment": environment_record(),
+        }
+
+    @contextmanager
+    def _marking(self, phase: str):
+        """Stamp this phase's figures if nothing checked its method.
+
+        One place rather than four, because the mark is a property of the
+        phase and not of any figure inside it. The alternative -- a `mark`
+        argument carried from here through `analyze.run`, the analysis
+        orchestrator, each `Analysis`, and on to every `save_figure` call
+        -- is five layers and ten call sites, and the parameter it would
+        arrive at has been there all along with nothing passing it.
+
+        Wrapped so a phase that cannot draw at all still runs. Matplotlib
+        is an analysis dependency, and the setup phase must not start
+        failing on an import it never needed.
+        """
+        mark = ""
+        try:
+            from fastmdxplora.marking import mark_for
+
+            mark = mark_for(
+                {**self.options, **getattr(self, "study_options", {})}, phase
+            )
+        except Exception:  # noqa: BLE001 -- a run is worth more than a stamp
+            logger.debug("Could not work out the mark for phase %s.", phase)
+        if not mark:
+            yield
+            return
+        try:
+            from fastmdxplora.analysis.plotting import marked_as
+        except Exception:  # noqa: BLE001 -- no matplotlib, no figures
+            yield
+            return
+        with marked_as(mark):
+            yield
 
     def _run_phase(self, phase: str, kwargs: dict[str, Any]) -> PhaseResult:
         phase_dir = self._phase_dirs[phase]
@@ -694,11 +1368,12 @@ class FastMDXplora:
 
         try:
             run_fn = self._resolve_phase_runner(phase)
-            artifacts = run_fn(
-                orchestrator=self,
-                output_dir=phase_dir,
-                **kwargs,
-            )
+            with self._marking(phase):
+                artifacts = run_fn(
+                    orchestrator=self,
+                    output_dir=phase_dir,
+                    **kwargs,
+                )
             finished = datetime.now(timezone.utc).isoformat()
             return PhaseResult(
                 name=phase,
@@ -708,10 +1383,45 @@ class FastMDXplora:
                 finished_at=finished,
                 message=f"Phase '{phase}' completed.",
                 artifacts=list(artifacts or []),
+                produced_by=self._phase_provenance(),
+            )
+        except (RunStopped, KeyboardInterrupt) as stopped:
+            # Past every handler that would have made it something else. A
+            # second Ctrl+C (or one outside production) arrives as a
+            # KeyboardInterrupt and went past this too: the study wrote no
+            # end, its record of its process was taken away as it exited,
+            # and it read Running until a day of silence. It is the same
+            # stop, recorded as one, so `fastmdx resume` carries it on.
+            error = (stopped.as_error() if isinstance(stopped, RunStopped)
+                     else _stopped_by_ctrl_c(phase))
+            return PhaseResult(
+                name=phase,
+                status="error",
+                output_dir=phase_dir,
+                started_at=started,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                message=str(error),
+                refusal=refusal_of(error).as_dict(),
+                produced_by=self._phase_provenance(),
+            )
+        except PhaseSkipped as skipped:
+            return PhaseResult(
+                name=phase,
+                status="skipped",
+                output_dir=phase_dir,
+                started_at=started,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                message=skipped.reason,
+                artifacts=skipped.artifacts,
+                produced_by=self._phase_provenance(),
             )
         except Exception as exc:  # noqa: BLE001 -- we log and record
             finished = datetime.now(timezone.utc).isoformat()
-            logger.exception("Phase '%s' raised an exception", phase)
+            # The reason is reported once, by whoever is driving: the explore
+            # loop below, or the per-phase command. Logging it here as well
+            # produced two lines, the first of which said nothing useful.
+            # The traceback stays available under --verbose.
+            logger.debug("Phase '%s' raised an exception", phase, exc_info=True)
             return PhaseResult(
                 name=phase,
                 status="error",
@@ -719,6 +1429,13 @@ class FastMDXplora:
                 started_at=started,
                 finished_at=finished,
                 message=str(exc),
+                # Total by construction: an exception from a raise site that
+                # has not been coded yet, or from a dependency, comes back
+                # as `unclassified` carrying its own message. So the field
+                # is always there and its resolution improves as the
+                # migration proceeds, rather than appearing and disappearing.
+                refusal=refusal_of(exc).as_dict(),
+                produced_by=self._phase_provenance(),
             )
 
     @staticmethod
@@ -745,26 +1462,199 @@ class FastMDXplora:
             from fastmdxplora.report import run
 
             return run
-        raise ValueError(f"Unknown phase: {phase}")
+        raise StudyError(f"Unknown phase: {phase}", code="config.phase.unknown")
+
+    def _add_run_record_to_bundle(self) -> None:
+        """Put the manifest and the resolved config into the bundle.
+
+        Quietly: a bundle that could not be updated is not a reason to fail a
+        study that has otherwise finished, and the files themselves are on
+        disk beside it either way.
+        """
+        import zipfile
+
+        bundle = self.output_dir / "report" / "project_bundle.zip"
+        if not bundle.is_file():
+            return
+
+        wanted = [name for name in ("manifest.json", "resolved_config.yml")
+                  if (self.output_dir / name).is_file()]
+        if not wanted:
+            return
+
+        try:
+            with zipfile.ZipFile(bundle, "a", zipfile.ZIP_DEFLATED) as archive:
+                held = set(archive.namelist())
+                for name in wanted:
+                    if name not in held:
+                        archive.write(self.output_dir / name, name)
+        except (OSError, zipfile.BadZipFile) as exc:  # pragma: no cover
+            logger.warning("Could not add the run record to the bundle: %s", exc)
 
     def _write_manifest(self) -> None:
         """Write a single JSON manifest summarizing this session."""
         from fastmdxplora import __citation__, __doi__, __version__
 
+        from fastmdxplora.provenance import (
+            environment_record,
+            source_provenance,
+        )
+
+        manifest_path = self.output_dir / "manifest.json"
+        previous: dict[str, Any] = {}
+        if manifest_path.is_file():
+            try:
+                with manifest_path.open(encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+                if isinstance(loaded, dict):
+                    previous = loaded
+            except (OSError, json.JSONDecodeError):
+                # A malformed or unreadable previous manifest must not stop
+                # the phase from recording its own result.
+                previous = {}
+
+        phase_records: dict[str, dict[str, Any]] = {}
+        phase_order: list[str] = []
+        previous_phases = previous.get("phases", [])
+        if not isinstance(previous_phases, list):
+            previous_phases = []
+        for record in previous_phases:
+            if not isinstance(record, dict) or not record.get("name"):
+                continue
+            name = str(record["name"])
+            phase_records[name] = record
+            if name not in phase_order:
+                phase_order.append(name)
+        # A phase carried over from a manifest written before phases recorded
+        # `produced_by` names no version, and the top-level `version` that
+        # did is about to be replaced by this session's. Re-analysing a 2.5.4
+        # run under 2.5.7 then left a manifest saying 2.5.7 with nothing
+        # anywhere saying the trajectory came from 2.5.4. The version that
+        # wrote the manifest the phase was in is written onto it instead,
+        # marked inferred: the phase was produced by that version or an
+        # earlier one, which is less than a record and more than nothing.
+        previous_version = previous.get("version")
+        if previous_version:
+            for record in phase_records.values():
+                if not isinstance(record.get("produced_by"), dict):
+                    record["produced_by"] = {"version": str(previous_version),
+                                             "inferred": True}
+        current_phases = [result.to_dict() for result in self.results]
+        for record in current_phases:
+            name = str(record["name"])
+            if name not in phase_records:
+                phase_order.append(name)
+            phase_records[name] = record
+
+        previous_options = previous.get("options", {})
+        options = dict(previous_options) if isinstance(previous_options, dict) else {}
+        options.update(self.options)
+
+        # The top-level `version`, `environment` and `source` below describe
+        # the session writing this file. Once phases from earlier sessions
+        # are preserved -- which is the whole point of the merge above --
+        # those fields no longer describe every phase beneath them. Each
+        # phase now carries its own `produced_by`, and where more than one
+        # version appears the manifest says so here, so that a reader who
+        # checks only the top of the file is not told a single version
+        # produced the lot.
+        # What earlier sessions already recorded, then the phases, then this
+        # one, so a version is not lost when the phase it produced is re-run.
+        versions_seen: list[str] = []
+        earlier = previous.get("versions_seen")
+        for version in [*(earlier if isinstance(earlier, list) else []),
+                        previous_version]:
+            if version and str(version) not in versions_seen:
+                versions_seen.append(str(version))
+        for name in phase_order:
+            produced = phase_records[name].get("produced_by")
+            version = (produced or {}).get("version") if isinstance(produced, dict) else None
+            if version and version not in versions_seen:
+                versions_seen.append(str(version))
+        if __version__ not in versions_seen:
+            versions_seen.append(__version__)
+
         manifest = {
             "tool": "FastMDXplora",
             "version": __version__,
+            # Where the package was imported from a checkout, which commit.
+            # The version string is written at install time, so an editable
+            # install carries whatever it was when pip was last run: a real
+            # study came back stamped 2.3.0 for a run using a feature 2.3.0
+            # did not have. Absent for an installed copy, where the version
+            # is the whole answer because the distribution was built from a
+            # tag.
+            "source": source_provenance(),
+            # The stack that produced the numbers, not merely the one that
+            # could have. Without it a result that changes between machines
+            # can be demonstrated and not explained.
+            "environment": environment_record(),
             "doi": __doi__,
             "citation": __citation__,
             "system": self.system,
             "output_dir": str(self.output_dir),
-            "phases": [r.to_dict() for r in self.results],
-            "options": self.options,
+            "phases": [phase_records[name] for name in phase_order],
+            "options": options,
         }
-        manifest_path = self.output_dir / "manifest.json"
+        # How each phase was written. Per phase rather than one summary,
+        # because "partly unvalidated" tells a reader to distrust the whole
+        # study, and the point of the per-phase setting is that they need
+        # only distrust some of it. Omitted entirely for a study a person
+        # wrote, which is most of them and every one before this existed.
+        try:
+            from fastmdxplora.config.agent_modes import resolve_agent_modes
+
+            # `options` is per-phase; the study-level value sits beside it.
+            # Passing only the phase blocks left `study` permanently None,
+            # so a config saying `agent: assisted` at the top and nothing
+            # per phase recorded no `agent` block at all -- and one that
+            # also said `setup: {agent: assisted}` recorded that phase as
+            # *departing* from a study value the resolver could not see.
+            modes = resolve_agent_modes({**options, **self.study_options})
+            # Which AI model, too: `agent_model` was kept in the resolved
+            # config and not here, so the manifest said an AI model was
+            # involved and not which one.
+            model = self.study_options.get("agent_model")
+            if modes.study is not None or modes.departures or model:
+                record = (modes.as_record()
+                          if modes.study is not None or modes.departures else {})
+                if model:
+                    record["model"] = str(model)
+                manifest["agent"] = record
+        except Exception:  # noqa: BLE001 - a manifest is worth writing anyway
+            logger.debug("Could not record how this study was written.")
+        if len(versions_seen) > 1:
+            manifest["versions_seen"] = versions_seen
+            manifest["version_note"] = (
+                "This manifest holds phases produced by more than one "
+                "version. `version` above is the session that wrote the "
+                "file; each phase records its own under `produced_by`."
+            )
         with manifest_path.open("w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2)
         logger.debug("Wrote manifest: %s", manifest_path)
+
+    def _recorded_phase_selection(self, plan: "list[str] | None" = None
+                                  ) -> "tuple[Any, Any] | None":
+        """The phases the study's resolved config already records, where
+        they include the simulation, with the phases run now (``plan``)
+        added; or None. A study recorded as `[setup, simulation]` and then
+        analysed was kept so, its analysis left out of its record."""
+        import yaml
+
+        try:
+            data = yaml.safe_load((self.output_dir / "resolved_config.yml").read_text(
+                encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        include, exclude = data.get("include_phase"), data.get("exclude_phase")
+        if isinstance(include, list) and include and "simulation" not in include:
+            return None
+        if isinstance(exclude, list) and "simulation" in exclude:
+            return None
+        return _with_the_phases_run(include, exclude, plan)
 
     def _write_resolved_config(self) -> None:
         """Write the fully-merged configuration for reproducibility.
@@ -775,14 +1665,27 @@ class FastMDXplora:
         reproduces the run.
         """
         from fastmdxplora.config import write_resolved_config
+        from fastmdxplora.utils.presenter import get_presenter
 
+        recorded = getattr(self, "_recorded_phases", None)
+        include = getattr(self, "_resolved_include", None) or self._config_include
+        exclude = getattr(self, "_resolved_exclude", None) or self._config_exclude
+        if recorded is not None:
+            include, exclude = recorded
         resolved = {
             "system": self.system,
+            "system_id": getattr(self, "_system_id", None),
             "output": str(self.output_dir),
             "verbose": self.verbose,
-            "include": getattr(self, "_resolved_include", None) or self._config_include,
-            "exclude": getattr(self, "_resolved_exclude", None) or self._config_exclude,
+            "explain": bool(getattr(get_presenter(), "explain", True)),
+            "include_phase": include,
+            "exclude_phase": exclude,
             "options": getattr(self, "_resolved_options", None) or self.options,
+            # How the study was written travels with it. The config that
+            # comes back out has to say the same thing the one that went in
+            # did, or re-running an agent-written study produces a record
+            # claiming a person wrote it.
+            **dict(getattr(self, "study_options", {}) or {}),
         }
         try:
             path = write_resolved_config(resolved, self.output_dir)
@@ -814,6 +1717,31 @@ class FastMDXplora:
         if _console_handler is not None:
             _console_handler.setLevel(console_level)
 
+    def _its_log(self) -> Path | None:
+        return (self.output_dir / "fastmdxplora.log"
+                if getattr(self, "output_dir", None) is not None else None)
+
+    def _attach_its_log(self) -> None:
+        """Attached for the outermost call, unless still attached from
+        construction or an enclosing call."""
+        from fastmdxplora.utils.logging import attach_file_logger, file_logger_path
+
+        self._log_depth = getattr(self, "_log_depth", 0) + 1
+        path = self._its_log()
+        if self._log_depth > 1 or path is None:
+            return
+        attached = file_logger_path()
+        if attached is None or attached.resolve() != path.resolve():
+            attach_file_logger(path, level=logging.DEBUG)
+
+    def _detach_its_log(self) -> None:
+        from fastmdxplora.utils.logging import detach_file_logger
+
+        self._log_depth = getattr(self, "_log_depth", 1) - 1
+        path = self._its_log()
+        if self._log_depth == 0 and path is not None:
+            detach_file_logger(path)
+
     def _configure_presenter(self):
         """Create the session presenter for structural output.
 
@@ -821,7 +1749,188 @@ class FastMDXplora:
         internally by :class:`SessionPresenter`) or when stdout is not a
         TTY (handled by color auto-detection). Users wanting different
         behaviour can replace ``self._presenter`` after construction.
-        """
-        from fastmdxplora.utils.presenter import SessionPresenter
 
-        return SessionPresenter()
+        This returns the process-wide presenter rather than a new instance.
+        The startup banner is shown once per presenter, so constructing a
+        second one made it print twice: once from the CLI and again when the
+        orchestrator started a study.
+        """
+        from fastmdxplora.utils.presenter import get_presenter
+
+        return get_presenter()
+
+
+def _same_directory(first: Path, second: Path) -> bool:
+    try:
+        return Path(first).resolve() == Path(second).resolve()
+    except OSError:
+        return False
+
+
+def _with_the_phases_run(include: Any, exclude: Any, plan: "list[str] | None") -> tuple[Any, Any]:
+    """A recorded phase selection with the phases run now added."""
+    from fastmdxplora.config.schema import PHASE_SCHEMAS
+
+    now = [str(p) for p in plan or []]
+    if isinstance(include, list) and include:
+        include = [p for p in PHASE_SCHEMAS if p in {str(x) for x in include} | set(now)]
+    if isinstance(exclude, list) and exclude:
+        exclude = [p for p in exclude if str(p) not in now] or None
+    return include, exclude
+
+
+def _a_simulation_recorded(output_dir: Path) -> bool:
+    """Whether the study's live record is of a simulation it ran: a stage
+    of one was taken, or the record counts its steps."""
+    import json
+
+    try:
+        record = json.loads((Path(output_dir) / "simulation" / "live_status.json")
+                            .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(record, dict):
+        return False
+    states = record.get("stage_states") if isinstance(record.get("stage_states"), dict) else {}
+    taken = any(str(states.get(name) or "").lower() not in ("", "waiting", "skipped")
+                for name in ("minimization", "nvt", "npt", "production"))
+    return taken or bool(record.get("total_planned_steps"))
+
+
+RUN_PROCESS_FILE = ".fastmdxplora_run.json"
+
+
+def this_machine() -> dict[str, str]:
+    """What a run record says about where it was written: the host's name
+    and, on Linux, which boot and which process namespace. A process number
+    means something only on the machine, in the boot and in the namespace
+    (a container's own) that gave it out."""
+    import os
+    import socket
+
+    try:
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        boot = ""
+    try:
+        space = os.readlink("/proc/self/ns/pid")
+    except (OSError, AttributeError):
+        space = ""
+    return {"host": socket.gethostname(), "boot": boot, "pidns": space}
+
+
+def record_is_from_elsewhere(record: dict) -> bool:
+    """Whether a run record was written on another machine, or before this
+    one last booted, so the process it names is not one here.
+
+    A container, a cloud GPU's sandbox and a cluster node each have a name
+    of their own, and each starts numbering processes again from one: a
+    study carried on in a new one would find its old record naming a
+    process number that, there, belongs to someone else. Records written
+    before hosts were recorded say nothing either way.
+    """
+    here = this_machine()
+    for key in ("host", "boot"):
+        there = record.get(key)
+        if isinstance(there, str) and there and here.get(key) and there != here[key]:
+            return True
+    return False
+
+
+def _stopped_by_ctrl_c(phase: str) -> StudyError:
+    """A phase ended by Ctrl+C, as the retryable stop it is."""
+    from fastmdxplora.simulation.runner import STOPPED_CODE
+
+    return StudyError(
+        f"The run was stopped by Ctrl+C in its {phase} phase, before it "
+        "finished; `fastmdx resume` carries it on.",
+        code=STOPPED_CODE, signal="SIGINT", checkpoint_on_frame=False)
+
+
+def _was_a_stop(result: Any) -> bool:
+    """Whether a phase ended because it was asked to stop."""
+    from fastmdxplora.simulation.runner import STOPPED_CODE
+
+    refusal = getattr(result, "refusal", None)
+    return (getattr(result, "status", None) == "error" and isinstance(refusal, dict)
+            and refusal.get("code") == STOPPED_CODE)
+
+
+def _record_run_process(output_dir: Path) -> None:
+    import atexit
+    import json
+    import os
+    import sys
+
+    path = Path(output_dir) / RUN_PROCESS_FILE
+    try:
+        path.write_text(json.dumps({
+            "pid": os.getpid(),
+            "argv": list(sys.argv),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            **this_machine(),
+        }), encoding="utf-8")
+    except OSError:
+        return
+
+    def _remove(p: Path = path, pid: int = os.getpid()) -> None:
+        # Only this process's record: a child that inherited this hook must not
+        # remove the parent's.
+        try:
+            if os.getpid() == pid and p.is_file():
+                p.unlink()
+        except OSError:
+            pass
+
+    atexit.register(_remove)
+
+
+def _phase_selection(
+    include_phase: list[str] | None,
+    exclude_phase: list[str] | None,
+    include: list[str] | None,
+    exclude: list[str] | None,
+) -> tuple[list[str] | None, list[str] | None]:
+    """Which phases to run, from either spelling of the argument.
+
+    `include_phase` and `exclude_phase` are the names the config, the
+    command line and the GUI use, so they are the Python API's names too:
+    somebody who learns one door has learnt all four. `include` and
+    `exclude` still work, the way they do in a config and on the command
+    line, and go in the release that removes every earlier spelling at
+    once.
+
+    Given both spellings with different values, this refuses -- with the
+    same named refusal the config gives for two conflicting settings --
+    rather than picking one. A call that says two things does not say which it meant,
+    and a guess here decides whether a simulation runs.
+    """
+    for current, earlier, name in ((include_phase, include, "include_phase"),
+                                   (exclude_phase, exclude, "exclude_phase")):
+        if (current is not None and earlier is not None
+                and list(current) != list(earlier)):
+            from fastmdxplora.config.loader import ConfigError
+
+            # A named refusal, like every other in the package, so a caller
+            # can tell this one from the rest without reading the sentence.
+            raise ConfigError(
+                f"`{name}` and its earlier spelling `{name[:-6]}` were both "
+                f"given, with different values ({list(current)} and "
+                f"{list(earlier)}). Give one; `{name}` is the current name.",
+                code="config.option.conflicting",
+                options=[name, name[:-6]], context="explore")
+    return (include_phase if include_phase is not None else include,
+            exclude_phase if exclude_phase is not None else exclude)
+
+
+def _document_the_phase_methods() -> None:
+    """Each phase method's docstring, from the schema: every setting it takes,
+    with its type, bounds, default and help, as ``fastmdx <phase> --help``
+    shows them. It named none, so help() said nothing an editor could use."""
+    from fastmdxplora.config.phase_settings import PHASES, docstring
+
+    for method in PHASES:
+        getattr(FastMDXplora, method).__doc__ = docstring(method)
+
+
+_document_the_phase_methods()

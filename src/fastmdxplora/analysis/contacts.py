@@ -11,10 +11,14 @@ ligand over a trajectory:
    "interaction fingerprint": the residues with high frequency line the pocket.
 
 Contacts are defined at the residue level: a residue is "in contact" in a
-frame if any of its atoms is within ``cutoff`` nm of any ligand atom.
+frame if any of its heavy atoms is within ``cutoff`` nm of any heavy atom of
+the ligand. Hydrogens are left out on both sides, which is what a heavy-atom
+threshold such as 0.4 nm is defined against: counted with hydrogens, a
+leucine whose nearest carbon was 0.48 nm from the ligand was in contact
+because two hydrogens pointing at each other were 0.22 nm apart.
 
-Outputs ``contacts.dat`` (per-frame count time series) and, alongside it,
-``contacts_per_residue.csv`` (residue, frequency). The figure shows the
+Outputs ``pl_contacts.dat`` (per-frame count time series) and, alongside it,
+``pl_contacts_per_residue.csv`` (residue, frequency). The figure shows the
 per-residue frequency fingerprint (the more informative of the two).
 """
 
@@ -28,8 +32,10 @@ import mdtraj as md
 import numpy as np
 import pandas as pd
 
+from fastmdxplora.analysis.plotting import colour
 from fastmdxplora.analysis.base import Analysis
 from fastmdxplora.analysis.orchestrator import register_analysis
+from fastmdxplora.refusals import StudyError
 
 
 class Contacts(Analysis):
@@ -43,16 +49,32 @@ class Contacts(Analysis):
     cutoff : float, default 0.4
         Contact distance cutoff in nm (0.4 nm = 4 Angstrom, a standard
         heavy-atom contact threshold).
+    periodic : bool, default True
+        Measure distances across the periodic boundary when the trajectory
+        carries a unit cell. A solvated trajectory is not always imaged, and
+        a molecule split across the boundary then looks far from everything it
+        is actually touching -- a bound ligand can report no contacts at all.
+        Where there is no unit cell this makes no difference. False measures
+        plain distances regardless.
     protein_selection : str, default "protein"
-        Selection for the receptor side of the contact.
+        The other side of the interaction. Usually the whole protein, and
+        worth changing in three cases: a complex where only one chain matters
+        (``"protein and chainid 0"``), a domain rather than the whole fold
+        (``"protein and resid 40 to 180"``), or a receptor that is not a
+        protein at all -- ``"nucleic"`` for a ligand bound to DNA or RNA,
+        which is a real and common case that the default name does not
+        suggest.
     **kwargs
         Standard base-class options.
     """
 
-    name = "contacts"
+    name = "pl_contacts"
     description = "Protein-ligand contacts (count + per-residue frequency)"
     requires_ligand = True
     default_selection = None
+    #: This works out its own atoms, so a general selection has nothing to
+    #: apply to.
+    honours_selection = False
 
     def __init__(
         self,
@@ -60,18 +82,21 @@ class Contacts(Analysis):
         ligand_resname: str | None = None,
         cutoff: float = 0.4,
         protein_selection: str = "protein",
+        periodic: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         if not ligand_resname:
-            raise ValueError(
+            raise StudyError(
                 "Contacts requires `ligand_resname`; it applies only to "
                 "protein-ligand complexes."
-            )
+            , code="analysis.option.missing_companion")
         self.ligand_resname = str(ligand_resname)
         self.cutoff = float(cutoff)
         self.protein_selection = str(protein_selection)
+        self.periodic: bool = bool(periodic)
         self.options.update(
+            periodic=self.periodic,
             ligand_resname=self.ligand_resname,
             cutoff=self.cutoff,
             protein_selection=self.protein_selection,
@@ -86,25 +111,27 @@ class Contacts(Analysis):
         pandas.DataFrame
             Columns ``frame, n_contacts`` (one row per frame).
         """
-        ligand_idx = traj.topology.select(f"resname {self.ligand_resname}")
+        ligand_idx = traj.topology.select(
+            f"resname {self.ligand_resname} and not element H")
         if len(ligand_idx) == 0:
-            raise ValueError(
-                f"No atoms matched ligand resname {self.ligand_resname!r}; "
+            raise StudyError(
+                f"No heavy atoms matched ligand resname {self.ligand_resname!r}; "
                 f"cannot compute protein-ligand contacts."
-            )
-        protein_idx = traj.topology.select(self.protein_selection)
+            , code="analysis.selection.empty")
+        protein_idx = traj.topology.select(
+            f"({self.protein_selection}) and not element H")
         if len(protein_idx) == 0:
-            raise ValueError(
+            raise StudyError(
                 f"Protein selection {self.protein_selection!r} matched zero "
                 f"atoms; cannot compute protein-ligand contacts."
-            )
+            , code="analysis.selection.arity")
 
         # Per-frame: protein atoms within cutoff of any ligand atom.
         # compute_neighbors returns a list (one array per frame) of haystack
         # atom indices near the query set.
         neighbor_lists = md.compute_neighbors(
             traj, self.cutoff, ligand_idx, haystack_indices=protein_idx,
-            periodic=False,
+            periodic=self.periodic,
         )
 
         # Map each protein atom to its residue, then reduce per frame to the
@@ -125,13 +152,16 @@ class Contacts(Analysis):
 
         # Build the per-residue frequency table (only residues that ever
         # contacted the ligand), sorted by frequency descending.
+        from fastmdxplora.analysis.residues import named, several_chains
+
+        # By chain as well where the protein has several: on a tetramer the
+        # same residue of two copies can hold one ligand, and "SER45" twice
+        # in the table said nothing about which.
+        qualified = several_chains(traj.topology)
         rows = []
         for ridx, n in res_contact_frames.items():
             res = traj.topology.residue(int(ridx))
-            try:
-                label = f"{res.name}{res.resSeq}"
-            except (AttributeError, TypeError):
-                label = str(res)
+            label = named(res, qualified=qualified)
             rows.append((label, int(res.resSeq) if hasattr(res, "resSeq") else ridx,
                          n / n_frames))
         rows.sort(key=lambda r: r[2], reverse=True)
@@ -149,7 +179,10 @@ class Contacts(Analysis):
         path.parent.mkdir(parents=True, exist_ok=True)
         result.to_csv(path, index=False)
         # Write the per-residue fingerprint alongside the main per-frame file.
-        per_res_path = path.parent / "contacts_per_residue.csv"
+        # Named from the analysis rather than written out, so a rename moves
+        # this with it instead of leaving a file called after the old name in
+        # a directory called after the new one.
+        per_res_path = path.parent / f"{self.name}_per_residue.csv"
         self._per_residue.to_csv(per_res_path, index=False)
         return path
 
@@ -162,11 +195,24 @@ class Contacts(Analysis):
             return
         top = pr.head(20)  # avoid an unreadable axis for large pockets
         y = np.arange(len(top))
-        ax.barh(y, top["contact_frequency"].to_numpy(), color="#3a7ca5")
+        ax.barh(y, top["contact_frequency"].to_numpy(), color=colour("SERIES"))
         ax.set_yticks(y)
         ax.set_yticklabels(top["residue"].tolist(), fontsize=8)
         ax.invert_yaxis()  # highest frequency at top
         ax.set_xlim(0, 1)
+
+    def figure_title(self) -> str:
+        """What this figure shows, which is half of what the analysis does.
+
+        ``description`` names the analysis -- a per-frame contact count and a
+        per-residue frequency, both of which it computes and writes. The
+        figure draws only the second, so inheriting that description put
+        "count + per-residue frequency" above a chart containing no count and
+        sent a reader looking for one. The count is in ``pl_contacts.dat``.
+        """
+        if self._user_title is not None:
+            return self._user_title
+        return "Protein-ligand contact frequency by residue"
 
     def default_xlabel(self) -> str | None:
         return "Contact frequency (fraction of frames)"

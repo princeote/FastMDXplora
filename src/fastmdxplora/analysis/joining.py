@@ -1,0 +1,446 @@
+"""Putting the pieces back together, and refusing where they do not fit.
+
+A segmented run leaves one directory per segment, which is right:
+appending into a single file would leave a crashed segment's half-written
+frames in the middle of the run's own output with no way to tell which
+were good. So joining is a separate, explicit step, and the joined
+trajectory is a derived artefact that looks like one.
+
+What makes this worth a module rather than a call to ``mdconvert`` is
+everything it refuses.
+
+**A gap.** Segment three missing between two and four does not produce a
+shorter trajectory. It produces a trajectory with a discontinuity in the
+middle that every analysis downstream will read straight through:
+equilibration detection will find a transient that is really a jump, and
+a correlation time computed across it is meaningless. A gap is not a
+smaller run, it is a different and silently wrong one.
+
+**A segment that did not finish.** Its checkpoint's sidecar says so. The
+seal cannot: every checkpoint is sealed as it is written, so a seal says
+the file is whole, not that the run reached its end. A run whose fourth segment was
+killed has four directories and three usable ones.
+
+**Segments from different studies.** Two runs of the same length under
+different settings leave directories that look alike and concatenate
+without complaint. The resolved config of each says which study it was,
+and they must agree.
+
+The refusals are the point. Concatenation itself is four lines.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from fastmdxplora import record_access as _records
+from fastmdxplora.refusals import MissingResultError, StudyError
+
+__all__ = ["SegmentPiece", "survey_segments", "join_segments",
+           "joins_beside"]
+
+
+@dataclass(frozen=True)
+class SegmentPiece:
+    """One segment's output, as found on disk."""
+
+    index: int
+    directory: Path
+    trajectory: Path | None
+    finished: bool
+    config_digest: str
+
+    @property
+    def usable(self) -> bool:
+        return self.finished and self.trajectory is not None
+
+
+def _study_it_reused(directory: Path) -> Path | None:
+    """The study whose prepared system a segment simulated, found as the
+    run's own record finds it: relative to the segment and by content. The
+    path its config names is relative to wherever the command ran, so for a
+    moved study it named nothing and the identity fell back to settings."""
+    from fastmdxplora.simulation.pipeline import (
+        _may_look,
+        _prepared_system_recorded,
+        _the_system_recorded,
+    )
+
+    reference = _prepared_system_recorded(directory)
+    if reference is None:
+        return None
+    try:
+        setup = _the_system_recorded(directory, reference)
+    except Exception:  # noqa: BLE001 - a join reports its own reasons
+        return None
+    if setup is None:
+        return None
+    # The folder holding the study's resolved config: `<study>/setup`, or
+    # `<study>/shared_setup/setup` for umbrella windows.
+    for folder in (setup, *list(setup.parents)[:2]):
+        config = folder / "resolved_config.yml"
+        if _may_look(config) and _records.is_file(config):
+            return folder
+    return None
+
+
+def _config_digest(directory: Path, *, _depth: int = 0) -> str:
+    """What study this segment was, from its own resolved config.
+
+    Reads the settings that define the study rather than hashing the file:
+    the resolved config differs between segments by design -- production
+    steps, minimize, resume_from -- so hashing it whole would say every
+    segment came from a different study, which is exactly backwards.
+
+    ``directory`` is the segment directory. A run writes its resolved
+    config at the root of its output directory, which for a segment is
+    ``segment-NNN/resolved_config.yml``; the simulation subdirectory is
+    looked in as well because that is where a hand-assembled campaign
+    tends to put it.
+    """
+    import hashlib
+
+    from fastmdxplora.simulation.pipeline import _may_look
+
+    for candidate in (directory / "resolved_config.yml",
+                      directory / "simulation" / "resolved_config.yml"):
+        if _records.is_file(candidate):
+            resolved = candidate
+            break
+    else:
+        return ""
+    try:
+        import yaml
+
+        data = yaml.load(_records.read_text(resolved, encoding="utf-8"),
+                         Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader)) or {}
+    except Exception:  # noqa: BLE001 - an unreadable config is not a study
+        return ""
+
+    simulation = dict(data.get("simulation") or {})
+    # A segment that reuses another study's prepared system IS that study:
+    # the same solvated box, the same water placement, the same atoms, on
+    # disk. Its identity is the parent's, which is a stronger statement
+    # than any comparison of settings -- and true where a comparison is
+    # not, since resolving a config materialises defaults unevenly and a
+    # ligand name can appear for a study that has no ligand.
+    reuses = simulation.get("prepared_from") or simulation.get("setup_from")
+    if reuses and _depth < 4:
+        for parent in (_study_it_reused(directory), Path(str(reuses))):
+            if (parent is not None and _may_look(parent) and _records.is_dir(parent)
+                    and parent.resolve() != directory.resolve()):
+                inherited = _config_digest(parent, _depth=_depth + 1)
+                if inherited:
+                    return inherited
+    for varies_by_design in ("production_steps", "duration_ns", "minimize",
+                             "nvt_steps", "npt_steps", "resume_from",
+                             "nvt_duration_ns", "npt_duration_ns",
+                             # A continuation states the ensemble the parent
+                             # left implicit, and names the parent it reuses
+                             # the prepared system from. Both say the two are
+                             # the same study rather than different ones.
+                             "ensemble", "setup_from", "prepared_from"):
+        simulation.pop(varies_by_design, None)
+
+    def decided(block: Any) -> dict[str, Any]:
+        """What was decided. A setting absent and a setting explicitly
+        null are the same decision; resolving a config materialises some
+        defaults and not others, and a digest that called those two
+        studies different would refuse to join a run to its own
+        continuation."""
+        return {k: v for k, v in dict(block or {}).items() if v is not None}
+
+    identity = {"setup": decided(data.get("setup")),
+                "systems": data.get("systems"),
+                "simulation": decided(simulation)}
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, default=str).encode()
+    ).hexdigest()[:16]
+
+
+def _finished(simulation_dir: Path) -> bool:
+    """Whether the run in `simulation_dir` reached its end.
+
+    Read from the checkpoint's sidecar, which says so. This used to be the
+    seal's presence, back when only a clean finish sealed; since every
+    checkpoint is sealed as it is written, a killed run looked finished,
+    the frames it wrote past its last checkpoint were kept, and the resume
+    ran them again, so the joined trajectory held that stretch twice. A
+    sidecar from before the sidecar said it is read by the final state,
+    which only a clean finish writes.
+    """
+    from fastmdxplora.simulation.runner import read_checkpoint_sidecar
+
+    side = read_checkpoint_sidecar(simulation_dir / "checkpoint.chk") or {}
+    if isinstance(side.get("finished"), bool):
+        return side["finished"]
+    return _records.is_file(simulation_dir / "state_final.xml")
+
+
+def survey_segments(root: Path | str, *,
+                    trajectory_name: str = "production.dcd") -> list[SegmentPiece]:
+    """What is on disk, without judging whether it joins.
+
+    Separated from :func:`join_segments` so a caller can see the state of
+    a campaign without committing to producing a file from it -- which is
+    what somebody coming back to a run that stopped overnight actually
+    wants first.
+    """
+    base = Path(root)
+    pieces: list[SegmentPiece] = []
+    # A study that ran in one piece and was then extended keeps its first
+    # trajectory where it wrote it. Its own simulation/ is segment zero --
+    # the index a campaign's first segment has -- and the extensions are
+    # segment-001 onward, so nothing a run wrote is moved to make the
+    # numbering tidy. A campaign that has its own segment-000 is untouched.
+    own = base / "simulation"
+    if _records.is_dir(own) and not _records.is_dir(base / "segment-000"):
+        own_trajectory = own / trajectory_name
+        if _records.is_file(own_trajectory):
+            pieces.append(SegmentPiece(
+                index=0, directory=base, trajectory=own_trajectory,
+                finished=_finished(own), config_digest=_config_digest(base)))
+    for directory in sorted(_records.glob(base, "segment-*")):
+        if not _records.is_dir(directory):
+            continue
+        try:
+            index = int(directory.name.split("-", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        simulation_dir = directory / "simulation"
+        trajectory = simulation_dir / trajectory_name
+        pieces.append(SegmentPiece(
+            index=index,
+            directory=directory,
+            trajectory=trajectory if _records.is_file(trajectory) else None,
+            finished=_finished(simulation_dir),
+            config_digest=_config_digest(directory),
+        ))
+    # By number, which is the order the pieces were run in. Names sort the
+    # same only while every index has three digits: segment-1000 lists
+    # before segment-101.
+    pieces.sort(key=lambda piece: piece.index)
+    # `segment-1` and `segment-001` are both segment one. Kept, the join
+    # held whichever listed later twice over or in the wrong place, and the
+    # continuation resumed from whichever `max` met first.
+    seen: dict[int, list[Path]] = {}
+    for piece in pieces:
+        seen.setdefault(piece.index, []).append(piece.directory)
+    twice = {index: folders for index, folders in seen.items() if len(folders) > 1}
+    if twice:
+        index, folders = sorted(twice.items())[0]
+        names = " and ".join(("the study's own run" if f == base else f.name)
+                             for f in folders)
+        raise StudyError(
+            f"{names} in {base} are both segment {index}, so which one is "
+            "that part of the trajectory would be decided by the order the "
+            "folders happen to list in. Rename or move the one that is not.",
+            code="simulation.resume.segment_named_twice", path=str(base),
+            index=index, folders=[str(f) for f in folders])
+    return pieces
+
+
+def join_segments(
+    root: Path | str,
+    destination: Path | str,
+    *,
+    topology: Path | str | None = None,
+    trajectory_name: str = "production.dcd",
+    keep_frames: dict[int, int] | None = None,
+) -> dict[str, Any]:
+    """Concatenate a segmented run into one trajectory, or refuse.
+
+    Returns a record of what was joined, which belongs beside the output:
+    a joined trajectory is derived, and a reader should be able to see how
+    many pieces it came from and which segments they were without opening
+    it.
+
+    Raises
+    ------
+    StudyError, MissingResultError
+        On a gap, an unfinished segment, or segments that are not from the
+        same study. Each is a case where concatenating would succeed and
+        produce something wrong.
+    """
+    base = Path(root)
+    pieces = survey_segments(base, trajectory_name=trajectory_name)
+    if not pieces:
+        raise MissingResultError(
+            f"No segment directories under {base}. A segmented run writes "
+            "one per segment; if this study ran in a single piece its "
+            "trajectory is already whole and does not need joining.",
+            code="analysis.data.absent", path=str(base))
+
+    # Gaps first, because a gap is the failure that most looks like
+    # success: the pieces either side concatenate perfectly.
+    found = sorted(p.index for p in pieces)
+    expected = list(range(found[0], found[-1] + 1))
+    missing = sorted(set(expected) - set(found))
+    if missing or found[0] != 0:
+        gap = missing or [0]
+        raise StudyError(
+            f"Segments {gap} are missing from {base}, so joining what is "
+            "here would produce a trajectory with a jump in the middle "
+            "rather than a shorter one. Every analysis downstream reads "
+            "straight through that: equilibration detection would find a "
+            "transient that is really a discontinuity, and a correlation "
+            "time computed across it means nothing.",
+            code="analysis.data.absent",
+            needs=f"segments {gap}")
+
+    limits = dict(keep_frames or {})
+    # A segment that was killed holds frames written after its last
+    # checkpoint -- the frames a resume runs again. Given a frame limit
+    # for it, those frames are left out and the pieces meet exactly at
+    # the checkpoint; without one, the overlap has nowhere to go and the
+    # join refuses as before.
+    unfinished = [p.index for p in pieces if not p.finished and p.index not in limits]
+    if unfinished:
+        raise MissingResultError(
+            f"Segments {unfinished} did not finish: their checkpoints were "
+            "written along the way, not at the end. Rerun them before "
+            "joining; a run that stopped "
+            "partway has a trajectory that ends wherever the process died, "
+            "and nothing in the file says so.",
+            code="simulation.resume.unsealed",
+            path=str(base))
+
+    without_trajectory = [p.index for p in pieces if p.trajectory is None]
+    if without_trajectory:
+        raise MissingResultError(
+            f"Segments {without_trajectory} have no {trajectory_name}. "
+            "A segment that finished without writing frames was configured "
+            "not to, and joining would silently skip its time.",
+            code="analysis.data.absent", path=str(base))
+
+    digests = {p.config_digest for p in pieces if p.config_digest}
+    if len(digests) > 1:
+        raise StudyError(
+            f"The segments under {base} are not all from the same study: "
+            f"{len(digests)} different sets of settings. Two runs of the "
+            "same length under different settings leave directories that "
+            "look alike and concatenate without complaint.",
+            code="analysis.data.absent",
+            needs="segments from one study")
+
+    # One spacing throughout. A continuation left to choose its own chose
+    # from its own length, so the remainder of a run wrote frames at half
+    # the spacing and the joined trajectory changed its clock at the join;
+    # every analysis that reads time assumes it does not.
+    from fastmdxplora.simulation.resume import trajectory_interval_of
+    from fastmdxplora.simulation.runner import read_checkpoint_sidecar
+
+    intervals = {p.index: trajectory_interval_of(p.directory) for p in pieces}
+    known = {index: value for index, value in intervals.items() if value is not None}
+    if len(set(known.values())) > 1:
+        spacing = ", ".join(f"segment {i}: every {v:,} steps" for i, v in sorted(known.items()))
+        raise StudyError(
+            f"The segments under {base} were written at different frame "
+            f"spacings ({spacing}), so joining them would change the time a "
+            "frame represents partway through the trajectory. Continue each "
+            "segment at its parent's trajectory_interval_steps.",
+            code="simulation.resume.interval_differs", path=str(base),
+            intervals={str(i): v for i, v in sorted(known.items())})
+    interval = next(iter(known.values()), None) if len(known) == len(pieces) else None
+    timestep_fs = (read_checkpoint_sidecar(
+        pieces[0].directory / "simulation" / "checkpoint.chk") or {}).get("timestep_fs")
+    from fastmdxplora.simulation.runner import chose_its_own_step
+
+    if chose_its_own_step(pieces[0].directory / "simulation"):
+        # Its timestep is where the integrator started, not the step it
+        # took: frames a fixed number of steps apart are no fixed time.
+        timestep_fs = None
+
+    import mdtraj
+
+    topology_path = Path(topology) if topology else (
+        pieces[0].directory / "simulation" / "topology.pdb")
+    if not topology_path.is_file():
+        raise MissingResultError(
+            f"No topology at {topology_path}, and a trajectory cannot be "
+            "read without one.",
+            code="analysis.data.absent", path=str(topology_path))
+
+    out = Path(destination)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    frames = 0
+    # Where each segment starts, in frames of the joined file. Without this
+    # the join record is a list of segment numbers that no analysis can
+    # locate, and `summarise_segments` has nothing to split on. It is the
+    # only thing the joined file cannot be asked for afterwards.
+    joins: list[int] = []
+    with mdtraj.formats.DCDTrajectoryFile(str(out), "w") as writer:
+        for piece in pieces:
+            if piece.index != pieces[0].index:
+                joins.append(frames)
+            allowed = limits.get(piece.index)
+            written_here = 0
+            for chunk in mdtraj.iterload(str(piece.trajectory),
+                                         top=str(topology_path), chunk=500):
+                if allowed is not None:
+                    if written_here >= allowed:
+                        break
+                    if written_here + len(chunk) > allowed:
+                        chunk = chunk[: allowed - written_here]
+                written_here += len(chunk)
+                writer.write(chunk.xyz * 10.0,
+                             cell_lengths=(chunk.unitcell_lengths * 10.0
+                                           if chunk.unitcell_lengths is not None
+                                           else None),
+                             cell_angles=chunk.unitcell_angles)
+                frames += chunk.n_frames
+
+    record = {
+        "trajectory": str(out),
+        "segments": [p.index for p in pieces],
+        "frames": frames,
+        # What was left out, and from where. A joined trajectory is
+        # derived; a reader should be able to see that a killed segment
+        # was cut back to its checkpoint without opening the file.
+        "trimmed": {str(index): count for index, count in sorted(limits.items())},
+        "joins": joins,
+        # The spacing every segment was written at, and the time a frame
+        # represents, so what is analysed from this file is labelled in
+        # time. None where a segment's spacing is not recorded.
+        "trajectory_interval_steps": interval,
+        "saving_interval_ps": (interval * float(timestep_fs) / 1000.0
+                               if interval and isinstance(timestep_fs, (int, float)) else None),
+        "topology": str(topology_path),
+        # Stated so a reader knows this file is derived without having to
+        # infer it from the directory it sits in.
+        "joined_from_segments": True,
+        "ran_through": False,
+    }
+    (out.with_suffix(out.suffix + ".join.json")).write_text(
+        json.dumps(record, indent=2), encoding="utf-8")
+    return record
+
+
+def joins_beside(trajectory: Path | str) -> list[int]:
+    """Where the segments of this trajectory begin, or an empty list.
+
+    :func:`join_segments` leaves a record beside its output. This reads it,
+    so a caller holding a trajectory path can find out whether it was
+    joined without having to have been told.
+
+    Empty for a trajectory that went through in one piece, which means a
+    caller can pass the result straight to
+    :func:`fastmdxplora.statistics.summarise_segments` without branching on
+    whether a run was segmented.
+    """
+    path = Path(trajectory)
+    record = path.with_suffix(path.suffix + ".join.json")
+    if not record.is_file():
+        return []
+    try:
+        return [int(frame)
+                for frame in json.loads(record.read_text(encoding="utf-8")
+                                        ).get("joins", [])]
+    except (ValueError, TypeError):
+        # An unreadable record is treated as absent rather than repaired.
+        # Guessing at where the joins were would put an invented number
+        # into the decision about how to read the run.
+        return []

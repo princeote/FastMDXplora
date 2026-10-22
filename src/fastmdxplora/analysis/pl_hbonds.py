@@ -9,6 +9,11 @@ bond has one partner in the protein and the other in the ligand.
 A per-frame H-bond list is computed with Wernet-Nilsson (which returns
 per-frame donor-H-acceptor triplets), and each triplet is kept only if it
 bridges protein and ligand. Outputs ``pl_hbonds.dat`` (frame, n_hbonds).
+
+This is one of three hydrogen-bond criteria in the package, and they count
+different bonds: ``hbonds`` uses Baker-Hubbard (H...A < 2.5 A) by default
+and ``pl_interactions`` the donor to acceptor distance of 3.5 A. Each names
+its criterion in its options and its axis label.
 """
 
 from __future__ import annotations
@@ -21,8 +26,17 @@ import mdtraj as md
 import numpy as np
 import pandas as pd
 
+from fastmdxplora.analysis.plotting import colour
 from fastmdxplora.analysis.base import Analysis
 from fastmdxplora.analysis.orchestrator import register_analysis
+from fastmdxplora.refusals import StudyError
+
+
+#: The criterion, by name. Wernet-Nilsson's distance cutoff depends on the
+#: angle, so it is not a pair of numbers like the others: an O-H...O at
+#: 3.3 A between the oxygens is a bond under ``pl_interactions``' 3.5 A and
+#: not here.
+CRITERION = "Wernet-Nilsson (angle-dependent D...A distance, Science 304:995, 2004)"
 
 
 class ProteinLigandHBonds(Analysis):
@@ -33,7 +47,13 @@ class ProteinLigandHBonds(Analysis):
     ligand_resname : str
         Ligand residue name (e.g. ``"LIG"``). Supplied by the orchestrator.
     protein_selection : str, default "protein"
-        Selection for the protein side.
+        The other side of the interaction. Usually the whole protein, and
+        worth changing in three cases: a complex where only one chain matters
+        (``"protein and chainid 0"``), a domain rather than the whole fold
+        (``"protein and resid 40 to 180"``), or a receptor that is not a
+        protein at all -- ``"nucleic"`` for a ligand bound to DNA or RNA,
+        which is a real and common case that the default name does not
+        suggest.
     **kwargs
         Standard base-class options.
     """
@@ -42,6 +62,9 @@ class ProteinLigandHBonds(Analysis):
     description = "Protein-ligand hydrogen bonds"
     requires_ligand = True
     default_selection = None
+    #: This works out its own atoms, so a general selection has nothing to
+    #: apply to.
+    honours_selection = False
 
     def __init__(
         self,
@@ -52,15 +75,18 @@ class ProteinLigandHBonds(Analysis):
     ) -> None:
         super().__init__(**kwargs)
         if not ligand_resname:
-            raise ValueError(
+            raise StudyError(
                 "ProteinLigandHBonds requires `ligand_resname`; it applies "
                 "only to protein-ligand complexes."
-            )
+            , code="analysis.option.missing_companion")
         self.ligand_resname = str(ligand_resname)
         self.protein_selection = str(protein_selection)
         self.options.update(
             ligand_resname=self.ligand_resname,
             protein_selection=self.protein_selection,
+            # Named, because `hbonds` and `pl_interactions` count hydrogen
+            # bonds by other criteria and do not agree with this one.
+            criterion=CRITERION,
         )
 
     def compute(self, traj: md.Trajectory) -> pd.DataFrame:
@@ -75,20 +101,50 @@ class ProteinLigandHBonds(Analysis):
             int(i) for i in traj.topology.select(f"resname {self.ligand_resname}")
         )
         if not ligand_idx:
-            raise ValueError(
+            raise StudyError(
                 f"No atoms matched ligand resname {self.ligand_resname!r}; "
                 f"cannot compute protein-ligand hydrogen bonds."
-            )
+            , code="analysis.selection.empty")
         protein_idx = set(int(i) for i in traj.topology.select(self.protein_selection))
         if not protein_idx:
-            raise ValueError(
+            raise StudyError(
                 f"Protein selection {self.protein_selection!r} matched zero "
                 f"atoms; cannot compute protein-ligand hydrogen bonds."
-            )
+            , code="analysis.selection.arity")
 
-        # H-bond detection needs bond connectivity.
+        # H-bond detection needs bond connectivity: a donor is found as a
+        # nitrogen or oxygen with a hydrogen bonded to it. create_standard_bonds
+        # knows the residues in its library, which does not include a ligand.
         if traj.topology.n_bonds == 0:
             traj.topology.create_standard_bonds()
+
+        # A ligand whose bonds are absent cannot be seen to donate, only to
+        # accept, and the count then reports one direction under a name that
+        # promises both. The protein having bonds is no comfort here: a PDB
+        # without CONECT records for its ligand gives exactly that, and the
+        # guard above never fires because n_bonds is not zero.
+        ligand_hydrogens = {
+            atom.index for atom in traj.topology.atoms
+            if atom.index in ligand_idx and atom.element is not None
+            and atom.element.symbol == "H"
+        }
+        if ligand_hydrogens:
+            bonded = {
+                atom.index
+                for bond in traj.topology.bonds
+                for atom in bond
+            }
+            if not (ligand_hydrogens & bonded):
+                raise StudyError(
+                    f"The ligand {self.ligand_resname!r} has "
+                    f"{len(ligand_hydrogens)} hydrogen(s) and no bonds to "
+                    "them, so it cannot be seen to donate a hydrogen bond -- "
+                    "only to accept one. Counting under those conditions "
+                    "would report one direction as though it were both. Give "
+                    "a topology that carries the ligand's connectivity: a PDB "
+                    "with CONECT records for it, or the topology written by "
+                    "the setup phase."
+                , code="analysis.selection.arity", expression=self.ligand_resname)
 
         # Wernet-Nilsson returns, per frame, an array of (donor, H, acceptor)
         # atom-index triplets. Keep a triplet only if the donor and acceptor
@@ -123,13 +179,13 @@ class ProteinLigandHBonds(Analysis):
         else:
             x = result["frame"].to_numpy()
         y = result["n_hbonds"].to_numpy()
-        ax.plot(x, y, linewidth=1.4, color="#3a7ca5")
-        ax.fill_between(x, 0, y, alpha=0.15, color="#3a7ca5")
+        ax.plot(x, y, linewidth=1.4, color=colour("SERIES"))
+        ax.fill_between(x, 0, y, alpha=0.15, color=colour("SERIES"))
         # Integer y ticks (counts).
         ax.set_ylim(bottom=0)
 
     def default_ylabel(self) -> str | None:
-        return "Protein-ligand H-bonds"
+        return "Protein-ligand H-bonds (Wernet-Nilsson)"
 
     _traj_for_plot: md.Trajectory | None = None
 

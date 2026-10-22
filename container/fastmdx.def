@@ -1,0 +1,144 @@
+Bootstrap: docker
+From: mambaorg/micromamba:1.5.8
+
+%labels
+    Description  FastMDXplora with the whole stack it needs, for machines
+                 that cannot reach conda-forge.
+    Upstream     https://github.com/aai-research-lab/FastMDXplora
+
+%help
+    FastMDXplora, built for a machine with no network.
+
+    The reason this exists: the ligand path needs the OpenFF toolkit,
+    openmmforcefields and AmberTools, and none is on PyPI -- they are
+    distributed through conda-forge only, so no arrangement of wheels reaches
+    them. Installing FastMDXplora on top of a site environment works for
+    everything else and stops there.
+
+    Everything in here comes from conda-forge in one solve, so the versions
+    are the ones the packaging chose rather than a set assembled by hand.
+
+    Run it:
+
+        apptainer exec --nv fastmdx.sif fastmdx explore --config study.yml
+
+    `--nv` passes the GPU through, and it is not optional for a GPU run: it
+    is what puts the host's driver inside, and without it the CUDA plugin is
+    there and cannot load. The run says which platform it selected and why
+    the others were unavailable. Check the banner.
+
+    The image carries its own OpenMM, so OPENMM_PLUGIN_DIR is set inside and
+    the host's does not apply.
+
+%post
+    set -eux
+
+    # One package, one solver. FastMDXplora declares what it needs, so
+    # conda-forge brings the whole stack -- OpenMM, PLUMED, MDTraj, PDBFixer,
+    # the OpenFF toolkit, AmberTools -- and the versions are mutually
+    # consistent because one solver chose them all.
+    #
+    # An earlier version of this file installed the stack with conda and then
+    # FastMDXplora with pip on top. That re-resolves its dependencies against
+    # what conda has already put there, and pip does not read conda's
+    # metadata properly: it can decide something needs upgrading and replace
+    # a conda-installed numpy with a wheel, which is how these images break.
+    # It also meant a hand-written package list here, which could drift from
+    # the one the package actually declares.
+    # `cuda-version` is conda-forge's handle on which CUDA every package in
+    # the solve is built against, and it has to be told: left free, the
+    # solver takes the newest, and an image built against CUDA 13 will not
+    # run on a driver that supports 12. That failure is
+    # CUDA_ERROR_UNSUPPORTED_PTX_VERSION, raised when the first kernel loads
+    # -- after setup has succeeded, so the run gets as far as looking like it
+    # works. Pinned low rather than high: a newer driver runs an older build,
+    # and the reverse is what fails.
+    micromamba install -y -n base -c conda-forge \
+        "fastmdxplora=${FASTMDX_VERSION:-2.5.0}" \
+        "cuda-version=${CUDA_VERSION:-12.6}" \
+        openff-toolkit \
+        ambertools \
+        openmmforcefields \
+        openmm-plumed \
+        weasyprint
+
+    micromamba clean --all --yes
+
+    # Fail the build rather than ship an image that cannot do the thing it
+    # exists for. A container that silently lacks the ligand path would be
+    # worse than no container: it would take a run to discover.
+    /opt/conda/bin/python - <<'CHECK'
+import openmm
+from openmm import app  # noqa: F401
+import mdtraj, pdbfixer  # noqa: F401
+import openff.toolkit, openmmforcefields  # noqa: F401
+import fastmdxplora  # noqa: F401
+from openmmplumed import PlumedForce  # noqa: F401
+
+import pathlib
+
+platforms = [openmm.Platform.getPlatform(i).getName()
+             for i in range(openmm.Platform.getNumPlatforms())]
+print("platforms:", platforms)
+assert "CPU" in platforms, platforms
+
+# The CUDA *library*, not the CUDA *platform*. A build machine has no GPU and
+# therefore no libcuda.so.1, so the plugin cannot load here however correct
+# the image is -- asking whether the platform registers can only ever answer
+# no, and asserting it fails every build. What is checkable at build time is
+# that the plugin was installed; the driver arrives at run time, from the
+# host, through `--nv`.
+plugins = pathlib.Path(openmm.version.openmm_library_path) / "plugins"
+built = sorted(p.name for p in plugins.glob("libOpenMMCUDA*"))
+assert built, (
+    f"no CUDA plugin in {plugins}: this image would run on the CPU wherever "
+    "it was taken. Contents: "
+    f"{sorted(q.name for q in plugins.glob('*'))}")
+print("cuda plugin:", ", ".join(built))
+
+# Charges, not imports. Every ligand takes AM1-BCC charges, which the toolkit
+# computes by calling AmberTools' sqm; without it the toolkit still imports,
+# and the image would fail at the first ligand, after solvating it. So one
+# small cation is charged here, by AmberTools and nothing else.
+from openff.toolkit import Molecule
+from openff.toolkit.utils.toolkits import AmberToolsToolkitWrapper
+
+cation = Molecule.from_smiles("C[NH3+]")
+cation.assign_partial_charges(
+    "am1bcc", toolkit_registry=AmberToolsToolkitWrapper())
+total = float(sum(cation.partial_charges.m_as("elementary_charge")))
+assert abs(total - 1.0) < 1e-3, (
+    f"AM1-BCC charges on methylammonium sum to {total:+.4f}, not +1")
+print(f"am1bcc: methylammonium charged by AmberTools, total {total:+.3f}")
+# OpenMM's `version` reads "8.4.0.dev-4768436" for a release build too (its
+# `release` flag is never set), which is how an image was taken to carry a
+# development build. The release number and the commit, said apart.
+print("openmm", openmm.version.short_version,
+      "(git " + openmm.version.git_revision[:7] + ")")
+print("fastmdxplora", getattr(fastmdxplora, "__version__", "unknown"))
+CHECK
+
+%environment
+    export PATH=/opt/conda/bin:$PATH
+    # The image's own plugins, not the host's. A machine with a site OpenMM
+    # will have OPENMM_PLUGIN_DIR set to a path that does not exist in here.
+    export OPENMM_PLUGIN_DIR=/opt/conda/lib/plugins
+
+%runscript
+    exec fastmdx "$@"
+
+%test
+    # Run at build time and by `apptainer test`. Imports only, and whether
+    # the toolkit can reach AmberTools for a ligand's charges: a GPU is not
+    # available on a build runner, so anything needing one belongs in the
+    # first real run rather than here.
+    /opt/conda/bin/python -c "
+import openmm, mdtraj, pdbfixer, fastmdxplora
+import openff.toolkit, openmmforcefields
+from openff.toolkit.utils.toolkits import AmberToolsToolkitWrapper
+assert AmberToolsToolkitWrapper.is_available(), 'no AmberTools, so no ligand charges'
+from openmmplumed import PlumedForce
+print('fastmdxplora', fastmdxplora.__version__ if hasattr(fastmdxplora, '__version__') else '')
+print('openmm', openmm.version.short_version, '(git ' + openmm.version.git_revision[:7] + ')')
+print('the ligand path is present')
+"

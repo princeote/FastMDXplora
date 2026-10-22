@@ -57,13 +57,59 @@ _C = {
 }
 
 
+#: Where a study prepares the one system all its windows share. The banner
+#: has to know the name because a preparation reports the directory it writes
+#: to, which is accurate and useless to watch: it is a second of setup,
+#: finished before anybody could type the command, and the windows that follow
+#: it are written somewhere else entirely.
+SHARED_SETUP_DIRECTORY = "shared_setup"
+
+
+def _worth_watching(output: str) -> str:
+    """The directory somebody watching this run should actually open.
+
+    A run's own directory, except for the shared preparation of an umbrella
+    study, where it is the study above: that is where the windows appear, and
+    by the time the command is typed the preparation has finished.
+    """
+    # Trimmed off the text rather than rebuilt from a `Path`. Rebuilding
+    # normalises the separators, so a caller who wrote `../runs/study` on
+    # Windows was handed back `..\\runs\\study` -- a correct path, and not the
+    # one they typed. What is wanted here is the string they will recognise.
+    text = str(output)
+    trimmed = text.rstrip("/\\")
+    # Both separators, whichever platform is running. `os.path.split` on
+    # POSIX does not treat a backslash as one, so a Windows path handed to a
+    # test on Linux would go unrecognised -- and the reverse was how this was
+    # found: the run directory came back with its separators swapped.
+    cut = max(trimmed.rfind("/"), trimmed.rfind("\\"))
+    if cut <= 0:
+        return text
+    head, tail = trimmed[:cut], trimmed[cut + 1:]
+    if tail == SHARED_SETUP_DIRECTORY and head not in ("", "."):
+        return head
+    return text
+
+
 def _ansi_supported(stream: IO) -> bool:
-    """Return True iff we should emit ANSI escapes on this stream."""
+    """Return True iff ANSI escapes should be emitted on this stream."""
     if os.getenv("NO_COLOR"):
         return False
     if not hasattr(stream, "isatty"):
         return False
     return bool(stream.isatty())
+
+
+def _readable_duration(seconds: float) -> str:
+    """A duration somebody can act on, rather than a float."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
 
 
 def _strip_ansi(s: str) -> str:
@@ -82,11 +128,18 @@ def _strip_ansi(s: str) -> str:
     return "".join(out)
 
 
+#: Whether the banner draws a frame. Kept as a name rather than deleted
+#: outright so the intent is visible: the values are the point, the border was
+#: decoration, and decoration on the loudest element of the output competes
+#: with the run it is describing.
+_BOXED = False
+
+
 def _visual_width(s: str) -> int:
     """Approximate displayed width (strip ANSI; count chars 1-wide).
 
     A full East-Asian width implementation is overkill for ASCII status
-    output; this approximation is correct for the characters we actually
+    output; this approximation is correct for the characters actually
     emit (box-drawing, arrows, status icons, latin-1).
     """
     return len(_strip_ansi(s))
@@ -95,6 +148,46 @@ def _visual_width(s: str) -> int:
 # ---------------------------------------------------------------------------
 # SessionPresenter
 # ---------------------------------------------------------------------------
+
+def _wrap(text: str, width: int) -> list[str]:
+    """Word-wrap ``text`` to ``width``, never splitting a word."""
+    lines: list[str] = []
+    current = ""
+    for word in text.split():
+        candidate = f"{current} {word}".strip()
+        if len(candidate) <= width or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _the_useful_part_of(name: str, reason: str | None) -> str:
+    """The part of a failure message worth putting in front of somebody.
+
+    Messages arrive as ``"<analysis>: <what went wrong>"``. The analysis
+    name is already the first column of the row, so repeating it wastes the
+    line. A bare exception class name is worse than nothing -- it occupies
+    the space where an explanation should be while saying only that
+    something raised -- so it is left out and the log keeps the traceback.
+    """
+    if not reason:
+        return ""
+    text = reason.strip()
+    prefix = f"{name}:"
+    if text.startswith(prefix):
+        text = text[len(prefix):].strip()
+    if not text or text in {"ok", name}:
+        return ""
+    # "KeyError" or "IndexError" alone says nothing a reader can act on.
+    if text.endswith("Error") and " " not in text:
+        return ""
+    return text
+
+
 class SessionPresenter:
     """Print structured session output to stdout.
 
@@ -128,14 +221,28 @@ class SessionPresenter:
         stream: IO | None = None,
         *,
         quiet: bool | None = None,
+        explain: bool = True,
         width: int | None = None,
     ) -> None:
-        self.stream: IO = stream if stream is not None else sys.stdout
+        # Held as "the stream I was given, or none" rather than as a
+        # resolved object. The presenter is a singleton built the first time
+        # anything prints, and `sys.stdout` is not fixed for the life of a
+        # process: a caller that redirects it afterwards would otherwise keep
+        # having output written to the stream it replaced -- invisible where
+        # it went, and a ValueError from this class if that stream has since
+        # been closed. Resolved at each write instead, so the console is
+        # wherever the console is now.
+        self._stream: IO | None = stream
+        self._color_override: bool | None = None
 
         # Auto-detect quiet mode from env when not explicitly set
         if quiet is None:
             quiet = os.getenv("FASTMDX_LOG_STYLE", "").strip().lower() == "plain"
         self.quiet: bool = bool(quiet)
+        #: Whether to say why each step happens. On, because a pipeline that
+        #: runs silently teaches nothing and somebody's first trajectory
+        #: should be one they can defend.
+        self.explain: bool = bool(explain)
 
         # Terminal width: explicit > shutil > 80 fallback
         if width is None:
@@ -145,7 +252,6 @@ class SessionPresenter:
                 width = 80
         self.width: int = max(40, width)  # clamp absurdly narrow terminals
 
-        self._color: bool = _ansi_supported(self.stream)
         self._session_start: float | None = None
         self._phase_start: float | None = None
         self._current_phase: str | None = None
@@ -154,179 +260,161 @@ class SessionPresenter:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    #: The wordmark, drawn rather than filled from a grid.
+    #:
+    #: This was three bitmap sets in a row -- a mixed-case one, then two
+    #: uppercase ones -- each shadowing the last, so the mixed-case set that
+    #: was already here had never once been used and the banner printed in
+    #: capitals regardless.
+    #:
+    #: Each glyph is a rectangle: five rows of equal width. Ascenders reach
+    #: row 0, x-height letters start at row 1, and `p` descends into row 4, so
+    #: the name reads with the capitals it actually carries. A single
+    #: character short in any row shifts every letter after it, which is what
+    #: the rectangle test guards.
+    _GLYPHS: dict[str, tuple[str, ...]] = {
+        "F": (" ___ ",
+              "| __|",
+              "| _| ",
+              "|_|  ",
+              "     "),
+        "a": ("      ",
+              " __ _ ",
+              "/ _` |",
+              "\\__,_|",
+              "      "),
+        "s": ("     ",
+              " ___ ",
+              "(_-< ",
+              "/__/ ",
+              "     "),
+        "t": (" _   ",
+              "| |_ ",
+              "| __|",
+              " \\__|",
+              "     "),
+        "M": (" __  __ ",
+              "|  \\/  |",
+              "| |\\/| |",
+              "|_|  |_|",
+              "        "),
+        "D": (" ___  ",
+              "|   \\ ",
+              "| |) |",
+              "|___/ ",
+              "      "),
+        "X": ("__  __",
+              "\\ \\/ /",
+              " >  < ",
+              "/_/\\_\\",
+              "      "),
+        "p": ("      ",
+              " _ __ ",
+              "| '_ \\",
+              "| .__/",
+              "|_|   "),
+        "l": (" _  ",
+              "| | ",
+              "| | ",
+              "|_| ",
+              "    "),
+        "o": ("     ",
+              " ___ ",
+              "/ _ \\",
+              "\\___/",
+              "     "),
+        "r": ("     ",
+              " _ __",
+              "| '_/",
+              "|_|  ",
+              "     "),
+    }
+    _WORDMARK = "FastMDXplora"
+    _TAGLINE = "Fully Automated SysTem for Molecular Dynamics eXploration"
+
+    @property
+    def stream(self) -> IO:
+        """Where output goes now, not where it went at construction."""
+        return self._stream if self._stream is not None else sys.stdout
+
+    @stream.setter
+    def stream(self, value: IO) -> None:
+        self._stream = value
+
+    @property
+    def _color(self) -> bool:
+        """Whether to colour, decided against the stream being written to.
+
+        Derived rather than stored, for the same reason the stream is: a
+        redirect changes the answer. An explicit assignment still wins, so a
+        caller that forces colour on or off keeps that.
+        """
+        if self._color_override is not None:
+            return self._color_override
+        return _ansi_supported(self.stream)
+
+    @_color.setter
+    def _color(self, value: bool) -> None:
+        self._color_override = bool(value)
+
     def welcome(
         self,
         *,
         dashboard_url: str = "http://127.0.0.1:8765",
         dashboard_enabled: bool = False,
     ) -> None:
-        """Print the centered FastMDXplora startup identity once.
+        """Print the FastMDXplora startup identity once.
 
-        The startup screen is deliberately minimal: one responsive wordmark,
-        the product name and tagline, and the dashboard address.  It performs
-        no simulation work and does not print the full command help.
+        Deliberately minimal: the wordmark, and the expansion of the name
+        justified to span it exactly. Nothing else. Version, backends, and
+        citation belong to ``fastmdx info``; the GUI address is printed by
+        the server that actually opens the socket.
 
-        ``dashboard_enabled`` is retained for API compatibility with older
-        callers, but the startup design intentionally avoids active/inactive
-        status wording.
+        ``dashboard_url`` and ``dashboard_enabled`` are accepted for call-site
+        compatibility and intentionally unused.
         """
         if self.quiet or self._welcome_shown:
             return
-
         self._welcome_shown = True
-        _ = dashboard_enabled
 
-        # Five-row block glyphs are rendered as one plain-text block before
-        # ANSI styling is applied. This keeps width calculations accurate and
-        # prevents individual lines from drifting away from the shared center.
-        glyphs = {
-            "A": ("01110", "10001", "11111", "10001", "10001"),
-            "D": ("11110", "10001", "10001", "10001", "11110"),
-            "F": ("11111", "10000", "11110", "10000", "10000"),
-            "L": ("10000", "10000", "10000", "10000", "11111"),
-            "M": ("10001", "11011", "10101", "10001", "10001"),
-            "O": ("01110", "10001", "10001", "10001", "01110"),
-            "P": ("11110", "10001", "11110", "10000", "10000"),
-            "R": ("11110", "10001", "11110", "10100", "10010"),
-            "S": ("01111", "10000", "01110", "00001", "11110"),
-            "T": ("11111", "00100", "00100", "00100", "00100"),
-            "X": ("10001", "01010", "00100", "01010", "10001"),
-        }
-        word = "FASTMDXPLORA"
+        # Joined without a separator: the glyphs carry their own side bearings,
+        # and a space between them opens gaps the letterforms already close.
+        logo = [
+            "".join(self._GLYPHS[ch][row] for ch in self._WORDMARK).rstrip()
+            for row in range(5)
+        ]
+        block = max(len(row) for row in logo)
+        pad = "  "
 
-        def render_wordmark(cell_width: int, gap: int) -> list[str]:
-            on = "█" * cell_width
-            off = " " * cell_width
-            separator = " " * gap
-            rows: list[str] = []
-            for row_index in range(5):
-                letters = [
-                    "".join(
-                        on if bit == "1" else off
-                        for bit in glyphs[letter][row_index]
-                    )
-                    for letter in word
-                ]
-                rows.append(separator.join(letters).rstrip())
-            return rows
+        self._write("")
 
-        usable_width = max(36, self.width - 4)
-        target_width = max(1, int(usable_width * 0.88))
+        if self.width < block + len(pad) + 1:
+            # Too narrow for the wordmark: plain text beats wrapping the
+            # glyph rows into noise.
+            self._write(self._c(pad + "FastMDXplora", "purple"))
+            for line in _wrap(self._TAGLINE, max(20, self.width - len(pad))):
+                self._write(pad + line)
+            self._write("")
+            return
 
-        if usable_width >= 131:
-            # Two-column pixels produce the largest wordmark. Select the gap
-            # dynamically so the logo occupies most of wide terminals.
-            gap = max(1, min(4, (target_width - 120) // 11))
-            logo = render_wordmark(cell_width=2, gap=gap)
-        elif usable_width >= 71:
-            # One-column pixels remain crisp on normal terminals while a
-            # variable gap prevents the wordmark from looking undersized.
-            gap = max(1, min(4, (target_width - 60) // 11))
-            logo = render_wordmark(cell_width=1, gap=gap)
+        for row in logo:
+            self._write(self._c(pad + row, "purple"))
+        self._write("")
+
+        # Spread the words so the expansion spans the wordmark exactly.
+        words = self._TAGLINE.split()
+        slack = block - sum(len(word) for word in words)
+        gaps = len(words) - 1
+        if gaps >= 1 and slack >= 0:
+            base, extra = divmod(slack, gaps)
+            spread = ""
+            for index, word in enumerate(words):
+                spread += word
+                if index < gaps:
+                    spread += " " * (base + (1 if index < extra else 0))
         else:
-            logo = ["FASTMDXPLORA"]
-
-        def center_plain(text: str, width: int | None = None) -> str:
-            available = self.width if width is None else width
-            padding = max(0, (available - _visual_width(text)) // 2)
-            return (" " * padding) + text
-
-        def purple_bold(text: str) -> str:
-            if not self._color:
-                return text
-            return f"{_C['purple']}{_C['bold']}{text}{_C['reset']}"
-
-        # Normalize every row to one block width and apply one shared left
-        # padding value. The block therefore has a single visual center axis.
-        logo_width = max(_visual_width(line) for line in logo)
-        normalized_logo = [line.ljust(logo_width) for line in logo]
-        logo_left = max(0, (self.width - logo_width) // 2)
-
-        self._write("")
-        for logo_line in normalized_logo:
-            plain_line = (" " * logo_left) + logo_line
-            self._write(self._c(plain_line, "purple"))
-
-        product_name = "FastMDXplora"
-        tagline = "Fully Automated SysTem for Molecular Dynamics eXploration"
-
-        def wrap_words(text: str, limit: int) -> list[str]:
-            words = text.split()
-            lines: list[str] = []
-            current: list[str] = []
-            current_width = 0
-            for word in words:
-                added = len(word) if not current else len(word) + 1
-                if current and current_width + added > limit:
-                    lines.append(" ".join(current))
-                    current = [word]
-                    current_width = len(word)
-                else:
-                    current.append(word)
-                    current_width += added
-            if current:
-                lines.append(" ".join(current))
-            return lines or [""]
-
-        self._write("")
-        self._write(purple_bold(center_plain(product_name)))
-        for tagline_line in wrap_words(tagline, max(20, self.width - 4)):
-            self._write(self._c(center_plain(tagline_line), "purple"))
-        self._write("")
-
-        # The box is centered as one unit; each content line is then centered
-        # inside the box. All branding uses the same purple palette.
-        box_width = min(
-            max(64, _visual_width(tagline) + 8),
-            max(36, self.width - 4),
-        )
-        inner_width = max(1, box_width - 2)
-
-        def fit(text: str) -> str:
-            if _visual_width(text) <= inner_width:
-                return text
-            if inner_width <= 3:
-                return text[:inner_width]
-            return text[: inner_width - 3] + "..."
-
-        def box_line(text: str) -> str:
-            fitted = fit(text)
-            visible = _visual_width(fitted)
-            left = max(0, (inner_width - visible) // 2)
-            right = max(0, inner_width - visible - left)
-            return "│" + (" " * left) + fitted + (" " * right) + "│"
-
-        box_left = max(0, (self.width - box_width) // 2)
-        box_prefix = " " * box_left
-        top = "╭" + ("─" * inner_width) + "╮"
-        bottom = "╰" + ("─" * inner_width) + "╯"
-
-        # Keep the wordmark purple, but make the dashboard call-to-action
-        # visually distinct with a cyan border, white heading/instruction,
-        # and a bright cyan URL.
-        self._write(self._c(box_prefix + top, "cyan"))
-        self._write(
-            self._c(
-                box_prefix + box_line("DASHBOARD"),
-                "white",
-            )
-        )
-        self._write(
-            self._c(
-                box_prefix + box_line(dashboard_url),
-                "cyan",
-            )
-        )
-        self._write(
-            self._c(
-                box_prefix
-                + box_line(
-                    "Open the dashboard to configure and launch a simulation."
-                ),
-                "white",
-            )
-        )
-        self._write(self._c(box_prefix + bottom, "cyan"))
+            spread = self._TAGLINE
+        self._write(pad + spread)
         self._write("")
 
     def banner(self, **fields: str) -> None:
@@ -341,7 +429,131 @@ class SessionPresenter:
 
         argv = list(_sys.argv[1:])
 
+        def _config_on_the_command_line() -> dict:
+            """The config this run was given, if it was given one.
+
+            The banner was built entirely from command-line flags, so a run
+            started with --config saw none of them and fell back to defaults:
+            it announced a million production steps for a run that only
+            analysed a trajectory, and the setup pH of a config that said
+            something else. Reading the file is the difference between the
+            banner describing the run and describing a run.
+
+            Never raises. A banner is decoration; a run that cannot print one
+            should still start.
+            """
+            import yaml
+
+            for index, item in enumerate(argv):
+                path = None
+                if item in {"--config", "-c", "-config"} and index + 1 < len(argv):
+                    path = argv[index + 1]
+                elif item.startswith("--config="):
+                    path = item.split("=", 1)[1]
+                if not path:
+                    continue
+                try:
+                    data = yaml.safe_load(
+                        _os.fspath(path) and open(path, encoding="utf-8").read()
+                    )
+                except Exception:
+                    return {}
+                return data if isinstance(data, dict) else {}
+            return {}
+
+        from_config = _config_on_the_command_line()
+
+        def configured(phase: str, key: str) -> str:
+            """A value the config gives, as text, or empty."""
+            block = from_config.get(phase)
+            if not isinstance(block, dict):
+                return ""
+            value = block.get(key)
+            return "" if value is None else str(value)
+
+        def argv_list(*names: str) -> list[str]:
+            """A multi-value option from the command line, or an empty list.
+
+            `--include` and `--exclude` take several phases, which `arg_value`
+            cannot read: it returns the first word after the flag.
+            """
+            for index, token in enumerate(argv):
+                if token not in names:
+                    continue
+                values = []
+                for candidate in argv[index + 1:]:
+                    if candidate.startswith("-"):
+                        break
+                    values.append(candidate)
+                return values
+            return []
+
+        _PHASE_OF_SUBCOMMAND = {
+            "setup": "setup",
+            "simulate": "simulation",
+            "analyze": "analysis",
+            "report": "report",
+        }
+
+        def subcommand_phase() -> str:
+            """The one phase a phase subcommand runs, or empty for the rest.
+
+            `fastmdx analyze` says nothing through --include, so the "where
+            nothing says, show everything" fallback printed a SIMULATION block
+            for a command that reads a finished trajectory: a million
+            production steps and a frame interval belonging to no run, taken
+            from the schema defaults. The subcommand is the most definite
+            statement available about which phases happen.
+            """
+            for token in argv:
+                if token.startswith("-"):
+                    continue
+                return _PHASE_OF_SUBCOMMAND.get(token, "")
+            return ""
+
+        def will_run(phase: str) -> bool:
+            """Whether this run includes a phase.
+
+            Read from the command line first, then the config. Reading only
+            the config, `--include setup` printed a SIMULATION section for a
+            run that stops after setup -- announcing 1,750,000 steps that were
+            never going to happen.
+
+            A phase block in a config says the phase was configured, not that
+            it runs: analysis and report take their defaults and appear in no
+            block, so treating a block as inclusion hid two sections of a run
+            that did all four. Where nothing says, every section is shown --
+            leaving one out is the worse mistake.
+
+            A phase subcommand outranks both: `fastmdx analyze` states which
+            phase runs more definitely than any flag, and says nothing through
+            --include, so it used to fall to the show-everything fallback.
+            """
+            only = subcommand_phase()
+            if only:
+                return phase == only
+            # The config is read from the file, not through the loader, so
+            # a study written with the earlier `include` is settled here.
+            included = (argv_list("--include-phase") or argv_list("--include")
+                        or from_config.get("include_phase")
+                        or from_config.get("include"))
+            if isinstance(included, list) and included:
+                return phase in included
+            excluded = (argv_list("--exclude-phase") or argv_list("--exclude")
+                        or from_config.get("exclude_phase")
+                        or from_config.get("exclude"))
+            if isinstance(excluded, list) and excluded:
+                return phase not in excluded
+            return True
+
         def arg_value(*names: str, default: str = "") -> str:
+            """First matching option on the command line, else ``default``.
+
+            Each option is listed under both spellings: `fastmdx explore` uses
+            the phase-prefixed form (--setup-ph), while the per-phase commands
+            drop the prefix (--ph). Listing only one meant the summary showed
+            defaults for every option a per-phase run had actually set.
+            """
             for i, token in enumerate(argv):
                 for name in names:
                     if token == name and i + 1 < len(argv):
@@ -400,16 +612,16 @@ class SessionPresenter:
             _SIM_DEFAULTS = {}
 
         platform = arg_value(
-            "--simulate-platform",
+            "--simulate-platform", "--platform",
             default=field_value("Platform", "platform", default=_SIM_DEFAULTS.get("platform", "auto")),
         )
         precision = arg_value(
-            "--simulate-precision",
+            "--simulate-precision", "--precision",
             default=field_value("Precision", "precision", default=_SIM_DEFAULTS.get("precision", "mixed")),
         )
 
         setup_ph = arg_value(
-            "--setup-ph",
+            "--setup-ph", "--ph",
             default=field_value("pH", "ph", "setup_ph", default=_SETUP_DEFAULTS.get("ph", 7.0)),
         )
         ion_conc = arg_value(
@@ -422,12 +634,22 @@ class SessionPresenter:
             ),
         )
         forcefield = arg_value(
-            "--setup-forcefield",
-            default=field_value("Force Field", "forcefield", "setup_forcefield", default=_SETUP_DEFAULTS.get("forcefield", "charmm36")),
+            "--setup-forcefield", "--forcefield",
+            default=field_value("Force Field", "forcefield", "setup_forcefield",
+                                default=_SETUP_DEFAULTS.get("forcefield", "auto")),
         )
+        if str(forcefield).strip().lower() == "auto":
+            # "auto" tells the reader nothing about what was simulated. Show
+            # what it resolves to, and say that it was chosen rather than named.
+            try:
+                from fastmdxplora.setup.forcefields import resolve_forcefield
+
+                forcefield = f"{resolve_forcefield('auto').name} (auto)"
+            except Exception:  # noqa: BLE001 - the banner must never fail a run
+                pass
 
         timestep = arg_value(
-            "--simulate-timestep-fs",
+            "--simulate-timestep-fs", "--timestep-fs",
             default=field_value("Timestep", "timestep_fs", "simulate_timestep_fs", default=_SIM_DEFAULTS.get("timestep_fs", 2.0)),
         )
         temperature = arg_value(
@@ -435,7 +657,7 @@ class SessionPresenter:
             default=field_value("Temperature", "temperature_K", "simulate_temperature_K", default=_SIM_DEFAULTS.get("temperature_K", 300.0)),
         )
         friction = arg_value(
-            "--simulate-friction-per-ps",
+            "--simulate-friction-per-ps", "--friction-per-ps",
             default=field_value("Friction", "friction_per_ps", "simulate_friction_per_ps", default=_SIM_DEFAULTS.get("friction_per_ps", 1.0)),
         )
 
@@ -464,28 +686,42 @@ class SessionPresenter:
             """Resolve displayed stage steps from the same defaults as simulation."""
             try:
                 from fastmdxplora.simulation.pipeline import DEFAULTS as _SIM_DEFAULTS
-                from fastmdxplora.simulation.pipeline import PRESETS as _SIM_PRESETS
                 from fastmdxplora.simulation.runner import plan_stages as _plan_stages
             except Exception:
-                nvt = maybe_int(arg_value("--simulate-nvt-steps", default=""))
-                npt = maybe_int(arg_value("--simulate-npt-steps", default=""))
-                prod = maybe_int(arg_value("--simulate-production-steps", default=""))
+                nvt = maybe_int(arg_value("--simulate-nvt-steps", "--nvt-steps", default=""))
+                npt = maybe_int(arg_value("--simulate-npt-steps", "--npt-steps", default=""))
+                prod = maybe_int(arg_value("--simulate-production-steps", "--production-steps", default=""))
                 total = None if None in (nvt, npt, prod) else int(nvt) + int(npt) + int(prod)
                 return nvt, npt, prod, total
 
             params = dict(_SIM_DEFAULTS)
-            preset = arg_value("--simulate-preset", default="")
-            if preset:
-                params.update(_SIM_PRESETS.get(preset.lower(), {}))
-                params["preset"] = preset.lower()
 
+            # A field the caller passed beats a command-line flag, which beats
+            # the default. The caller knows what the run resolved to; argv
+            # only knows what somebody typed, and a run driven by a config
+            # file typed none of it.
             overrides = {
-                "nvt_steps": maybe_int(arg_value("--simulate-nvt-steps", default="")),
-                "npt_steps": maybe_int(arg_value("--simulate-npt-steps", default="")),
-                "production_steps": maybe_int(arg_value("--simulate-production-steps", default="")),
-                "duration_ns": maybe_float(arg_value("--simulate-duration-ns", default="")),
-                "nvt_duration_ns": maybe_float(arg_value("--simulate-nvt-duration-ns", default="")),
-                "npt_duration_ns": maybe_float(arg_value("--simulate-npt-duration-ns", default="")),
+                "nvt_steps": maybe_int(field_value(
+                    "nvt_steps", default=arg_value(
+                        "--simulate-nvt-steps", "--nvt-steps", default=""))),
+                "npt_steps": maybe_int(field_value(
+                    "npt_steps", default=arg_value(
+                        "--simulate-npt-steps", "--npt-steps", default=""))),
+                "production_steps": maybe_int(field_value(
+                    "production_steps", default=arg_value(
+                        "--simulate-production-steps", "--production-steps",
+                        default=""))),
+                "duration_ns": maybe_float(field_value(
+                    "duration_ns", default=arg_value(
+                        "--simulate-duration-ns", "--duration-ns", default=""))),
+                "nvt_duration_ns": maybe_float(field_value(
+                    "nvt_duration_ns", default=arg_value(
+                        "--simulate-nvt-duration-ns", "--nvt-duration-ns",
+                        default=""))),
+                "npt_duration_ns": maybe_float(field_value(
+                    "npt_duration_ns", default=arg_value(
+                        "--simulate-npt-duration-ns", "--npt-duration-ns",
+                        default=""))),
                 "timestep_fs": maybe_float(timestep),
             }
             params.update({k: v for k, v in overrides.items() if v is not None})
@@ -506,7 +742,20 @@ class SessionPresenter:
         nvt_steps, npt_steps, prod_steps, total_steps = resolve_stage_display()
 
         def resolve_trajectory_display() -> str:
-            raw = arg_value("--simulate-trajectory-interval-steps", default="")
+            # Fields beat the command line, and the command line beats the
+            # config -- the same precedence the stage steps above use, and for
+            # the same reason: a run driven by a config file typed none of it.
+            # Reading argv alone, this printed a computed default while the
+            # run used the config's value, so a banner promising a frame every
+            # 100 steps introduced a run writing one every 250.
+            raw = field_value(
+                "trajectory_interval_steps",
+                default=arg_value(
+                    "--simulate-trajectory-interval-steps",
+                    "--trajectory-interval-steps",
+                    default=configured("simulation", "trajectory_interval_steps"),
+                ),
+            )
             explicit = maybe_int(raw)
             if explicit is not None:
                 return f"save frame every {explicit:,} production steps"
@@ -519,7 +768,6 @@ class SessionPresenter:
 
         trajectory_display = resolve_trajectory_display()
 
-        report_title = arg_value("--report-title", default="FastMDXplora Run")
         # Resolve the dashboard URL from an explicitly supplied field,
         # an environment variable, or the dashboard CLI flags.
         dashboard_link = str(
@@ -558,20 +806,14 @@ class SessionPresenter:
 
         H = chr(0x2500)
         V = chr(0x2502)
-        TL = chr(0x256D)
-        TR = chr(0x256E)
-        BL = chr(0x2570)
-        BR = chr(0x256F)
-        CHECK = chr(0x2713)
-
-        # Every run-information box uses one shared width and one shared
-        # indentation. The boxes are centered beneath the startup wordmark,
-        # while their internal content remains left-aligned for readability.
+        # One box holds every section. It is left-aligned with the startup
+        # wordmark rather than centred, so the whole introduction reads as a
+        # single left-hand column instead of drifting to the middle of a wide
+        # terminal.
         box_width = min(112, max(72, self.width - 24))
         box_width = min(box_width, max(38, self.width - 2))
         content_w = box_width - 4
-        box_indent = max(0, (self.width - box_width) // 2)
-        box_prefix = " " * box_indent
+        box_prefix = "  "
 
         def fit(text: str, limit: int | None = None) -> str:
             text = str(text)
@@ -582,15 +824,14 @@ class SessionPresenter:
                 return text[:available]
             return text[: max(0, available - 3)] + "..."
 
+        # No border. A box around the settings made the banner the loudest
+        # thing on the screen, and it is the least important: what a reader
+        # wants from it is the handful of values, not a frame around them.
         def top(color: str) -> None:
-            self._write(
-                box_prefix + self._c(TL + H * (box_width - 2) + TR, color)
-            )
+            return
 
         def bottom(color: str) -> None:
-            self._write(
-                box_prefix + self._c(BL + H * (box_width - 2) + BR, color)
-            )
+            return
 
         def line(
             text: str = "",
@@ -600,6 +841,9 @@ class SessionPresenter:
             raw = fit(text)
             pad = " " * max(0, content_w - _visual_width(raw))
             body = self._c(raw, text_color) if text_color else raw
+            if not _BOXED:
+                self._write((box_prefix + "  " + body).rstrip())
+                return
             self._write(
                 box_prefix
                 + self._c(V, border)
@@ -628,6 +872,15 @@ class SessionPresenter:
             value_raw = fit(value, value_limit)
             visible = _visual_width(label_raw) + 1 + _visual_width(value_raw)
             pad = " " * max(0, content_w - visible)
+            if not _BOXED:
+                self._write(
+                    box_prefix
+                    + "  "
+                    + self._c(label_raw, label_color or border)
+                    + " "
+                    + self._c(value_raw, value_color)
+                )
+                return
             self._write(
                 box_prefix
                 + self._c(V, border)
@@ -640,95 +893,90 @@ class SessionPresenter:
                 + self._c(V, border)
             )
 
+        def section(text: str, border: str) -> None:
+            """Start a new section inside the shared box."""
+            line("", border)
+            title(text, border)
+
         self.welcome(
             dashboard_url=dashboard_link,
             dashboard_enabled=dashboard_enabled,
         )
 
         top("green")
-        title("CURRENT RUN", "green")
         kv("System", system, "green")
         kv("Output", output, "green")
         kv("Version", version, "green")
         kv("Started", started, "green")
-        kv("Platform", f"{platform} ({precision} precision)", "green")
-        bottom("green")
-        self._write("")
+        from fastmdxplora.simulation.runner import PRECISION_PLATFORMS
 
-        top("cyan")
-        title("SETUP", "cyan")
-        kv("pH", setup_ph, "cyan")
-        kv("Ion Conc.", f"{ion_conc} M", "cyan")
-        kv("Force Field", forcefield, "cyan")
-        bottom("cyan")
-        self._write("")
+        # The platform asked for, before one is chosen: a precision applies
+        # only on the GPU platforms, so "CPU (mixed precision)" said one that
+        # is never applied.
+        if platform in PRECISION_PLATFORMS:
+            kv("Platform", f"{platform} ({precision} precision)", "green")
+        elif platform == "auto":
+            kv("Platform", f"auto ({precision} precision if a GPU is chosen)", "green")
+        else:
+            kv("Platform", platform, "green")
+        # How to watch it. The banner computed this address and threw it away,
+        # on the reasoning that the GUI prints its own -- true when a server
+        # is running, and no help to somebody who has just started a run and
+        # wants to see it. Where no server is running, the command that starts
+        # one is the useful thing to print; a bare URL would point at nothing.
+        if dashboard_enabled:
+            kv("Watch", dashboard_link, "green")
+        else:
+            kv("Watch", f"fastmdx gui --output {_worth_watching(output)}", "green")
+        # Only the phases this run includes. Announcing a million production
+        # steps for a run that only analyses a trajectory is not a small
+        # inaccuracy: it is the log saying the run did something it did not.
+        if will_run("setup"):
+            section("SETUP", "cyan")
+            kv("pH", configured("setup", "ph") or setup_ph, "cyan")
+            kv(
+                "Ion Conc.",
+                f"{configured('setup', 'ion_concentration_M') or ion_conc} M",
+                "cyan",
+            )
+            kv("Force Field", configured("setup", "forcefield") or forcefield, "cyan")
+        if will_run("simulation"):
+            section("SIMULATION", "orange")
+            kv("NVT", f"{format_steps(nvt_steps)} steps", "orange")
+            kv("NPT", f"{format_steps(npt_steps)} steps", "orange")
+            kv("Production", f"{format_steps(prod_steps)} steps", "orange")
+            kv("Total Planned", f"{format_steps(total_steps)} steps", "orange")
+            kv("Timestep", f"{timestep} fs", "orange")
+            kv(
+                "Temperature",
+                f"{configured('simulation', 'temperature_K') or temperature} K",
+                "orange",
+            )
+            kv("Friction", f"{friction} / ps", "orange")
+            kv("DCD Frames", trajectory_display, "orange")
 
-        top("orange")
-        title("SIMULATION", "orange")
-        kv("NVT", f"{format_steps(nvt_steps)} steps", "orange")
-        kv("NPT", f"{format_steps(npt_steps)} steps", "orange")
-        kv("Production", f"{format_steps(prod_steps)} steps", "orange")
-        kv("Total Planned", f"{format_steps(total_steps)} steps", "orange")
-        kv("Timestep", f"{timestep} fs", "orange")
-        kv("Temperature", f"{temperature} K", "orange")
-        kv("Friction", f"{friction} / ps", "orange")
-        kv("DCD Frames", trajectory_display, "orange")
-        bottom("orange")
-        self._write("")
-
-        # Analysis and report information uses a blue frame, cyan labels,
-        # and white values. The box itself shares the same centered layout as
-        # every other run-information section; its contents remain left-aligned.
-        top("blue")
-        title("ANALYSIS & REPORT", "blue")
-        kv(
-            "Dashboard",
-            dashboard_link if dashboard_link else "Not available",
-            "blue",
-            label_color="cyan",
-        )
-        kv(
-            "Report",
-            report_title,
-            "blue",
-            label_color="cyan",
-        )
-        bottom("blue")
-        self._write("")
+        # The report's title was listed here, which announced the name of a
+        # document that did not exist yet and said nothing about the run. A
+        # section with nothing to say is left out rather than printed empty.
+        if dashboard_enabled and dashboard_link:
+            section("ANALYSIS", "blue")
+            # Only when a browser was actually asked for: printing the address
+            # unconditionally sent people to a refused connection, since
+            # `explore` does not start a server on its own.
+            kv(
+                "GUI",
+                dashboard_link,
+                "blue",
+                label_color="cyan",
+            )
 
         # Use green here to balance the cyan, orange, and blue sections above.
-        top("green")
-        title("REPORTING & OUTPUTS", "green")
-        line(
-            f"{CHECK} Markdown report      {CHECK} HTML summary        {CHECK} PDF figures",
-            "green",
-            "white",
-        )
-        line(
-            f"{CHECK} PowerPoint slides    {CHECK} PNG/SVG plots       {CHECK} ZIP result bundle",
-            "green",
-            "white",
-        )
+        # The list of output formats and the feature badges are gone. Both
+        # said what this software is rather than what this run is doing, and
+        # the banner is read once at the start of a run by somebody who has
+        # already chosen to use it. The formats are visible in the output
+        # directory afterwards, where they can be opened rather than admired.
         bottom("green")
-        self._write("")
-
-        badges = [
-            "Reproducible",
-            "Config-driven",
-            "OpenMM CPU/GPU",
-            "Energy-aware",
-            "Publication-ready",
-        ]
-
-        def badge_line(items: list[str]) -> str:
-            return "  ".join(self._c(CHECK, "green") + f" {item}" for item in items)
-
-        all_badges = badge_line(badges)
-        if _visual_width(all_badges) <= box_width:
-            self._write(box_prefix + all_badges)
-        else:
-            self._write(box_prefix + badge_line(badges[:3]))
-            self._write(box_prefix + badge_line(badges[3:]))
         self._write("")
 
     def phase_start(self, name: str) -> None:
@@ -758,26 +1006,112 @@ class SessionPresenter:
             return
         elapsed = (time.monotonic() - self._phase_start) if self._phase_start else 0.0
         icon, color = self._STATUS_ICON.get(status, ("·", "muted"))
-        msg = message or f"{name} complete"
+        default_message = {
+            "ok": f"{name} complete",
+            "error": f"{name} failed",
+            "skipped": f"{name} skipped",
+            "warning": f"{name} completed with warnings",
+        }.get(status, f"{name} complete")
+        msg = message or default_message
         line = f"  {self._c(icon, color)} {msg} {self._c(f'({self._fmt_elapsed(elapsed)})', 'muted')}"
         self._write(line)
         self._write("")
         self._phase_start = None
         self._current_phase = None
 
-    def step(self, message: str, *, status: str = "ok") -> None:
+    def progress(
+        self,
+        label: str,
+        done: int,
+        total: int,
+        *,
+        rate_ns_per_day: float | None = None,
+        seconds_left: float | None = None,
+    ) -> None:
+        """Show how far through a stage the run is.
+
+        Molecular dynamics is the part that takes the time, and it used to
+        print the number of steps it was about to take and then nothing until
+        it finished -- half an hour of a terminal that looked identical to a
+        hung one.
+
+        On a terminal this rewrites one line. Where the output is a file --
+        which is where a worker's output goes when several run at once -- a
+        line of carriage returns is unreadable, so it prints at intervals
+        instead.
+        """
+        if self.quiet or total <= 0:
+            return
+
+        fraction = min(1.0, max(0.0, done / total))
+        parts = [f"{fraction * 100:5.1f}%"]
+        if rate_ns_per_day is not None and rate_ns_per_day > 0:
+            parts.append(f"{rate_ns_per_day:.2f} ns/day")
+        if seconds_left is not None and seconds_left > 0:
+            parts.append(f"{_readable_duration(seconds_left)} left")
+        trailer = "  ".join(parts)
+
+        if not _ansi_supported(self.stream):
+            # A file. Say something every tenth, and once at the end.
+            tenth = max(1, total // 10)
+            if done % tenth and done != total:
+                return
+            self._write(f"    {label}: {trailer}")
+            return
+
+        width = 28
+        filled = int(width * fraction)
+        bar = "\u2501" * filled + "\u2500" * (width - filled)
+        line = (f"    {self._c(bar, 'green' if fraction < 1 else 'cyan')} "
+                f"{trailer}  {label}")
+        self.stream.write("\r\x1b[2K" + line)
+        self.stream.flush()
+        if done >= total:
+            self.stream.write("\n")
+            self.stream.flush()
+
+    def step(self, message: str, *, status: str = "ok",
+             explain: str | None = None) -> None:
         """Print a single indented step inside the current phase.
 
         Used for fine-grained progress messages within a phase, such as
         ``"Loaded input: protein.pdb"`` during setup or ``"Wrote slides.pptx"``
         during report.
+
+        ``explain`` names an entry in :mod:`fastmdxplora.explain`, printed
+        beneath the step when explanations are on. It is a key rather than the
+        text itself, so an explanation cannot drift onto the wrong step and a
+        step cannot quietly lose its explanation.
         """
         if self.quiet:
             return
         icon, color = self._STATUS_ICON.get(status, ("·", "muted"))
         self._write(f"  {self._c(icon, color)} {message}")
 
-    def info(self, message: str) -> None:
+        self.explanation(explain)
+
+    def explanation(self, key: str | None) -> None:
+        """Print the explanation named by ``key``, if explanations are on.
+
+        Separate from :meth:`step` because the simulation phase announces its
+        stages through :meth:`info` -- no status icon, because "NVT
+        equilibration: 250,000 steps" is not a thing that succeeded or failed
+        -- and those stages are exactly where the reasons are worth having.
+        The entries for minimisation, NVT, NPT and the ensemble existed and
+        had nowhere to be printed from.
+        """
+        if not key or not self.explain or self.quiet:
+            return
+        from fastmdxplora.explain import explain as _lookup
+
+        entry = _lookup(key)
+        if entry is None:
+            return
+        self._write("")
+        self._write(self._c(entry.as_text(), "muted"))
+        self._write("")
+
+    def info(self, message: str, *, explain: str | None = None) -> None:
         """Print a plain indented message (no status icon).
 
         Useful for things like ``"Loading trajectory... 10000 frames"``
@@ -786,6 +1120,7 @@ class SessionPresenter:
         if self.quiet:
             return
         self._write(f"  {message}")
+        self.explanation(explain)
 
     def analysis_table_row(
         self,
@@ -795,6 +1130,7 @@ class SessionPresenter:
         elapsed: float,
         *,
         name_width: int | None = None,
+        reason: str | None = None,
     ) -> None:
         """Print one row of the analysis-phase status table.
 
@@ -804,6 +1140,15 @@ class SessionPresenter:
 
         The orchestrator should pass ``name_width`` set to the longest
         analysis name in the plan so all rows align.
+
+        An analysis that fails passes ``reason``, which is printed beneath
+        the row. Without it the table read ``✗ error`` and nothing else,
+        while the explanation sat in the debug log: `rdf` on a default
+        configuration reports *"selection_b 'water and name O' matched no
+        atoms"*, which names the problem exactly, and a reader watching the
+        run never saw it. The software refuses in order to be told why, and
+        a refusal filed somewhere the person is not looking is a refusal
+        that has not been made.
         """
         if self.quiet:
             return
@@ -818,6 +1163,10 @@ class SessionPresenter:
             f"{path_arrow}  {path:<22}  {elapsed_str}"
         )
         self._write(line)
+        detail = _the_useful_part_of(name, reason)
+        if detail:
+            for wrapped in _wrap(detail, max(40, self.width - nw - 12)):
+                self._write(f"  {' ' * (nw + 4)}{self._c(wrapped, color)}")
 
     def done(self, *, message: str = "Done") -> None:
         """Print the closing session-total line."""
@@ -912,6 +1261,16 @@ def get_presenter() -> SessionPresenter:
     if _PRESENTER is None:
         _PRESENTER = SessionPresenter()
     return _PRESENTER
+
+
+def set_explain(enabled: bool) -> None:
+    """Turn the step explanations on or off for the current session.
+
+    The presenter is a singleton created before the command line has been
+    read, so the setting arrives afterwards rather than through its
+    constructor.
+    """
+    get_presenter().explain = bool(enabled)
 
 
 def reset_presenter() -> None:

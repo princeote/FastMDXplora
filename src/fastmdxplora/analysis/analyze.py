@@ -39,17 +39,73 @@ def __getattr__(name: str):
     raise AttributeError(name)
 
 
+def study_trajectory(project_root: Path) -> tuple[Path | None, Path | None]:
+    """An extended study's joined trajectory and its topology, where it has
+    one newer than its own first piece; otherwise ``(None, None)``.
+
+    Analysed again in place, an extended study is its pieces, not its first
+    one. The join used to say so by writing the joined trajectory's path
+    into the study's resolved config, which then carried it to any study run
+    from that file: a new study would simulate and analyse the old one's
+    trajectory. The study's own folder says it instead.
+
+    In a read held to the study (`record_access`), a record of the join, the
+    first piece's trajectory or the topology the join names that the read
+    refuses raises `OutsideWorkspace`: not read is not a study of one run.
+    """
+    import json
+
+    from fastmdxplora import record_access as _records
+    from fastmdxplora.refusals import OutsideWorkspace
+    from fastmdxplora.simulation.pipeline import _may_look, _refuse
+
+    root = Path(project_root)
+    joined = root / "joined" / "production.dcd"
+    record = root / "joined" / "joined.json"
+    own = root / "simulation" / "production.dcd"
+    try:
+        # A record of the join a held read refused (`pipeline._refused`) was
+        # not read: the study is not thereby a study of one run. The record
+        # first, which says what the join is, so it is the one named.
+        _refuse(record, joined)
+        if not (_records.is_file(joined) and _records.is_file(record)
+                and _records.stat(joined).st_size > 0):
+            return None, None
+        # A study simulated again in place after it was joined has a first
+        # piece newer than the join, and the join is not its trajectory.
+        _refuse(own)
+        if (_records.is_file(own)
+                and _records.stat(own).st_mtime > _records.stat(joined).st_mtime):
+            return None, None
+        named = json.loads(_records.read_text(record, encoding="utf-8")).get("topology")
+    except OutsideWorkspace:
+        raise
+    except (OSError, ValueError, AttributeError):
+        return None, None
+    # The topology the join names is looked at only where a held read may
+    # look (`pipeline._may_look`).
+    topology = Path(str(named)) if named else None
+    if topology is not None:
+        _refuse(topology)
+    return joined, (topology if topology is not None and _may_look(topology)
+                    and _records.is_file(topology) else None)
+
+
 def run(
     *,
     orchestrator: "FastMDXplora",
     output_dir: Path,
     trajectory: str | None = None,
     topology: str | None = None,
+    ligand_resname: str | None = None,
     include: list[str] | None = None,
     exclude: list[str] | None = None,
     options: dict[str, dict[str, Any]] | None = None,
     selection: str | None = None,
+    select_atoms: str | None = None,
     scope: str = "solute",
+    figure_colours: str | None = None,
+    figure_width: str | None = None,
     stride: int | None = None,
     first: int | None = None,
     last: int | None = None,
@@ -69,11 +125,47 @@ def run(
     """
     import json
 
+    # One word for a selection expression, whichever phase is asking. The
+    # collective-variable blocks take `select_atoms`; an analysis taking a
+    # different word for the same string would put the general name back
+    # where it started, which is a thing to look up.
+    if select_atoms is not None and selection is None:
+        selection = select_atoms
+
     project_root = orchestrator.output_dir
-    traj_path = Path(trajectory) if trajectory else project_root / "simulation" / "production.dcd"
-    top_path = Path(topology) if topology else project_root / "simulation" / "topology.pdb"
+    joined_trajectory, joined_topology = study_trajectory(project_root)
+    traj_path = Path(trajectory) if trajectory else (
+        joined_trajectory or project_root / "simulation" / "production.dcd")
+    if not trajectory and not topology and joined_topology is not None:
+        topology = str(joined_topology)
+    # The topology that matches the trajectory, where the two differ.
+    # `save_selection` defaults to leaving the solvent out, so the file
+    # beside the trajectory describes fewer atoms than the prepared system
+    # does, and loading a subset against the full topology is not a
+    # near-miss: it is an atom-count mismatch that stops the phase, or
+    # worse a silent misalignment wherever the counts happen to agree.
+    if topology:
+        top_path = Path(topology)
+    else:
+        saved = project_root / "simulation" / "trajectory_topology.pdb"
+        top_path = (saved if saved.is_file()
+                    else project_root / "simulation" / "topology.pdb")
 
     presenter = getattr(orchestrator, "_presenter", None)
+
+    # A study that asked for no production (`duration_ns: 0`) has nothing to
+    # analyse, and says so as a skip with its reason rather than as a
+    # deferral waiting for a trajectory that will never come.
+    if not Path(traj_path).exists() and _production_was_zero(project_root):
+        from fastmdxplora.orchestrator import PhaseSkipped
+
+        reason = ("the study equilibrated only, with no production, so there "
+                  "is no trajectory to analyse")
+        manifest_path = output_dir / "analysis_manifest.json"
+        with manifest_path.open("w", encoding="utf-8") as fh:
+            json.dump({"phase": "analysis", "status": "skipped", "note": reason},
+                      fh, indent=2)
+        raise PhaseSkipped(reason, ["analysis_manifest.json"])
 
     # Graceful degradation when the simulation phase hasn't produced
     # a real trajectory yet.
@@ -101,7 +193,9 @@ def run(
     # Detect a ligand from the setup manifest so scope-based selections can
     # include it (solute = protein + ligand) and so ligand-specific analyses
     # know the residue name. Absent or unreadable manifest -> no ligand.
-    ligand_resname = _detect_ligand_resname(project_root)
+    resolved_ligand_resname = (
+        ligand_resname or _detect_ligand_resname(project_root)
+    )
 
     ao = AnalysisOrchestrator(
         trajectory=str(traj_path),
@@ -109,10 +203,13 @@ def run(
         output_dir=output_dir,
         selection=selection,
         scope=scope,
-        ligand_resname=ligand_resname,
+        ligand_resname=resolved_ligand_resname,
         stride=stride,
         first=first,
         last=last,
+        saving_interval_ps=_saving_interval_ps(project_root, trajectory=traj_path),
+        figure_colours=figure_colours,
+        figure_width=figure_width,
     )
 
     if presenter:
@@ -143,8 +240,15 @@ def run(
                 if r.output_dir else f"analysis/{name}/"
             )
             presenter.analysis_table_row(
-                name, r.status, path + "/", elapsed, name_width=name_width
+                name, r.status, path + "/", elapsed, name_width=name_width,
+                reason=r.message if r.status != "ok" else None,
             )
+        # Why the figures say how many independent samples a mean rests on,
+        # and why interactions are typed rather than counted.
+        if any(r.status == "ok" for r in results.values()):
+            presenter.explanation("convergence")
+        if getattr(results.get("pl_interactions"), "status", None) == "ok":
+            presenter.explanation("interactions")
 
     artifacts: list[str] = []
     for r in results.values():
@@ -161,16 +265,94 @@ def run(
     return artifacts
 
 
+def _saving_interval_ps(project_root: Path, *, trajectory: str | Path | None = None) -> float | None:
+    """Picoseconds between saved frames, from the run's own record.
+
+    DCD does not carry this through MDTraj, so without it every time series
+    is drawn against a frame index labelled "Time (ns)" -- see
+    ``loading._with_a_real_clock``. The simulation phase records both halves
+    of the answer already and neither had a reader.
+
+    The reporter interval is preferred over the summary fields because it is
+    what the reporter was actually configured with, and stays right when a
+    run stops early: ``duration_ns_actual`` and ``n_production_frames`` are
+    both counted from the steps production ran, so their ratio is also
+    correct, but it is a reconstruction where the first is a setting.
+
+    ``None`` where neither is recorded -- a foreign trajectory, or a run from
+    before this was written -- which the loader turns into a frame axis
+    rather than an invented one. ``None`` too for a run whose integrator
+    chose its own step (`variable_langevin`, `variable_verlet`): its frames
+    are a fixed number of steps apart, not a fixed time.
+    """
+    import json
+
+    from fastmdxplora.simulation.runner import chose_its_own_step
+
+    if chose_its_own_step(project_root / "simulation"):
+        return None
+
+    # A joined trajectory says its own spacing, which is the one to use: its
+    # first segment may have been killed and never written the run's record.
+    if trajectory is not None:
+        beside = Path(trajectory)
+        for record_path in (beside.with_suffix(beside.suffix + ".join.json"),
+                            beside.parent / "joined.json"):
+            try:
+                joined = json.loads(record_path.read_text(encoding="utf-8"))
+                if float(joined.get("saving_interval_ps") or 0) > 0:
+                    return float(joined["saving_interval_ps"])
+            except (OSError, ValueError, TypeError):
+                continue
+
+    manifest = project_root / "simulation" / "simulation_parameters.json"
+    try:
+        record = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+    params = record.get("parameters") or {}
+    # The resolved value first: where no interval was set, the parameter is
+    # the null that was asked for and the resolved one is what was written.
+    steps = ((record.get("resolved") or {}).get("trajectory_interval_steps")
+             or params.get("trajectory_interval_steps"))
+    timestep_fs = params.get("timestep_fs")
+    try:
+        if steps and timestep_fs:
+            interval = float(steps) * float(timestep_fs) / 1000.0
+            if interval > 0:
+                return interval
+    except (TypeError, ValueError):
+        pass
+
+    frames = record.get("n_production_frames")
+    duration_ns = record.get("duration_ns_actual")
+    try:
+        if frames and duration_ns:
+            interval = float(duration_ns) * 1000.0 / float(frames)
+            if interval > 0:
+                return interval
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return None
+
+
 def _detect_ligand_resname(project_root: Path) -> str | None:
     """Read the ligand residue name from the setup manifest, if present.
 
     Returns the ligand name recorded under
     ``resolved_forcefield.ligand.name`` in ``setup/setup_parameters.json``,
-    or ``None`` if there is no ligand or the manifest can't be read.
+    or ``None`` if there is no ligand or the manifest can't be read. For a
+    run given `setup_from`, the manifest is the named system's.
     """
     import json
 
-    manifest = project_root / "setup" / "setup_parameters.json"
+    from fastmdxplora.simulation.pipeline import setup_records_of
+
+    records = setup_records_of(project_root)
+    if records is None:
+        return None
+    manifest = records / "setup_parameters.json"
     try:
         data = json.loads(manifest.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -179,4 +361,19 @@ def _detect_ligand_resname(project_root: Path) -> str | None:
     if not ligand:
         return None
     name = ligand.get("name")
+    if isinstance(name, list):
+        # Several ligands: one selection naming each, `resname AAA L01`.
+        name = " ".join(str(n) for n in name if n)
     return str(name) if name else None
+
+
+def _production_was_zero(project_root: Path) -> bool:
+    """Whether the run's record says it ran no production steps."""
+    import json
+
+    record = Path(project_root) / "simulation" / "simulation_parameters.json"
+    try:
+        resolved = json.loads(record.read_text(encoding="utf-8")).get("resolved") or {}
+    except (OSError, ValueError, AttributeError):
+        return False
+    return isinstance(resolved, dict) and resolved.get("production_steps") == 0

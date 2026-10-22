@@ -17,6 +17,8 @@ import numpy as np
 
 from fastmdxplora.analysis.plotting import apply_style, new_figure, save_figure
 from fastmdxplora.utils.logging import get_logger
+from fastmdxplora.refusals import StudyError
+from fastmdxplora.analysis.plotting import closes_what_it_opens as _closes_what_it_opens
 
 logger = get_logger("report.region_highlights")
 
@@ -72,10 +74,10 @@ def build_region_highlight_artifacts(
     }
 
     try:
-        rmsf_data = _load_rmsf(project_root / "analysis" / "rmsf" / "rmsf.dat")
+        rmsf_data, chains = _load_rmsf(project_root / "analysis" / "rmsf" / "rmsf.dat")
         regions = validate_region_highlights(region_highlights, rmsf_data[:, 0])
         rmsf_path = project_root / "analysis" / "rmsf" / "rmsf_region_highlights.png"
-        _plot_rmsf_regions(rmsf_data, regions, rmsf_path)
+        _plot_rmsf_regions(rmsf_data, regions, rmsf_path, chains=chains)
         manifest["artifacts"].append(_rel(rmsf_path, project_root))
         artifacts.append(_rel_to(rmsf_path, output_dir))
 
@@ -124,44 +126,44 @@ def validate_region_highlights(
 ) -> list[RegionHighlight]:
     """Validate user-supplied region highlight dictionaries."""
     if not isinstance(raw_regions, list) or not raw_regions:
-        raise ValueError("report.region_highlights must be a non-empty list.")
+        raise StudyError("report.region_highlights must be a non-empty list.", code="report.region.invalid")
 
     residues = np.asarray(residue_values, dtype=float)
     if residues.size == 0:
-        raise ValueError("RMSF data contains no residue values.")
+        raise StudyError("RMSF data contains no residue values.", code="analysis.data.absent")
     min_res = int(np.nanmin(residues))
     max_res = int(np.nanmax(residues))
 
     regions: list[RegionHighlight] = []
     for index, item in enumerate(raw_regions, start=1):
         if not isinstance(item, dict):
-            raise ValueError(f"region_highlights[{index}] must be a mapping.")
+            raise StudyError(f"region_highlights[{index}] must be a mapping.", code="report.region.invalid")
         try:
             start = int(item["start"])
             end = int(item["end"])
         except KeyError as exc:
-            raise ValueError(
+            raise StudyError(
                 f"region_highlights[{index}] is missing required key {exc.args[0]!r}."
-            ) from exc
+            , code="report.region.invalid") from exc
         except (TypeError, ValueError) as exc:
-            raise ValueError(
+            raise StudyError(
                 f"region_highlights[{index}] start/end must be integers."
-            ) from exc
+            , code="report.region.invalid") from exc
 
         if start < 1:
-            raise ValueError(
+            raise StudyError(
                 f"region_highlights[{index}] start must be >= 1; got {start}."
-            )
+            , code="report.region.invalid")
         if end < start:
-            raise ValueError(
+            raise StudyError(
                 f"region_highlights[{index}] end must be >= start; "
                 f"got start={start}, end={end}."
-            )
+            , code="report.region.invalid")
         if start < min_res or end > max_res:
-            raise ValueError(
+            raise StudyError(
                 f"region_highlights[{index}] range {start}-{end} is outside "
                 f"the RMSF residue range {min_res}-{max_res}."
-            )
+            , code="report.region.invalid")
 
         label = str(item.get("label") or f"Region {index}")
         color = str(item.get("color") or DEFAULT_COLORS[(index - 1) % len(DEFAULT_COLORS)])
@@ -169,12 +171,26 @@ def validate_region_highlights(
     return regions
 
 
-def _load_rmsf(path: Path) -> np.ndarray:
+def _load_rmsf(path: Path) -> tuple[np.ndarray, "np.ndarray | None"]:
+    """Residue number and RMSF, and each row's chain where there are several.
+
+    A structure with several chains writes a table with a header, naming
+    the chain beside the number; read by position, its first two columns
+    were the chain and the number."""
     if not path.is_file():
-        raise ValueError(
+        raise StudyError(
             "region_highlights require existing RMSF output at "
             "analysis/rmsf/rmsf.dat. Run RMSF analysis first."
-        )
+        , code="analysis.data.absent")
+    try:
+        import pandas as pd
+
+        table = pd.read_csv(path)
+        if {"residue", "rmsf_nm"} <= set(table.columns):
+            return (table[["residue", "rmsf_nm"]].to_numpy(dtype=float),
+                    table["chain"].astype(str).to_numpy() if "chain" in table else None)
+    except (ValueError, OSError):
+        pass
     try:
         data = np.loadtxt(path)
     except ValueError:
@@ -186,14 +202,17 @@ def _load_rmsf(path: Path) -> np.ndarray:
     if data.ndim == 1:
         data = data.reshape(1, -1)
     if data.shape[1] < 2:
-        raise ValueError("RMSF data must have at least two columns.")
-    return data[:, :2]
+        raise StudyError("RMSF data must have at least two columns.", code="analysis.data.absent")
+    return data[:, :2], None
 
 
+@_closes_what_it_opens()
 def _plot_rmsf_regions(
     rmsf_data: np.ndarray,
     regions: list[RegionHighlight],
     output_path: Path,
+    *,
+    chains: "np.ndarray | None" = None,
 ) -> None:
     fig, ax = new_figure(
         title="RMSF with highlighted residue regions",
@@ -215,8 +234,17 @@ def _plot_rmsf_regions(
             fontsize=8,
             color=region.color,
         )
-    ax.plot(x, y, linewidth=1.5, marker="o", markersize=3, color="#4E79A7")
-    ax.fill_between(x, 0, y, alpha=0.10, color="#4E79A7")
+    if chains is None:
+        ax.plot(x, y, linewidth=1.5, marker="o", markersize=3, color="#4E79A7")
+        ax.fill_between(x, 0, y, alpha=0.10, color="#4E79A7")
+    else:
+        # One line per chain on the shared numbering; a region is a range of
+        # residue numbers, so it is shaded once and holds in every chain.
+        for name in dict.fromkeys(chains):
+            mine = chains == name
+            ax.plot(x[mine], y[mine], linewidth=1.3, marker="o", markersize=2.5,
+                    label=f"chain {name}")
+        ax.legend(fontsize="small", ncol=min(4, len(set(chains))))
     ax.set_ylim(top=max(ymax * 1.18, ymax + 0.01))
     save_figure(fig, output_path)
 
@@ -314,6 +342,7 @@ def build_pymol_script(
     return "\n".join(lines)
 
 
+@_closes_what_it_opens()
 def _plot_region_summary(
     *,
     rmsf_path: Path,
@@ -348,6 +377,14 @@ def _plot_region_summary(
         )
 
     fig.tight_layout(pad=0.6)
+    # This one composes its own panels and saves with `bbox_inches="tight"`,
+    # so it does not pass through `save_figure` and would otherwise be the
+    # figure in the report that carries no mark while the analyses behind it
+    # all do. Stamped after tight_layout, as save_figure does, so the mark is
+    # not counted as content and squeezed into the plot area.
+    from fastmdxplora.analysis.plotting import stamp_current
+
+    stamp_current(fig)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(
         output_path,

@@ -9,14 +9,14 @@ description.
 
 Four features read from this single registry, so they never drift apart:
 
-  1. **Validation** (:mod:`fastmdxplora.config.loader`) — unknown keys
+  1. **Validation** (:mod:`fastmdxplora.config.loader`): unknown keys
      are rejected with did-you-mean suggestions; values are type-checked.
-  2. **Template generation** (``fastmdx init-config``) — a fully-commented
+  2. **Template generation** (``fastmdx config``): a fully-commented
      YAML template is generated directly from the field descriptions and
      defaults.
-  3. **Resolved-config dump** — after a run, the merged configuration is
+  3. **Resolved-config dump**: after a run, the merged configuration is
      written to ``resolved_config.yml`` for reproducibility.
-  4. **Documentation** — the field help strings are the canonical
+  4. **Documentation**: the field help strings are the canonical
      descriptions used in the template and (eventually) the docs.
 
 The schema deliberately mirrors the keyword arguments accepted by each
@@ -26,13 +26,56 @@ so a config file and the equivalent flags/kwargs produce identical runs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
 # ---------------------------------------------------------------------------
 # Field descriptor
 # ---------------------------------------------------------------------------
+#: Distinguishes "no separate phase value" from a phase value of ``None``,
+#: which is itself meaningful.
+_UNSET = object()
+
+
+#: Every analysis the registry knows, named here so the schema can offer them
+#: as choices. Kept as a literal rather than imported from the registry: the
+#: analyses import this module, so reading it back would be a cycle. The test
+#: below it holds the two in step.
+ANALYSIS_NAMES = (
+    "rmsd", "rmsf", "rg", "hbonds", "ss", "sasa", "dihedrals", "qvalue",
+    "cluster", "dimred", "water_sites", "ligand_rmsd", "ligand_rmsf",
+    "pl_contacts", "pl_hbonds", "pl_interactions",
+    # Measured against experiment rather than against the trajectory alone:
+    # the first is what NMR relaxation reports, the second what a crystal's
+    # B-factors imply. Each runs only where the system supplies what it
+    # needs -- amide hydrogens, and a deposited file that has B-factors.
+    "order_parameters", "bfactor_comparison",
+    # Reads the state record the simulation wrote, where there is one.
+    "thermodynamics",
+    # Needs a periodic box to normalise against, so it runs on solvated
+    # systems and leaves itself out of anything built in vacuum.
+    "rdf",
+    # Reads the umbrella study's result rather than the trajectory, and runs
+    # only where such a study produced one.
+    "pmf",
+    # Reads the metadynamics run's own surface, where one was produced.
+    "metad_surface",
+    # Reads the pull's own record, where a steered run produced one.
+    "steered_work",
+    # Geometry other people's task sets ask for and this package could not
+    # express: a shell count, a chain's extension, the shape of the inertia
+    # tensor, and the separation of two named things. Each is one number per
+    # frame and none of them needed a new phase.
+    "coordination_number", "end_to_end", "moments_of_inertia",
+    "pair_distance",
+    # A lipid bilayer's area per lipid, thickness and acyl-chain order,
+    # measured where there is one: what a membrane run is checked against
+    # before anything about the protein in it is believed.
+    "area_per_lipid", "bilayer_thickness", "lipid_order",
+)
+
+
 @dataclass(frozen=True)
 class Field:
     """One configurable option.
@@ -47,15 +90,30 @@ class Field:
         (MD option lists are heterogeneous enough that element-level
         checking causes more false positives than it's worth).
     default : Any
-        The value used when the option is absent. ``None`` means "the
-        phase supplies its own default" — we don't duplicate phase
-        defaults here; we record ``None`` so the phase's DEFAULTS table
-        remains the single source for the actual value.
+        The value a user gets when the option is absent. This is what the
+        documentation, the config template, and ``--help`` all report, and
+        what the phase initialises with unless ``phase_sentinel`` says
+        otherwise. It is declared here and nowhere else.
     help : str
         One-line human-readable description (used in the template).
     example : Any, optional
         A representative value shown in the generated template when the
         default is ``None`` (so the template is illustrative, not blank).
+    choices : tuple of str, optional
+        The complete set of accepted values, where there is one. Declared
+        here so that argparse, the GUI's controls, the config template,
+        and validation all offer the same list. They used to hold four
+        separate copies of it.
+    phase_sentinel : Any, optional
+        What the phase table holds, where that must differ from the value
+        the user is told about. ``pressure_bar`` is the case this exists
+        for: its effective default is 1 bar, but the phase must start from
+        ``None`` so that ``pressure_atm`` can be recognised as the setting
+        the user actually gave. Writing 1.0 into the phase table would make
+        bar always present, and bar wins, so an explicit ``pressure_atm``
+        would be silently ignored.
+
+        Both meanings then live in one declaration, next to the reason.
     """
 
     name: str
@@ -63,6 +121,29 @@ class Field:
     default: Any
     help: str
     example: Any = None
+    choices: tuple[str, ...] | None = None
+    #: Inclusive bounds for a numeric setting, where a bound is a fact
+    #: rather than a preference. `choices` refuses a name the software does
+    #: not know; these refuse a number the quantity cannot be. A pH of 25 is
+    #: not a strict pH, it is not a pH.
+    #:
+    #: Only where the limit is genuinely knowable. A 10 fs timestep is
+    #: unstable for almost every system and is not impossible, so it has no
+    #: upper bound -- a guessed one would refuse somebody's legitimate
+    #: coarse-grained run, and the runner already refuses an integration
+    #: that blows up, which is the honest place for that judgement.
+    minimum: float | None = None
+    maximum: float | None = None
+    #: The minimum itself refused too: a timestep or a tolerance of zero is
+    #: no more a value than a negative one, and an interval of steps is at
+    #: least one step.
+    exclusive_minimum: bool = False
+    phase_sentinel: Any = _UNSET
+
+    @property
+    def phase_value(self) -> Any:
+        """What the phase should initialise this option with."""
+        return self.default if self.phase_sentinel is _UNSET else self.phase_sentinel
 
 
 @dataclass(frozen=True)
@@ -75,6 +156,15 @@ class PhaseSchema:
 
     def field_names(self) -> set[str]:
         return {f.name for f in self.fields}
+
+    def defaults(self) -> dict[str, Any]:
+        """The table a phase initialises from.
+
+        A phase used to keep its own copy of this, which is how the pH default
+        came to be 7.4 in one place and 7.0 in another. There is one
+        declaration now, and this reads it.
+        """
+        return {f.name: f.phase_value for f in self.fields}
 
     def get(self, name: str) -> Field | None:
         for f in self.fields:
@@ -92,16 +182,83 @@ TOP_LEVEL = PhaseSchema(
     fields=(
         Field("output", str, None,
               "Output directory for all artifacts. "
-              "Default: ./fastmdxplora_output_<UTC-timestamp>.",
+              "Default: ./fastmdxplora_<system>_study_<UTC-timestamp>.",
               example="./my_study"),
+        Field("agent_model", str, None,
+              "Which AI model wrote this study, as provider/model. Written by "
+              "`fastmdx agent`; by the Agent an AI app asks, which writes the "
+              "AI app's name and its model where the AI app lent it; and by "
+              "an AI app's `save_study`, which writes the AI app's name where "
+              "the AI app does not name its model. Absent when a person wrote "
+              "the config. "
+              "Recorded because `agent: assisted` says an AI model was "
+              "involved and not which one, and six months on that is the "
+              "difference between a record and a note. Pin a dated version "
+              "rather than an alias if it matters: an alias moves when a "
+              "new snapshot lands, so `claude-sonnet-4-6` names different "
+              "software at different times while "
+              "`claude-sonnet-4-5-20250929` does not.",
+              example="anthropic/claude-sonnet-4-5-20250929"),
+        Field("budget_hours", float, None,
+              "A ceiling on GPU hours for this study, every run of it: each "
+              "window, replica and system. Checked after setup, "
+              "where the solvated particle count and so the cost are first "
+              "known, and the study refuses to go on if it would cost more. "
+              "Required for `agent: autonomous`, which runs without being "
+              "shown to anybody, so a ceiling is the only thing left that can "
+              "stop it. Optional in every other mode, and never wrong to set "
+              "on a study that will run for days.",
+              example=40, minimum=0.0),
+        Field("agent", str, None,
+              "How this study was written. Absent means a person wrote it, "
+              "by hand or through the CLI, the API or the GUI, and that is "
+              "the default: nothing here needs an AI model unless you ask for "
+              "one. 'assisted' means an AI model drafted it and you approved "
+              "it before it ran. 'autonomous' means an AI model drafted it and "
+              "it ran without being shown to you, which needs a cost "
+              "estimate so there is a ceiling on what an unseen study may "
+              "spend. 'unvalidated' means the work went outside this "
+              "schema, so nothing checked it and every file it produced "
+              "says so. Recorded rather than inferred, because a reader "
+              "a year from now wants to know how a study was produced and "
+              "not only what it contained.",
+              choices=("assisted", "autonomous", "unvalidated"),
+              example="assisted"),
+        Field("decisions", dict, None,
+              "Why a setting has the value it has, keyed by the setting's "
+              "dotted name (`setup.ph`, `simulation.duration_ns`, "
+              "`budget_hours`): `why`, the reason in a sentence; `source`, "
+              "who or what decided it (`person`, `agent`, or a reference such "
+              "as a DOI); and `alternatives`, the values considered and set "
+              "aside. A record, not a setting: no run reads it, every file "
+              "the study writes carries it, and the report gives it beside "
+              "the methods, so a reader learns what was chosen and why "
+              "rather than only what was used. A name that is not a setting "
+              "is refused, as a misspelled setting is.",
+              example={"setup.ph": {"why": "the assay buffer is pH 7.0",
+                                    "source": "person",
+                                    "alternatives": ["7.4"]}}),
+        Field("explain", bool, True,
+              "Say why each step happens as it happens, with a reference "
+              "where there is one worth reading. On, because a pipeline that "
+              "runs silently teaches nothing and somebody's first trajectory "
+              "should be one they can defend. Turn it off once the steps are "
+              "familiar."),
         Field("verbose", bool, False,
               "Stream debug logging to the terminal in addition to the log file."),
-        Field("include", list, None,
+        # Named for what they select. `include` and `exclude` also name
+        # the analyses inside the analysis block, and a config reading
+        # `exclude: [setup]` above `analysis.exclude: [dimred]` invites the
+        # reader to think the two are the same kind of thing. The earlier
+        # spellings are still accepted and converted when a config is read.
+        Field("include_phase", list, None,
               "Subset of phases to run, in order. "
-              "Mutually exclusive with `exclude`.",
+              "Mutually exclusive with `exclude_phase`. The earlier name "
+              "`include` is still accepted.",
               example=["setup", "simulation", "analysis", "report"]),
-        Field("exclude", list, None,
-              "Phases to skip. Mutually exclusive with `include`.",
+        Field("exclude_phase", list, None,
+              "Phases to skip. Mutually exclusive with `include_phase`. The "
+              "earlier name `exclude` is still accepted.",
               example=["report"]),
     ),
 )
@@ -114,20 +271,135 @@ SETUP = PhaseSchema(
     name="setup",
     description="System preparation: fix structure, solvate, ionize, parameterize.",
     fields=(
-        Field("ph", float, 7.0,
-              "pH for hydrogen placement (sets protonation states)."),
+        Field("agent", str, None,
+              "How this phase was written, where it differs from the "
+              "study's `agent`. Absent means it follows the top-level "
+              "value, and absent everywhere means a person wrote it. "
+              "Set per phase so a study can say what is actually true of "
+              "it: a simulation written by hand and an analysis explored "
+              "outside the schema is a realistic study and a different "
+              "object from one where nothing was checked, and only the "
+              "second should have its trajectory treated with suspicion. "
+              "Choices are the same at both levels: assisted, autonomous, "
+              "unvalidated.",
+              choices=("assisted", "autonomous", "unvalidated"),
+              example="unvalidated"),
+        Field("ph", float, 7.4,
+              "pH for hydrogen placement, which sets protonation states. The "
+              "default is physiological: blood is 7.4, and a protein studied "
+              "without a stated reason otherwise is studied there. Cytosol "
+              "sits near 7.2, a lysosome near 4.7, so a compartment-specific "
+              "study should say so.",
+              example=7.0,
+                    minimum=0.0, maximum=14.0),
+        Field("heterogens", str, "auto",
+              "How to treat non-standard residues: 'auto' (the default) "
+              "decides per component, prepares any ligand it can, and stops "
+              "where the structure does not determine what to simulate. For "
+              "a structure given by PDB identifier, setup fetches each "
+              "ligand's chemistry from the entry itself, so no ligand file "
+              "is needed; crystallisation additives and ions from the liquor "
+              "are discarded, and said. "
+              "'drop' removes them all, reporting what went; 'keep' retains "
+              "them all. 'drop' was the default before 2.0. It never stops, "
+              "but a discarded ligand changes what the run answers without "
+              "saying so.",
+              choices=("auto", "drop", "keep"),
+              example="drop"),
+        Field("mutations", list, None,
+              "Point substitutions to make before anything else, written "
+              "either as L99A or as LEU-99-ALA. The original residue is "
+              "checked against the structure and setup stops where it does "
+              "not match, because a mutation written against one "
+              "construct's numbering would otherwise silently replace "
+              "whatever sits at that position. The replacement side chain "
+              "is placed geometrically rather than modelled, so a mutant "
+              "needs its equilibration watched more closely than a "
+              "deposited structure does.",
+              example=["L99A"]),
+        Field("mutation_chain", str, None,
+              "Which chain the mutations apply to. The first chain when "
+              "not given, which is what a single-chain structure means; "
+              "name it explicitly for anything else.",
+              example="A"),
+        Field("protonation_margin", float, 1.0,
+              "How close a ligand's pKa may come to the pH before setup stops "
+              "rather than pick a charge state. The default is about the "
+              "uncertainty of the pKa calculation itself, so the band marks "
+              "where the answer is unresolved rather than merely close. "
+              "Narrow it only for a ligand whose protonation you know.",
+              example=0.5,
+              minimum=0.0),
+        Field("residue_states", dict, None,
+              "Protonation states to use in place of the ones setup would "
+              "choose, for residues named by chain and number as the "
+              "structure numbers them: {A:57: HIP}. Histidine takes HID "
+              "(hydrogen on ND1), HIE (on NE2) or HIP (both, charged); "
+              "aspartate ASH (neutral) or ASP; glutamate GLH or GLU; lysine "
+              "LYN (neutral) or LYS. Setup otherwise chooses from each "
+              "residue's usual pKa at the pH, and a histidine's tautomer "
+              "from its hydrogen bonds, which is wrong for a catalytic or a "
+              "metal-binding histidine as often as not. A residue named here "
+              "that the structure does not hold stops setup, as does a "
+              "state the residue cannot take.",
+              example={"A:57": "HIP", "A:102": "ASH"}),
+        Field("model", int, None,
+              "Which model of a structure file holding several to prepare, "
+              "as the file numbers them: the conformers of an NMR ensemble, "
+              "most often. Unset, setup prepares the first and says how many "
+              "there are. Swept, it gives replicas that start from different "
+              "structures of the ensemble, which a stopping rule counts as "
+              "independent starts.",
+              example=5, minimum=1),
+        Field("replace_nonstandard_residues", bool, True,
+              "Substitute modified residues (selenomethionine, oxidised "
+              "cysteine) with their standard equivalents. They are part of "
+              "the polymer, and few force fields describe them directly."),
+        Field("chains", list, None,
+              "Chains to simulate, by their deposited ID -- for example "
+              "[A, B]. Default: the biological assembly the file declares "
+              "(built from its symmetry operators where the file holds only "
+              "part of it), or every chain where it declares none. A deposited "
+              "entry is what the experiment produced, not what anyone means "
+              "to simulate: a crystal may hold two copies where one is "
+              "wanted, and a complex may hold partners that belong to a "
+              "different question. Heterogens are kept by proximity rather "
+              "than by their own chain ID, so a ligand in a kept binding "
+              "site comes with it however the entry numbers it.",
+              example=["A", "B"]),
+        Field("build_missing_termini", bool, False,
+              "Build unresolved residues past the ends of a chain as well as "
+              "the gaps between resolved ones. Off, because the two are not "
+              "the same: a gap is pinned at both ends and what is built has "
+              "to reach between them, while a terminus is anchored at one end "
+              "only and what is built there is placed rather than determined. "
+              "Cryo-EM entries commonly leave tens of residues unresolved at "
+              "each terminus, and building them can extend a chain far enough "
+              "to make the structure unusable."),
         Field("keep_heterogens", bool, False,
-              "Retain non-standard residues (ligands, cofactors, ions)."),
+              "Retain non-standard residues. Equivalent to heterogens: keep."),
         Field("keep_water", bool, False,
               "Retain crystallographic waters."),
         Field("fixed_pdb", str, None,
               "Path to an already-fixed PDB to use directly, skipping "
               "PDBFixer. Default: run PDBFixer on the input.",
               example="prepared.pdb"),
-        Field("forcefield", str, "charmm36",
-              "Named force field: charmm36 (default), amber14, amber-fb15. "
+        Field("preparation_audit", bool, False,
+              "Keep a record of each step of the preparation in "
+              "setup/preparation_audit.json: the structure's SHA-256 and "
+              "counts after each, and a copy within 16 MB a file and 64 MB "
+              "in all. It only observes: the system prepared is the same "
+              "with it and without it."),
+        Field("forcefield", str, "auto",
+              "Named force field. "
               "Resolves to the right XML files and water model. For an "
               "unlisted combination, use `force_field` instead.",
+              # The registry in setup.forcefields defines these. It cannot
+              # be imported here: reaching it runs the setup package's
+              # __init__, which imports the phase, which imports this module.
+              # So the names are restated and a test holds them level.
+              choices=("auto", "amber-fb15", "amber-openff", "amber14",
+                       "charmm36"),
               example="charmm36"),
         Field("force_field", list, None,
               "Raw OpenMM force-field XML file(s) — power-user escape hatch "
@@ -139,8 +411,11 @@ SETUP = PhaseSchema(
               example="tip3p"),
         Field("ligand", (str, list), None,
               "Ligand/cofactor SDF or MOL2 file(s) for protein-ligand "
-              "systems. Requires a ligand-capable force field "
-              "(forcefield: amber-openff).",
+              "systems. A file holding several molecules is several "
+              "ligands. Requires a ligand-capable force field "
+              "(forcefield: amber-openff). Needed for a structure given as "
+              "a file; for one given by PDB identifier, setup fetches the "
+              "chemistry of the ligands the entry holds.",
               example="ligand.sdf"),
         Field("ligand_forcefield", str, None,
               "OpenFF small-molecule force field for the ligand "
@@ -148,54 +423,166 @@ SETUP = PhaseSchema(
               "force field.",
               example="openff-2.2.1"),
         Field("ligand_name", str, "LIG",
-              "Residue/molecule name assigned to the ligand."),
+              "Residue/molecule name assigned to the ligand. Also accepted "
+              "as `ligand_resname`, which is what the collective-variable "
+              "blocks call it -- one ligand should not need two words."),
+        Field("ligand_resname", str, None,
+              "The same thing as `ligand_name`, under the spelling the "
+              "umbrella, steered and metadynamics blocks use. Given both, "
+              "this one is ignored."),
         Field("ligand_net_charge", int, None,
-              "Ligand formal net charge. Default: inferred from the SDF."),
+              "Ligand formal net charge. Read from the chemistry file's own "
+              "formal charges when not given, and checked against them when "
+              "it is: setup stops where the two disagree, because the file "
+              "is what gets parameterised and a number cannot change the "
+              "atoms in it. Supplying chemistry as a file therefore sets the "
+              "protonation state, and an ideal SDF from the Chemical "
+              "Component Dictionary is given in one particular form -- "
+              "amidines and carboxylates in it are neutral, which is not "
+              "their state at physiological pH.",
+              example=1),
+        Field("ligand_pose", str, "auto",
+              "Where the ligand's starting coordinates come from. `auto` "
+              "takes the pose from the structure where it holds the residue "
+              "and from the supplied file where it does not, and refuses "
+              "where the structure holds the residue but its atoms cannot "
+              "be matched to the file's. `structure` also refuses a "
+              "structure without the residue. `file` keeps "
+              "the supplied file's coordinates even on a complex -- a "
+              "deliberately unbound start, e.g. as a known-negative control "
+              "for the contact analyses. The clash check still applies.",
+              example="file"),
         Field("check_ligand_clashes", bool, True,
               "Fail setup if the ligand pose severely overlaps the protein "
               "(the provided coordinates must be a feasible bound pose)."),
         Field("ligand_clash_threshold_nm", float, 0.15,
               "Minimum allowed ligand-protein contact distance in nm; pairs "
-              "closer than this count as a clash."),
+              "closer than this count as a clash.",
+              minimum=0.0),
+        Field("membrane", str, None,
+              "Embed the protein in a lipid bilayer instead of a box of "
+              "water. One of POPC, POPE, DLPC, DLPE, DMPC, DOPC or DPPC -- "
+              "the lipids OpenMM can pack. A membrane protein simulated in "
+              "water is not the protein: the hydrophobic belt that sits in "
+              "the bilayer is exposed to solvent and the helices splay. The "
+              "bilayer is built in the xy plane at z = 0 around the protein, "
+              "which is placed first: an OPM file keeps its own frame; "
+              "otherwise the membrane normal, centre and thickness are "
+              "fitted from where the protein's lipid-facing surface is "
+              "apolar. A structure that is not a membrane protein is refused.",
+              choices=("POPC", "POPE", "DLPC", "DLPE", "DMPC", "DOPC", "DPPC")),
+        Field("membrane_orient", bool, False,
+              "Rotate the structure onto the membrane normal fitted from "
+              "where its lipid-facing surface is apolar, and centre it on "
+              "the fitted bilayer. Checked against OPM's orientations for "
+              "65 membrane proteins -- helical bundles, GPCRs with a fusion "
+              "partner or a G protein (whose longest axis is not the "
+              "normal), beta-barrels, trimeric porins -- it came within 21 "
+              "degrees of OPM's normal every time, 3 to 4 at the median. "
+              "Needed for a structure straight from the PDB, whose frame "
+              "has no relation to a membrane; setup refuses and says so "
+              "otherwise. It cannot tell which way up a protein sits, which "
+              "a bilayer of one lipid does not care about."),
+        Field("membrane_orientation_checked", bool, False,
+              "Keep the structure's orientation exactly as it is: the "
+              "bilayer is built in the xy plane and the protein must already "
+              "lie along z. Its centre along z is fitted, unless "
+              "`membrane_center_z_nm` gives it. Set this where you have "
+              "oriented the structure yourself; an OPM file is recognised "
+              "and needs neither."),
+        Field("membrane_center_z_nm", float, None,
+              "Where the bilayer's centre is along z in the structure's own "
+              "frame, in nm, for a structure oriented and positioned "
+              "elsewhere. Needs `membrane_orientation_checked: true`. "
+              "Unset, the centre is fitted, or taken from an OPM file.",
+              example=0.0),
         Field("solvent_padding_nm", float, 1.0,
-              "Minimum distance (nm) between solute and the box wall."),
-        Field("box_shape", str, "cube",
-              "Periodic box geometry: cube, dodecahedron, or octahedron."),
+              "Least distance (nm) between the solute and its nearest periodic "
+              "image, as OpenMM sizes a padded box: the box is the solute's "
+              "bounding sphere plus this, so the water between the solute "
+              "and the box's wall is about half of it. Grown by setup where "
+              "the box would be too narrow for the cutoff.",
+                    minimum=0.0),
+        Field("box_shape", str, "dodecahedron",
+              "Periodic box geometry: cube, dodecahedron, or octahedron. "
+              "A dodecahedron holds the same clearance around the solute in "
+              "roughly 71% of a cube\'s volume, so about a third of the water "
+              "a cube would need is not simulated -- and water is most of the "
+              "atoms. A cube is the right choice where the box must be "
+              "orthorhombic, or where a solute tumbles far enough that only a "
+              "cube keeps it clear of its own image.",
+              choices=("cube", "dodecahedron", "octahedron")),
         Field("ion_positive", str, "Na+",
               "Counter-ion cation."),
         Field("ion_negative", str, "Cl-",
               "Counter-ion anion."),
         Field("ion_concentration_M", float, 0.15,
-              "Target ionic strength in molar (physiological is 0.15)."),
+              "Target ionic strength in molar (physiological is 0.15).",
+                    minimum=0.0, maximum=20.0),
         Field("neutralize", bool, True,
               "Add ions to neutralize the net solute charge."),
+        Field("random_seed", int, None,
+              "Seed for the random choices setup makes: where OpenMM puts the "
+              "hydrogens it adds (at random, then minimised) and which waters "
+              "become ions. With it, preparing the same structure again gives "
+              "the same atoms in the same box. Left unset, a seed is drawn "
+              "and recorded, so any preparation can be repeated from its "
+              "resolved config. A bilayer's packing is seeded from it too.",
+              example=42),
         Field("nonbonded_method", str, "PME",
               "Nonbonded method: NoCutoff, CutoffNonPeriodic, "
-              "CutoffPeriodic, PME, or Ewald."),
-        Field("nonbonded_cutoff_nm", float, 1.0,
-              "Real-space nonbonded cutoff in nm (cutoff/PME/Ewald methods)."),
+              "CutoffPeriodic, PME, or Ewald.",
+              choices=("NoCutoff", "CutoffNonPeriodic", "CutoffPeriodic",
+                       "PME", "Ewald")),
+        Field("nonbonded_cutoff_nm", float, None,
+              "Real-space nonbonded cutoff in nm (cutoff/PME/Ewald methods). "
+              "Default: the force field's own, 1.0 nm for AMBER and 1.2 nm "
+              "for CHARMM36; for an explicit `force_field` list, its files' "
+              "family's (1.2 nm for CHARMM36 files), otherwise 1.0 nm "
+              "(OpenMM's default).",
+              example=1.0,
+                    minimum=0.0),
         Field("ewald_error_tolerance", float, 0.0005,
-              "Ewald/PME error tolerance."),
-        Field("use_switching_function", bool, True,
-              "Apply a switching function near the cutoff (cutoff methods)."),
+              "Ewald/PME error tolerance.",
+              minimum=0.0, exclusive_minimum=True),
+        Field("use_switching_function", bool, None,
+              "Apply a switching function near the cutoff (cutoff methods). "
+              "Default: as the force field is developed, none for AMBER and "
+              "from 1.0 nm for CHARMM36; for an explicit `force_field` list, "
+              "as its files' family is developed where they name one, and "
+              "otherwise none (OpenMM's own default).",
+              example=False),
         Field("switch_distance_nm", (int, float), None,
               "Switching-function turn-on distance in nm. "
-              "Default: 0.9 × cutoff.",
-              example=0.9),
-        Field("dispersion_correction", bool, True,
-              "Apply the long-range dispersion (vdW tail) correction."),
-        Field("remove_cm_motion", bool, False,
-              "Add a center-of-mass motion remover."),
+              "Default: the force field's own where it switches, otherwise "
+              "0.9 × cutoff.",
+              example=0.9,
+              minimum=0.0, exclusive_minimum=True),
+        Field("dispersion_correction", bool, None,
+              "Apply the long-range dispersion (vdW tail) correction. "
+              "Default: as the force field is developed, off for CHARMM36 "
+              "(its lipids were fitted without one), and otherwise as its "
+              "files leave it: OpenMM turns it on where a file says nothing, "
+              "as the AMBER files do. The value used is recorded.",
+              example=True),
+        Field("remove_cm_motion", bool, True,
+              "Add a center-of-mass motion remover. Matches OpenMM's own "
+              "default; without it the system is free to drift as a whole."),
         Field("constraints", str, "HBonds",
               "Bond constraints: None, HBonds, AllBonds, or HAngles."),
         Field("rigid_water", bool, True,
               "Constrain water bond lengths and angles."),
         Field("hydrogen_mass_amu", (int, float), None,
               "Hydrogen-mass-repartitioning mass in amu (enables longer "
-              "timesteps). Default: off.",
-              example=4.0),
+              "timesteps): more than hydrogen's own 1.008 and at most 4.032, "
+              "four times it, "
+              "as the mass is taken from the heavy atom each hydrogen is "
+              "bonded to, which a larger one leaves negative. Default: off.",
+              example=4.0,
+              minimum=1.008, exclusive_minimum=True, maximum=4.032),
         Field("temperature_K", (int, float), 300.0,
-              "Temperature in K for initial velocity assignment."),
+              "Temperature in K for initial velocity assignment.",
+                    minimum=0.0),
     ),
 )
 
@@ -207,83 +594,243 @@ SIMULATION = PhaseSchema(
     name="simulation",
     description="Molecular dynamics: minimize, equilibrate (NVT, NPT), produce.",
     fields=(
-        Field("preset", str, None,
-              "Optional simulation preset. 'gentle' uses conservative "
-              "smoke-test settings: 0.5 fs, 100 K, 5/ps friction, no NPT, "
-              "and short NVT/production.",
-              example="gentle"),
+        Field("agent", str, None,
+              "How this phase was written, where it differs from the "
+              "study's `agent`. Absent means it follows the top-level "
+              "value, and absent everywhere means a person wrote it. "
+              "Set per phase so a study can say what is actually true of "
+              "it: a simulation written by hand and an analysis explored "
+              "outside the schema is a realistic study and a different "
+              "object from one where nothing was checked, and only the "
+              "second should have its trajectory treated with suspicion. "
+              "Choices are the same at both levels: assisted, autonomous, "
+              "unvalidated.",
+              choices=("assisted", "autonomous", "unvalidated"),
+              example="unvalidated"),
         Field("duration_ns", (int, float), None,
               "Production length in ns (standard MD convention — "
-              "equilibration is independent). Default: 2 ns.",
-              example=100.0),
+              "equilibration is independent). 0 equilibrates and stops, "
+              "with no production. Default: 2 ns.",
+              example=100.0,
+                    minimum=0.0),
         Field("nvt_duration_ns", (int, float), None,
               "NVT equilibration in ns. Default: fixed 500 ps regardless "
               "of production length.",
-              example=1.0),
+              example=1.0,
+                    minimum=0.0),
         Field("npt_duration_ns", (int, float), None,
               "NPT equilibration in ns. Default: fixed 1 ns regardless of "
               "production length.",
-              example=2.0),
+              example=2.0,
+                    minimum=0.0),
         Field("nvt_steps", int, None,
-              "NVT step count (overrides nvt_duration_ns). Default: 250000.",
-              example=250000),
+              "NVT step count (in place of nvt_duration_ns; both only where "
+              "they say the same length). Default: the steps "
+              "500 ps takes at the timestep, 250,000 at 2 fs.",
+              example=250000,
+              minimum=0),
+        Field("ensemble", str, None,
+              "Which ensemble production runs in -- 'npt' at constant "
+              "pressure, 'nvt' at constant volume. Absent means it is read "
+              "from `npt_steps`, which is how this worked before the "
+              "setting existed, so every config already written keeps its "
+              "meaning. Worth setting for the case that could not be said "
+              "at all before, which is to equilibrate at constant pressure "
+              "and then produce at constant volume. That is the right way "
+              "to do an NVT production run, because the density has to be "
+              "learned from a barostat before the box is fixed at it, and "
+              "with one setting doing both jobs it was unsayable -- a "
+              "positive NPT stage gave NPT production, and a zero one gave "
+              "NVT at whatever density solvation happened to produce, "
+              "which is the one option nobody intends. With this set, "
+              "`npt_steps` means only how long to equilibrate, so asking "
+              "for npt production with a zero NPT stage is a resumed "
+              "segment, with no equilibration and the barostat the study "
+              "runs under.",
+              choices=("npt", "nvt"),
+              example="nvt"),
         Field("npt_steps", int, None,
-              "NPT step count (overrides npt_duration_ns). Default: 500000.",
-              example=500000),
+              "NPT step count (in place of npt_duration_ns; both only where "
+              "they say the same length). Default: the steps "
+              "1 ns takes at the timestep, 500,000 at 2 fs.",
+              example=500000,
+              minimum=0),
         Field("production_steps", int, None,
-              "Production step count (overrides duration_ns). Default: 1000000.",
-              example=1000000),
+              "Production step count (in place of duration_ns; both only where "
+              "they say the same length). Default: the "
+              "steps 2 ns takes at the timestep, 1,000,000 at 2 fs.",
+              example=1000000,
+              minimum=0),
+        Field("setup_from", str, None,
+              "A finished study or setup directory to simulate from instead "
+              "of running setup again. Point it at the study -- "
+              "`runs/reference` -- and the setup directory inside is found; "
+              "pointing straight at `runs/reference/setup` also works. Runs "
+              "that share one prepared system share its water placement, so "
+              "a difference between them is the setting that was changed "
+              "rather than where the solvent happened to land. Pair it with "
+              "`--exclude setup`, since nothing needs setting up.",
+              example="runs/reference"),
+        Field("prepared_from", str, None,
+              "The earlier name for `setup_from`, still accepted. `setup` "
+              "is what this package calls the automated first phase, so "
+              "`setup_from` is what a directory that phase wrote is called.",
+              example="runs/reference"),
+        Field("extra_ns", float, None,
+              "With `resume_from` naming a study: production to run on top "
+              "of what that study already has, whether or not it finished "
+              "its plan. `duration_ns` beside `resume_from` says the total "
+              "the study should end with instead; with neither, the "
+              "remainder of what it planned is run, which is what resuming "
+              "means. Absent here never means the default length -- a "
+              "continuation with no length asked for finishes the plan.",
+              example=0.1,
+              minimum=0.0),
+        Field("stop_when", dict, None,
+              "Run until what the study is for is determined, rather than for a "
+              "length fixed in advance. A block with `measures` (each an "
+              "`analysis` and either its `standard_error`, in the "
+              "analysis's own unit, or its `relative_error`, a fraction of "
+              "its mean) and `max_duration_ns`, the most production any run "
+              "may reach. `duration_ns` is then the first piece: after it "
+              "the analyses are read, and every run is extended by what the "
+              "numbers say is needed until each quantity is determined as asked "
+              "or the ceiling is reached. By default replicas are required "
+              "(a sweep over `random_seed`) and must agree within their own "
+              "errors, because one run can look equilibrated while trapped in "
+              "one state and its error bar cannot show it; "
+              "`independent_starts: not_required` accepts one run's own "
+              "precision, and the record says what that leaves unchecked.",
+              example={"measures": [{"analysis": "rmsd", "standard_error": 0.01}],
+                       "max_duration_ns": 50}),
+        Field("resume_unsealed", bool, False,
+              "Accept a checkpoint with no seal beside it. A seal says "
+              "the file was written whole, and every checkpoint this "
+              "software writes has one; one written by hand, by another "
+              "program, or by a version before every checkpoint was sealed "
+              "does not. Continuing a study sets this itself where the study "
+              "was killed partway, and the frames written after its last "
+              "checkpoint are left out of the join, so the pieces meet at "
+              "the checkpoint rather than overlapping it."),
+        Field("resume_from", str, None,
+              "What this run continues from, and how much it does depends "
+              "on what you name. A STUDY DIRECTORY continues that study: "
+              "the production runs as its next segment, every finished "
+              "segment is joined into one trajectory, and the analyses and "
+              "the report are rerun over the whole of it -- one study, not "
+              "two, and nothing to join by hand. A CHECKPOINT FILE is the "
+              "raw mechanism underneath: the run starts from those "
+              "coordinates and writes its own trajectory wherever it was "
+              "told, joining and analysing nothing, which is what a "
+              "segmented campaign wants. "
+              "Path to a checkpoint this run continues from. Set on every "
+              "segment after the first when a long run is split; leave it "
+              "out for a run that starts at the beginning. A checkpoint is "
+              "only valid for the exact system, platform and precision it "
+              "was written from, and loading refuses rather than "
+              "proceeding if it does not match. Not every study may be "
+              "split: a metadynamics or steered run refuses, because a "
+              "checkpoint does not carry the bias those methods are made "
+              "of.",
+              example="runs/segment-000/simulation/checkpoint.chk"),
         Field("minimize", bool, True,
               "Run energy minimization before equilibration."),
         Field("integrator", str, "langevin_middle",
               "Integrator: langevin_middle, langevin, brownian, verlet, "
-              "variable_langevin, or variable_verlet."),
+              "variable_langevin, or variable_verlet. verlet and "
+              "variable_verlet have no thermostat while every stage holds a "
+              "temperature, so they are refused; brownian needs a friction of "
+              "about 100 per ps at 2 fs and 300 K (it scales with the "
+              "timestep and temperature) and is refused below it.",
+              choices=("langevin_middle", "langevin", "brownian", "verlet",
+                       "variable_langevin", "variable_verlet")),
         Field("integrator_error_tolerance", float, 0.001,
               "Error tolerance for the variable-timestep integrators "
-              "(variable_langevin / variable_verlet)."),
+              "(variable_langevin / variable_verlet).",
+              minimum=0.0, exclusive_minimum=True),
         Field("minimize_tolerance_kjmol_per_nm", (int, float), 10.0,
-              "Minimization force tolerance in kJ/mol/nm."),
+              "Minimization force tolerance in kJ/mol/nm.",
+              minimum=0.0, exclusive_minimum=True),
         Field("minimize_max_iterations", int, 0,
-              "Max minimization iterations (0 = until convergence)."),
+              "Max minimization iterations (0 = until convergence).",
+              minimum=0),
         Field("timestep_fs", (int, float), 2.0,
-              "Integrator timestep in fs."),
+              "Integrator timestep in fs.",
+              minimum=0.0, exclusive_minimum=True),
         Field("temperature_K", (int, float), 300.0,
-              "Production temperature in K."),
+              "Production temperature in K.",
+              minimum=0.0),
         Field("pressure_bar", (int, float), 1.0,
-              "Pressure for the Monte Carlo barostat in bar (OpenMM-native)."),
+              "Pressure for the Monte Carlo barostat in bar (OpenMM-native).",
+              # The phase must start from None. Bar wins when both units are
+              # given, so a phase table holding 1.0 would make bar always
+              # present and quietly override an explicit pressure_atm.
+              phase_sentinel=None,
+                    minimum=0.0),
         Field("pressure_atm", (int, float), None,
               "Pressure in atm (converted to bar internally). Accepted as "
               "an alternative to pressure_bar; bar wins if both are given.",
-              example=1.0),
+              example=1.0,
+              minimum=0.0),
         Field("friction_per_ps", (int, float), 1.0,
-              "Langevin thermostat friction coefficient in 1/ps."),
+              "Langevin thermostat friction coefficient in 1/ps.",
+              minimum=0.0),
         Field("barostat_frequency", int, 25,
-              "MC barostat volume-move attempt interval in steps."),
+              "MC barostat volume-move attempt interval in steps.",
+              minimum=1),
         Field("random_seed", int, None,
               "Integrator random seed for reproducibility. Default: unset.",
               example=42),
         Field("platform", str, "auto",
-              "OpenMM compute platform: auto, CUDA, OpenCL, CPU, or HIP."),
+              "OpenMM compute platform: auto, CUDA, OpenCL, CPU, or HIP.",
+              choices=("auto", "CUDA", "OpenCL", "CPU", "HIP")),
         Field("precision", str, "mixed",
-              "GPU precision: single, mixed, or double."),
+              "GPU precision: single, mixed, or double.",
+              choices=("single", "mixed", "double")),
         Field("device_index", str, None,
               "GPU device index for multi-GPU machines (e.g. '0' or '0,1').",
               example="0"),
         Field("trajectory_interval_steps", int, None,
               "DCD reporter interval in steps. Default: adaptive "
               "(~2000 frames per production run).",
-              example=1000),
+              example=1000,
+              minimum=1),
         Field("state_interval_steps", int, 1000,
-              "Energy/state reporter interval in steps."),
+              "Energy/state reporter interval in steps.",
+              minimum=1),
+        Field("save_selection", str, "not water",
+              "Which atoms go into the trajectory, in MDTraj's selection "
+              "language. The default leaves the solvent out, because water "
+              "is nine tenths of a solvated system and nine tenths of the "
+              "file: a 20 ns run of a small protein is about 740 MB with it "
+              "and under 80 without. The topology matching what was saved "
+              "is written beside the trajectory; the full system stays in "
+              "setup/. Use `all` where the water itself is the subject -- "
+              "the water-site analysis needs it, and says so rather than "
+              "reporting an empty result.",
+              example="all"),
         Field("checkpoint_interval_steps", int, 10000,
-              "Binary checkpoint (.chk) interval in steps, for restart / "
-              "crash recovery. 0 disables checkpointing."),
-        Field("live_telemetry", bool, False,
+              "Binary checkpoint (.chk) interval in steps, placed on a "
+              "frame. Each is sealed as it is written, and a study stopped "
+              "part-way is carried on from its last one with `fastmdx "
+              "resume`, so this is the most production an interruption can "
+              "cost. A run asked to stop (SIGTERM, Ctrl-C) during production "
+              "writes one on its next frame first, where that is within "
+              "`FASTMDX_STOP_GRACE_SECONDS` (20). 0 disables it, and with it "
+              "resuming.",
+              minimum=0),
+        Field("live_telemetry", bool, True,
               "Write live_status.json, live_metrics.csv, and live_events.log "
               "for the local live dashboard. Also writes a live-frame PDB so "
-              "the molecular viewer can refresh on the simulation."),
+              "the molecular viewer can refresh on the simulation. On by "
+              "default: it costs a tenth of a per cent of the run, measured "
+              "on a solvated system over 2,000 steps with and without, and "
+              "the frame history is capped, so the only thing switching it "
+              "off saves is the ability to watch. Nothing leaves the machine "
+              "-- these are files in the run directory that the GUI reads."),
         Field("telemetry_interval", int, 1000,
-              "Minimum step interval for live dashboard telemetry updates."),
+              "Minimum step interval for live dashboard telemetry updates.",
+              minimum=0),
         Field("dashboard_ligand_resname", str, None,
               "Override the ligand residue name surfaced in the dashboard's "
               "ligand tools pane. Auto-detected when omitted.",
@@ -291,15 +838,114 @@ SIMULATION = PhaseSchema(
         Field("dashboard_binding_pocket_cutoff_A", float, 5.0,
               "Default binding-pocket cutoff in angstrom for the dashboard "
               "molecular viewer (used by the 'show pocket' tools).",
-              example=5.0),
-        Field("dashboard_max_playback_frames", int, 200,
-              "Maximum frames the trajectory-playback panel will load. "
-              "Frames are downsampled evenly from the full DCD.",
-              example=200),
+              example=5.0,
+              minimum=0.0, exclusive_minimum=True),
+        Field("dashboard_max_playback_frames", int, 2000,
+              "Maximum frames of the trajectory the molecular viewer is sent, "
+              "evenly spaced over the whole of it; a system over 5,000 atoms "
+              "is sent fewer, ten million atoms times frames at most.",
+              example=2000,
+              minimum=1),
+        Field("restrain", (str, list, dict), None,
+              "What to hold still during equilibration, as an atom selection "
+              "-- 'protein and not element H' is the usual choice -- or a "
+              "list of blocks with `kind` (position, distance, angle, "
+              "torsion), `selection`, `force_constant` and `target`. Every "
+              "kind is E = k x^2 with no half (a torsion 2k(1 - cos x)); with "
+              "no `target` a restraint is held where it is in the prepared "
+              "structure (before minimisation, which runs restrained), and an "
+              "angle or torsion takes its atoms in the "
+              "order an `index` selection writes them. A structure that has "
+              "just been minimised is not at equilibrium, and heating it lets "
+              "the solute move as well as the solvent: side chains relax into "
+              "the space crystal packing left, and a ligand drifts out of the "
+              "experimental pose. Restraints are released in stages and are "
+              "off for production."),
+        Field("restraint_release", list, None,
+              "Force constants in kJ/mol/nm^2 stepped through during "
+              "equilibration. Defaults to 1000, 500, 100, 0, which is the "
+              "shape standard protocols use. A restraint with no force "
+              "constant of its own runs at these; one with its own is stepped "
+              "down in the same proportions. Production is free whatever the "
+              "last step. Letting go all at once releases the solute into a "
+              "solvent arrangement that formed around a rigid structure."),
+        Field("restrain_production", bool, False,
+              "Keep the restraints on during production, at their full force "
+              "constants, and do not release them during equilibration. Off, "
+              "because a biased production run samples the bias: RMSF, "
+              "clustering and dimensionality reduction would describe the "
+              "restraint as much as the system. Turning it on is recorded "
+              "with the results."),
+        Field("umbrella", dict, None,
+              "Umbrella sampling: a free energy along a coordinate, from "
+              "equilibrium sampling at a series of positions. A block with "
+              "`collective_variable`, the selections it needs, a "
+              "`force_constant`, and either `centres` or `from`/`to`/"
+              "`n_windows`. A selection can be given as `select_atoms`, the "
+              "general word, wherever the variable takes only one; where it "
+              "takes two they are `select_atoms_a` and `select_atoms_b`. Each window becomes a run, and the sampling is "
+              "recombined into a potential of mean force -- unless adjacent "
+              "windows fail to overlap, in which case the gap is reported "
+              "rather than bridged. `minimum_overlap` sets how much two "
+              "neighbours must share; `minimum_samples`, how full a window's "
+              "histogram must be before anything is concluded from it; "
+              "`bootstrap_resamples` (200), how many resamples lie behind the "
+              "curve's interval, 0 for none. The "
+              "system is prepared once and every window simulates from it, "
+              "so a difference between windows is the restraint rather than "
+              "where the water landed. Add a `steered` block beside this one "
+              "and the study pulls once first and starts each window from "
+              "the frame nearest its own centre -- which is what a window "
+              "near a barrier needs, since a restraint cannot move a system "
+              "across one and a window started on the wrong side stays "
+              "there. `seed_from` reuses a finished pull instead of running "
+              "another, so retuning the spacing or the force constant costs "
+              "windows and not a pathway. `force_constant` takes one number "
+              "for every window, or a list with one per window where the "
+              "coordinate has a steep stretch: a restraint holds within two "
+              "sigma against a gradient of 2*sqrt(k*kT), so the constant a "
+              "barrier needs is far larger than the flat parts do, and using "
+              "it everywhere narrows every window until neighbours stop "
+              "overlapping. Give the steep windows their own, and put them "
+              "closer together with `centres` to keep the overlap.",
+              example={"collective_variable": "distance",
+                       "from": 0.3, "to": 1.5, "n_windows": 7,
+                       "force_constant": 5000,
+                       "selection_a": "resname BNZ",
+                       "selection_b": "protein"}),
+        Field("steered", dict, None,
+              "Pull the system along a named coordinate. A block with the "
+              "same `collective_variable` metadynamics takes, plus `to` (the "
+              "value to pull towards), optionally `from`, and `steps`. This "
+              "gives a pathway and the work done along it, not a free "
+              "energy: the work depends on how fast the anchor moves, and a "
+              "single fast pull overestimates a barrier. Its usual purpose "
+              "is generating starting structures for umbrella sampling.",
+              example={"collective_variable": "distance",
+                       "from": 0.3, "to": 1.5, "steps": 500000,
+                       "selection_a": "resname BNZ",
+                       "selection_b": "protein"}),
+        Field("metadynamics", dict, None,
+              "Metadynamics from a named collective variable, without "
+              "writing PLUMED input. A block with `collective_variable` "
+              "(distance, angle, torsion, radius_of_gyration, coordination, "
+              "membrane_depth, q, ligand_distance or ligand_rmsd), the "
+              "selections it needs, and `sigma` -- "
+              "the hill width, roughly the size of the fluctuations within a "
+              "single state. Well-tempered by default, because plain "
+              "metadynamics never lets the bias converge. Choosing the "
+              "variable is the decision the method turns on: if it does not "
+              "distinguish the states that matter, the surface converges and "
+              "describes something that is not the system.",
+              example={"collective_variable": "radius_of_gyration",
+                       "selection": "protein and name CA", "sigma": 0.02,
+                       "height_kjmol": 1.2, "pace_steps": 500}),
         Field("plumed", dict, None,
-              "Optional PLUMED enhanced-sampling config: a dict with "
-              "`enabled` (bool) and `script` (inline PLUMED text or a path "
-              "to a .dat file). Requires the openmm-plumed package."),
+              "Optional PLUMED enhanced sampling: `enabled` turns it on, "
+              "and `script` is the PLUMED input -- the script text itself, "
+              "which then travels inside the config, or a path to a .dat "
+              "file on the machine that runs the study. Requires the "
+              "openmm-plumed package."),
     ),
 )
 
@@ -311,6 +957,19 @@ ANALYSIS = PhaseSchema(
     name="analysis",
     description="Trajectory analysis: RMSD, RMSF, Rg, H-bonds, SS, SASA, etc.",
     fields=(
+        Field("agent", str, None,
+              "How this phase was written, where it differs from the "
+              "study's `agent`. Absent means it follows the top-level "
+              "value, and absent everywhere means a person wrote it. "
+              "Set per phase so a study can say what is actually true of "
+              "it: a simulation written by hand and an analysis explored "
+              "outside the schema is a realistic study and a different "
+              "object from one where nothing was checked, and only the "
+              "second should have its trajectory treated with suspicion. "
+              "Choices are the same at both levels: assisted, autonomous, "
+              "unvalidated.",
+              choices=("assisted", "autonomous", "unvalidated"),
+              example="unvalidated"),
         Field("trajectory", str, None,
               "Trajectory file. Default: simulation/production.dcd.",
               example="simulation/production.dcd"),
@@ -318,30 +977,73 @@ ANALYSIS = PhaseSchema(
               "Topology file. Default: simulation/topology.pdb.",
               example="simulation/topology.pdb"),
         Field("include", list, None,
-              "Subset of analyses to run. Default: all ten. "
+              "Subset of analyses to run. Default: every analysis the "
+              "system supports -- eleven always, the fraction of native "
+              "contacts where the chain is long enough to have a fold, "
+              "water sites where the "
+              "trajectory has water, five more where there is a ligand, and "
+              "the potential of mean force where an umbrella study produced "
+              "one, the free energy surface where a metadynamics run "
+              "did, and the work done where a pull was steered. "
               "Mutually exclusive with `exclude`.",
+              choices=ANALYSIS_NAMES,
               example=["rmsd", "rmsf", "rg", "cluster"]),
         Field("exclude", list, None,
               "Analyses to skip. Mutually exclusive with `include`.",
+              choices=ANALYSIS_NAMES,
               example=["dimred"]),
+        Field("select_atoms", str, None,
+              "Which atoms the analyses read, as an MDTraj selection "
+              "expression. Overrides `scope` when set. The same word the "
+              "umbrella, steered and metadynamics blocks take, so a "
+              "selection is a selection wherever it appears.",
+              example="name CA"),
         Field("selection", str, None,
-              "Default MDTraj atom selection applied across analyses. "
-              "Overrides `scope` when set.",
+              "The earlier name for `select_atoms`, still accepted. Given "
+              "both, `select_atoms` is ignored.",
               example="name CA"),
         Field("scope", str, "solute",
-              "Atom scope for analyses that don't set their own selection: "
-              "solute (protein+ligand, default), protein, ligand, or all. "
-              "Keeps analyses off solvent/ions.",
+              "Which atoms an analysis reads when it has no selection of "
+              "its own. 'solute' is the protein and any ligand, and is the "
+              "default: including the water and ions would describe the "
+              "solvent box rather than the molecule in it, so a radius of "
+              "gyration would report the size of the box and barely move. "
+              "'all' is there for when the solvent is the point.",
+              choices=("solute", "protein", "ligand", "all"),
               example="solute"),
         Field("stride", int, None,
               "Load every Nth frame from the trajectory.",
-              example=1),
+              example=1,
+              minimum=1),
         Field("first", int, None,
               "First frame index to include.",
-              example=0),
+              example=0,
+              minimum=0),
         Field("last", int, None,
               "Last frame index (exclusive). Default: full trajectory.",
-              example=10000),
+              example=10000,
+              minimum=0),
+        Field("figure_colours", str, "colour",
+              "What every figure is plotted in. 'colour' uses the Okabe-Ito "
+              "palette, which is chosen to stay distinguishable under the "
+              "common forms of colour vision deficiency. 'greyscale' drops "
+              "hue and carries the same distinctions in value and hatching, "
+              "which is what a print journal wants. 'both' writes the colour "
+              "figure as <name>.png and a greyscale copy as "
+              "<name>_greyscale.png beside it, so the choice does not have "
+              "to be made before the journal is. American spellings are "
+              "accepted.",
+              choices=("colour", "greyscale", "both"),
+              example="both"),
+        Field("figure_width", str, "page",
+              "How wide every figure is plotted, with its type sized for that "
+              "width: 'page' (6.5 in, a manuscript page's text width), "
+              "'single_column' (89 mm, one journal column, 7-8 pt type) or "
+              "'double_column' (183 mm, two). A figure plotted at the width it "
+              "is printed at keeps its type legible; one plotted for the page "
+              "and scaled into a column takes its 9 pt ticks to about 5 pt.",
+              choices=("page", "single_column", "double_column"),
+              example="single_column"),
         Field("options", dict, None,
               "Per-analysis option overrides, keyed by analysis name. "
               "E.g. {cluster: {methods: [kmeans], n_clusters: 5}}.",
@@ -357,6 +1059,19 @@ REPORT = PhaseSchema(
     name="report",
     description="Generate the Markdown report, PPTX slides, and project bundle.",
     fields=(
+        Field("agent", str, None,
+              "How this phase was written, where it differs from the "
+              "study's `agent`. Absent means it follows the top-level "
+              "value, and absent everywhere means a person wrote it. "
+              "Set per phase so a study can say what is actually true of "
+              "it: a simulation written by hand and an analysis explored "
+              "outside the schema is a realistic study and a different "
+              "object from one where nothing was checked, and only the "
+              "second should have its trajectory treated with suspicion. "
+              "Choices are the same at both levels: assisted, autonomous, "
+              "unvalidated.",
+              choices=("assisted", "autonomous", "unvalidated"),
+              example="unvalidated"),
         Field("title", str, None,
               "Report title. Default: auto-generated from the system name.",
               example="My MD Study"),
@@ -367,6 +1082,12 @@ REPORT = PhaseSchema(
               "Generate the Markdown study report."),
         Field("slides", bool, True,
               "Generate the PPTX slide deck."),
+        Field("pdf", bool, True,
+              "Render the report as a PDF as well as Markdown. Needs "
+              "WeasyPrint and a Markdown converter; where they are absent "
+              "the run says so and continues, because four other formats "
+              "were produced. Install with the [pdf] extra, or from "
+              "conda-forge where the system libraries come with it."),
         Field("bundle", bool, True,
               "Generate the self-contained project_bundle.zip."),
         Field("include_methods", bool, True,
@@ -396,11 +1117,13 @@ EXECUTION = PhaseSchema(
     description="How the runs are scheduled: sequentially or in parallel.",
     fields=(
         Field("mode", str, "sequential",
-              "Run scheduling: 'sequential' (one at a time) or 'parallel'."),
+              "Run scheduling: 'sequential' (one at a time) or 'parallel'.",
+              choices=("sequential", "parallel")),
         Field("workers", int, None,
               "Parallel worker count. Default: one per device if `devices` "
               "is set, else the CPU count (capped at the number of runs).",
-              example=2),
+              example=2,
+              minimum=1),
         Field("devices", list, None,
               "GPU device indices to distribute parallel runs across, "
               "round-robin (one run per device). GPU runs only.",
@@ -415,6 +1138,264 @@ EXECUTION = PhaseSchema(
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# How the settings are grouped
+# ---------------------------------------------------------------------------
+#: Settings, in the order somebody meets the decisions they stand for.
+#:
+#: Thirty-six settings for setup and thirty-seven for simulation arrived as one
+#: flat list each, in the order they happened to be declared: a pH sat beside a
+#: dispersion correction, and finding the one you wanted meant reading all of
+#: them. The schema is the one place that knows what a setting is, so it is the
+#: place that says what it is *about*.
+#:
+#: Declared here rather than on each Field so the order within a group is
+#: visible as an order, and so adding a group does not mean editing eighty-odd
+#: declarations. A setting left out of every group is caught by a test, not by
+#: somebody noticing it missing from the page.
+SETTING_GROUPS: dict[str, tuple[tuple[str, str, tuple[str, ...]], ...]] = {
+    "(top-level)": (
+        ("What to study",
+         "The runs this config produces. A single study names none of "
+         "this and describes its system in `setup`.",
+         ("systems",)),
+        ("Which phases run",
+         "A study is setup, simulation, analysis and report. Either list "
+         "picks a subset; naming both is refused.",
+         ("include_phase", "exclude_phase")),
+        ("Where it goes",
+         "One directory holds everything a study wrote.",
+         ("output",)),
+        ("How it was written",
+         "Whether an AI model was involved and which one, so the record "
+         "identifies the software rather than the category, and why each "
+         "setting chosen has its value.",
+         ("agent", "agent_model", "decisions")),
+        ("What it may spend",
+         "A ceiling for a study nobody is watching, checked after setup "
+         "when the particle count -- and so the cost -- is first known.",
+         ("budget_hours",)),
+        ("What you see while it runs",
+         "How much the software says for itself as it works.",
+         ("explain", "verbose")),
+    ),
+    "setup": (
+        ("How this phase was written",
+         "Whether a person wrote it, an AI model drafted it, or it went "
+         "outside this schema and nothing checked it.",
+         ("agent",)),
+        ("The structure",
+         "What is kept, what is repaired, and how it is protonated.",
+         ("ph", "residue_states", "protonation_margin", "heterogens", "keep_heterogens",
+          "keep_water", "replace_nonstandard_residues",
+          "model", "chains", "build_missing_termini", "fixed_pdb",
+          "mutations", "mutation_chain")),
+        ("The ligand",
+         "Found and parameterised, or named if the structure is ambiguous.",
+         ("ligand", "ligand_name", "ligand_resname", "ligand_forcefield",
+          "ligand_net_charge",
+          "ligand_pose", "check_ligand_clashes",
+          "ligand_clash_threshold_nm")),
+        ("The membrane",
+         "A bilayer to embed in, and whether the orientation is trusted.",
+         ("membrane", "membrane_orient", "membrane_orientation_checked",
+          "membrane_center_z_nm")),
+        ("Solvent, ions and the box",
+         "How much water, of what kind, at what salt concentration.",
+         ("water_model", "solvent_padding_nm", "box_shape", "neutralize",
+          "ion_positive", "ion_negative", "ion_concentration_M", "random_seed")),
+        ("How preparation is observed",
+         "Whether setup saves bounded observational evidence for this run.",
+         ("preparation_audit",)),
+        ("The force field",
+         "What the atoms are, and which motions are held rigid.",
+         ("forcefield", "force_field", "constraints", "rigid_water",
+          "hydrogen_mass_amu", "temperature_K")),
+        ("How forces are computed",
+         "The long-range treatment. Defaults suit a solvated protein; "
+         "changing one changes the physics.",
+         ("nonbonded_method", "nonbonded_cutoff_nm", "ewald_error_tolerance",
+          "use_switching_function", "switch_distance_nm",
+          "dispersion_correction", "remove_cm_motion")),
+    ),
+    "simulation": (
+        ("How this phase was written",
+         "Whether a person wrote it, an AI model drafted it, or it went "
+         "outside this schema and nothing checked it.",
+         ("agent",)),
+        ("How long it runs",
+         "Production length, and the equilibration before it.",
+         ("duration_ns", "extra_ns", "stop_when", "nvt_duration_ns", "npt_duration_ns",
+          "production_steps", "nvt_steps", "npt_steps", "ensemble")),
+        ("Where it starts",
+         "A system prepared here or elsewhere, where the run picks up from "
+         "if it is continuing one, and how hard it is minimised first.",
+         ("setup_from", "prepared_from", "resume_from", "resume_unsealed",
+          "minimize",
+          "minimize_tolerance_kjmol_per_nm",
+          "minimize_max_iterations")),
+        ("Conditions",
+         "The thermodynamic state the run is held at.",
+         ("temperature_K", "pressure_bar", "pressure_atm", "friction_per_ps",
+          "barostat_frequency")),
+        ("The integrator",
+         "How the equations of motion are stepped.",
+         ("integrator", "timestep_fs", "integrator_error_tolerance",
+          "random_seed")),
+        ("Enhanced sampling",
+         "Bias the run to reach what it would not reach on its own. Each is "
+         "a block of settings, and each says what its output is and is not.",
+         ("umbrella", "steered", "metadynamics", "plumed")),
+        ("Restraints",
+         "Hold part of the system still while the rest equilibrates.",
+         ("restrain", "restraint_release", "restrain_production")),
+        ("Where it runs",
+         "The compute platform, and which device.",
+         ("platform", "precision", "device_index")),
+        ("What gets written",
+         "How often frames, states and checkpoints are saved, and which "
+         "atoms go into them.",
+         ("trajectory_interval_steps", "state_interval_steps",
+          "checkpoint_interval_steps", "save_selection")),
+        ("Watching it run",
+         "What the live dashboard shows while the simulation is going.",
+         ("live_telemetry", "telemetry_interval", "dashboard_ligand_resname",
+          "dashboard_binding_pocket_cutoff_A",
+          "dashboard_max_playback_frames")),
+    ),
+    "analysis": (
+        ("How this phase was written",
+         "Whether a person wrote it, an AI model drafted it, or it went "
+         "outside this schema and nothing checked it.",
+         ("agent",)),
+        ("What to analyse",
+         "Which analyses run, and how each is configured.",
+         ("include", "exclude", "options")),
+        ("What to analyse it on",
+         "The trajectory, and which atoms count.",
+         ("trajectory", "topology", "select_atoms", "selection", "scope")),
+        ("Which frames",
+         "Trimming and thinning before anything is analysed.",
+         ("first", "last", "stride")),
+        ("What the figures look like",
+         "How every figure is plotted, for the screen or for print.",
+         ("figure_colours", "figure_width")),
+    ),
+    "report": (
+        ("How this phase was written",
+         "Whether a person wrote it, an AI model drafted it, or it went "
+         "outside this schema and nothing checked it.",
+         ("agent",)),
+        ("What it says",
+         "Who it is by, and which sections it carries.",
+         ("title", "author", "include_methods", "include_reproducibility",
+          "region_highlights", "comparison")),
+        ("What comes out",
+         "The formats written to the run directory.",
+         ("document", "slides", "pdf", "bundle")),
+    ),
+    # Not a phase, and it still has to be reachable. Without an entry here
+    # `grouped_fields("execution")` returned an empty tuple, so the GUI drew
+    # no controls for it and `--help` had no section to put its flags under.
+    "execution": (
+        ("How the runs are scheduled",
+         "One at a time, or several at once across the devices named.",
+         ("mode", "workers", "devices", "continue_on_error")),
+    ),
+}
+
+
+#: What a setting with no default does when nobody sets it, in a few words,
+#: keyed by its dotted name (a top-level setting by its own name). A form
+#: offers it as the value to leave alone: a list of choices with no default
+#: showed its first choice, so a protein in water read as embedded in POPC,
+#: and an empty box beside an example ("e.g. 5") said nothing about what an
+#: empty box does. The help says it at length; this says it in a line.
+UNSET_MEANS: dict[str, str] = {
+    "agent": "a person wrote it",
+    "agent_model": "no AI model involved",
+    "budget_hours": "no ceiling",
+    "decisions": "none recorded",
+    "setup.agent": "as the study says",
+    "simulation.agent": "as the study says",
+    "analysis.agent": "as the study says",
+    "report.agent": "as the study says",
+    "setup.model": "the first model",
+    "setup.chains": "the biological assembly",
+    "setup.fixed_pdb": "repaired here",
+    "setup.water_model": "from the force field",
+    "setup.ligand_forcefield": "from the force field",
+    "setup.ligand_net_charge": "read from the chemistry file",
+    "setup.membrane": "no membrane",
+    "setup.membrane_center_z_nm": "fitted",
+    "setup.random_seed": "a seed is drawn and recorded",
+    "setup.nonbonded_cutoff_nm": "the force field's own",
+    "setup.use_switching_function": "as the force field was developed",
+    "setup.switch_distance_nm": "the force field's own",
+    "setup.hydrogen_mass_amu": "off",
+    "setup.mutation_chain": "the first chain",
+    "simulation.duration_ns": "2 ns",
+    "simulation.nvt_duration_ns": "500 ps",
+    "simulation.npt_duration_ns": "1 ns",
+    "simulation.ensemble": "as the NPT stage implies",
+    "simulation.random_seed": "a different seed each run",
+    "simulation.trajectory_interval_steps": "about 2,000 frames a run",
+    "simulation.restraint_release": "1000, 500, 100, 0",
+    "analysis.trajectory": "the study's production",
+    "analysis.topology": "the study's topology",
+    "analysis.last": "the last frame",
+    "report.title": "named for the system",
+    "execution.workers": "one per device, or the CPU count",
+}
+
+#: The settings a form shows first in each group; the rest wait behind a
+#: "show more". Chosen for what a study is most often about: the structure
+#: prepared, its protonation, the box and the force field; how long and
+#: under what conditions it runs; what is written. Everything else is left
+#: at its default by most studies, and a setting changed is shown whatever
+#: its tier, so nothing chosen is ever hidden.
+ESSENTIAL: dict[str, tuple[str, ...]] = {
+    "(top-level)": ("budget_hours",),
+    "setup": ("model", "chains", "heterogens", "ph", "residue_states",
+              "ligand", "ligand_net_charge", "membrane",
+              "box_shape", "solvent_padding_nm", "ion_concentration_M",
+              "neutralize", "forcefield"),
+    "simulation": ("duration_ns", "stop_when", "temperature_K",
+                   "pressure_bar", "ensemble", "timestep_fs",
+                   "umbrella", "steered", "metadynamics", "plumed",
+                   "platform", "trajectory_interval_steps", "save_selection"),
+    "analysis": ("figure_width",),
+    "report": ("title", "author", "document", "pdf", "slides", "bundle"),
+    "execution": ("mode",),
+}
+
+
+def grouped_fields(phase: str) -> tuple[tuple[str, str, tuple[Field, ...]], ...]:
+    """A phase's settings in named groups, in the order they are declared.
+
+    Anything the groups do not name is returned last under "Other", so a
+    setting added without being placed still appears rather than vanishing
+    from every interface at once. The test is what makes that a warning
+    rather than a habit.
+    """
+    group = PHASE_SCHEMAS.get(phase) or (EXECUTION if phase == "execution"
+                                         else None)
+    if group is None:
+        return ()
+    by_name = {f.name: f for f in group.fields}
+    placed: set[str] = set()
+    out: list[tuple[str, str, tuple[Field, ...]]] = []
+    for title, why, names in SETTING_GROUPS.get(phase, ()):
+        fields = tuple(by_name[n] for n in names if n in by_name)
+        placed.update(f.name for f in fields)
+        if fields:
+            out.append((title, why, fields))
+    left = tuple(f for f in group.fields if f.name not in placed)
+    if left:
+        out.append(("Other", "Not yet placed in a group.", left))
+    return tuple(out)
+
+
 PHASE_SCHEMAS: dict[str, PhaseSchema] = {
     "setup": SETUP,
     "simulation": SIMULATION,
@@ -433,11 +1414,47 @@ PHASE_KEYS = tuple(PHASE_SCHEMAS.keys())
 # batch layer rather than the per-field type checker.
 BATCH_KEYS = ("systems", "sweep", "execution")
 
+#: What `systems` and `sweep` are, said where they are declared, so the
+#: config-language guide, the Agent's instructions and anything else that
+#: describes the language read one text. The guide listed every field of
+#: the top level and of each phase and neither of these, while saying that
+#: a key not listed is refused: an AI app writing from it wrote `system:`,
+#: which is refused, and could not write a study that runs. `execution`
+#: is left out on purpose: it is how this machine schedules a campaign's
+#: runs, not the study.
+BATCH_KEY_HELP: dict[str, str] = {
+    "systems": (
+        "Required. The structures to study, as a list of mappings, even for "
+        "one: each has `system`, a PDB identifier or a structure file's "
+        "path; an optional `id`, the name its run's folder and records carry "
+        "(default s1, s2, ... in order); and optionally a block named after "
+        "a phase (`setup`, `simulation`, `analysis`, `report`) whose settings "
+        "apply to that system alone, over the study's. There is no "
+        "top-level `system` key. Example: `systems: [{system: 1L2Y, id: "
+        "trpcage}]`."),
+    "sweep": (
+        "Optional. Settings to run at several values, as a mapping from a "
+        "dotted `phase.setting` name to a list of values; every system runs "
+        "at every combination, each as a run of its own. Sweeping "
+        "`simulation.random_seed` over three values gives three replicas. "
+        "Example: `sweep: {simulation.temperature_K: [300, 310]}`."),
+}
+
 # All keys recognized at the top level: the scalar top-level fields plus
 # the per-phase block names plus the batch keys.
 TOP_LEVEL_KEYS = TOP_LEVEL.field_names() | set(PHASE_KEYS) | set(BATCH_KEYS)
 
 
 def all_schemas() -> dict[str, PhaseSchema]:
-    """Return every schema, including the top-level pseudo-phase."""
-    return {"(top-level)": TOP_LEVEL, **PHASE_SCHEMAS}
+    """Return every schema, including the top-level pseudo-phase.
+
+    `execution` is here and is not in `PHASE_SCHEMAS`, which is the
+    distinction worth keeping: the four phases drive the plan, and this
+    block says how the runs the plan produces are scheduled. It was in
+    neither, so the flag generator, the GUI form builder and the parity
+    suite all walked past it -- and the parity suite iterating this
+    function is why the omission stayed invisible. `mode`, `workers`,
+    `devices` and `continue_on_error` were reachable only by writing a
+    config file.
+    """
+    return {"(top-level)": TOP_LEVEL, **PHASE_SCHEMAS, "execution": EXECUTION}

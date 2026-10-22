@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from fastmdxplora.dependencies import MissingDependency
 from fastmdxplora.setup import pdbfix as _pdbfix_mod
 from fastmdxplora.setup import prepare as _prepare_mod
 from fastmdxplora.setup.pipeline import (
@@ -48,11 +49,21 @@ except ImportError:
 # ---------------------------------------------------------------------------
 MINI_PDB = """\
 HEADER    DUMMY                                   01-JAN-26                     
-ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N  
-ATOM      2  CA  ALA A   1       1.500   0.000   0.000  1.00  0.00           C  
-ATOM      3  C   ALA A   1       2.000   1.400   0.000  1.00  0.00           C  
-ATOM      4  O   ALA A   1       1.300   2.400   0.000  1.00  0.00           O  
-ATOM      5  CB  ALA A   1       2.000  -0.700   1.200  1.00  0.00           C  
+ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N
+ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00  0.00           C
+ATOM      3  C   ALA A   1       2.009   1.420   0.000  1.00  0.00           C
+ATOM      4  O   ALA A   1       1.251   2.390   0.000  1.00  0.00           O
+ATOM      5  CB  ALA A   1       1.988  -0.773  -1.199  1.00  0.00           C
+ATOM      6  N   GLY A   2       3.332   1.549   0.000  1.00  0.00           N
+ATOM      7  CA  GLY A   2       3.972   2.849   0.000  1.00  0.00           C
+ATOM      8  C   GLY A   2       5.486   2.705   0.000  1.00  0.00           C
+ATOM      9  O   GLY A   2       6.008   1.593   0.000  1.00  0.00           O
+ATOM     10  N   ALA A   3       6.171   3.845   0.000  1.00  0.00           N
+ATOM     11  CA  ALA A   3       7.623   3.845   0.000  1.00  0.00           C
+ATOM     12  C   ALA A   3       8.174   5.265   0.000  1.00  0.00           C
+ATOM     13  O   ALA A   3       7.416   6.235   0.000  1.00  0.00           O
+ATOM     14  CB  ALA A   3       8.153   3.072  -1.199  1.00  0.00           C
+ATOM     15  OXT ALA A   3       9.400   5.400   0.000  1.00  0.00           O
 END
 """
 
@@ -119,14 +130,14 @@ class TestResolveInput:
     def test_sequence_raises_not_implemented(self, tmp_path: Path):
         out_dir = tmp_path / "out"
         out_dir.mkdir()
-        with pytest.raises(NotImplementedError, match="Sequence-to-structure"):
+        with pytest.raises(NotImplementedError, match="structure predictor"):
             _resolve_input("MKTAYIA", "sequence", out_dir)
 
     def test_pdb_id_uses_urllib(self, tmp_path: Path):
-        """RCSB fetch path goes through urllib.urlretrieve."""
+        """RCSB fetch path goes through the pipeline's download."""
         out_dir = tmp_path / "out"
         out_dir.mkdir()
-        with patch("urllib.request.urlretrieve") as m:
+        with patch("fastmdxplora.setup.pipeline._download") as m:
             # Make the mock create the file so the test can continue
             def fake_fetch(url, dest):
                 Path(dest).write_text("HEADER fetched\nEND\n")
@@ -185,15 +196,21 @@ class TestPDBFixWrapper:
 # prepare.prepare_system — mocked OpenMM
 # ===========================================================================
 class TestPrepareSystem:
-    def test_default_forcefield_resolves_to_charmm36(self):
-        """The default named force field resolves to CHARMM36 XMLs."""
+    def test_the_default_resolves_to_a_ligand_capable_stack(self):
+        """Unspecified means auto, which must be able to take a ligand.
+
+        The default heterogen policy prepares a bound ligand without being
+        asked, so a protein-only default would refuse on any structure that
+        has one.
+        """
         from fastmdxplora.setup.forcefields import (
             DEFAULT_FORCEFIELD,
             resolve_forcefield,
         )
-        assert DEFAULT_FORCEFIELD == "charmm36"
+        assert DEFAULT_FORCEFIELD == "auto"
         choice = resolve_forcefield(None)
-        assert choice.xmls == ("charmm36.xml", "charmm36/water.xml")
+        assert choice.supports_ligand
+        assert choice.small_molecule_forcefield
         assert _prepare_mod.DEFAULT_PADDING_NM == 1.0
         assert _prepare_mod.DEFAULT_IONIC_STRENGTH_M == 0.15
 
@@ -321,9 +338,18 @@ class TestPrepareSystem:
         assert (out / "topology.pdb").exists()
         assert (out / "system.xml").exists()
         assert (out / "state.xml").exists()
-        assert set(artifacts.keys()) == {
+        # The files. Preparation also reports things the methods section has
+        # to state and that were previously only logged -- the system size and
+        # the box -- which are provenance rather than artifacts. Splitting on
+        # what a value *is* rather than naming each exception keeps this from
+        # needing an edit every time the record learns something new.
+        assert artifacts["n_atoms_solvated"] == 42
+        paths = {k for k, v in artifacts.items()
+                 if isinstance(v, (str, Path))}
+        assert paths == {
             "solvated_pdb", "topology_pdb", "system_xml", "state_xml"
         }
+        assert "box" in artifacts
 
 
 # ===========================================================================
@@ -341,19 +367,47 @@ class TestPipelineRun:
         assert manifest["phase"] == "setup"
         assert manifest["input"]["form"] == "pdb_file"
 
-    def test_charmm36_default_in_manifest(self, stub_orchestrator):
-        """Setup records CHARMM36 as the resolved force field by default."""
+    def test_the_resolved_force_field_is_recorded(self, stub_orchestrator):
+        """`auto` must never leave a run ambiguous about what it used."""
         out_dir = stub_orchestrator.output_dir / "setup"
         out_dir.mkdir()
         setup_run(orchestrator=stub_orchestrator, output_dir=out_dir)
         manifest = json.loads((out_dir / "setup_parameters.json").read_text(encoding="utf-8"))
         # Default uses the named selector; the resolved block records the XMLs.
-        assert manifest["parameters"]["forcefield"] == "charmm36"
+        assert manifest["parameters"]["forcefield"] == "auto"
         resolved = manifest["resolved_forcefield"]
         assert resolved["source"] == "named"
-        assert resolved["name"] == "charmm36"
-        assert "charmm36.xml" in resolved["xmls"]
-        assert "charmm36/water.xml" in resolved["xmls"]
+        # What auto chose, recorded concretely rather than as the word "auto".
+        assert resolved["name"] == "amber-openff"
+        assert resolved["xmls"], "the manifest must name the XML files used"
+
+    def test_openmm_parameterization_failure_writes_manifest(
+        self, stub_orchestrator, mini_pdb
+    ):
+        """A missing OpenMM parameterization backend preserves actionable output."""
+        out_dir = stub_orchestrator.output_dir / "setup"
+        out_dir.mkdir()
+        with (
+            patch(
+                "fastmdxplora.setup.prepare.prepare_system",
+                side_effect=ImportError("openmm missing"),
+            ),
+            patch(
+                "fastmdxplora.setup.pipeline.missing_dependencies",
+                return_value=[MissingDependency("OpenMM", "openmm.app", "openmm")],
+            ),
+        ):
+            artifacts = setup_run(
+                orchestrator=stub_orchestrator,
+                output_dir=out_dir,
+                fixed_pdb=str(mini_pdb),
+            )
+
+        assert artifacts[-1] == "setup_parameters.json"
+        manifest = json.loads(
+            (out_dir / "setup_parameters.json").read_text(encoding="utf-8")
+        )
+        assert "conda install -c conda-forge openmm" in " ".join(manifest["notes"])
 
     @pytest.mark.skipif(HAS_SETUP_DEPS, reason="graceful-degradation path only")
     def test_skips_chemistry_when_deps_missing(self, stub_orchestrator):
@@ -398,8 +452,11 @@ class TestPipelineRun:
         ]
 
     def test_sequence_input_records_fallback(self, tmp_path: Path):
-        """Sequence input yields the manifest-only fallback with a clear note."""
+        """Sequence input keeps the sequence and the manifest with a clear
+        note, and setup fails: nothing was prepared."""
         from unittest.mock import MagicMock as MM
+
+        from fastmdxplora.refusals import StudyError
 
         orch = MM()
         orch.system = "MKTAYIAKQRQISFVKSHFSRQ"
@@ -407,11 +464,13 @@ class TestPipelineRun:
         orch._presenter = None
         out_dir = tmp_path / "setup"
         out_dir.mkdir()
-        artifacts = setup_run(orchestrator=orch, output_dir=out_dir)
-        assert "input.sequence" in artifacts
+        with pytest.raises(StudyError, match="structure predictor") as raised:
+            setup_run(orchestrator=orch, output_dir=out_dir)
+        assert raised.value.code == "environment.backend.missing"
+        assert (out_dir / "input.sequence").is_file()
         manifest = json.loads((out_dir / "setup_parameters.json").read_text(encoding="utf-8"))
         assert manifest["input"]["form"] == "sequence"
-        assert any("Sequence" in n for n in manifest["notes"])
+        assert any("structure predictor" in n for n in manifest["notes"])
 
 
 # ===========================================================================
@@ -420,7 +479,7 @@ class TestPipelineRun:
 class TestDefaults:
     def test_charmm36_protein_default(self):
         """Pipeline default uses the named charmm36 selector; raw list off."""
-        assert DEFAULTS["forcefield"] == "charmm36"
+        assert DEFAULTS["forcefield"] == "auto"
         assert DEFAULTS["force_field"] is None
 
     def test_physiological_ionic_strength(self):
@@ -466,26 +525,165 @@ class TestRealSetup:
         # The system has more particles than the input (we added water)
         assert system.getNumParticles() > 5
 
-    def test_cutoff_larger_than_half_box_raises_clear_error(
+    def test_a_small_solute_gets_the_smallest_box_its_cutoff_allows(
         self, mini_pdb, tmp_path
     ):
-        """A cutoff > half the box yields an actionable error, not OpenMM's.
-
-        With small padding and a large cutoff, the periodic-box constraint
-        is violated; the guard in prepare_system should raise a ValueError
-        naming the cutoff, the box, and how to fix it.
-        """
+        """0.4 nm of padding and a 1.5 nm cutoff around a tripeptide: the
+        padding sizes the box, and the box grown to is the smallest any solute
+        that small can have under this cutoff, so it is built and the padding
+        used recorded."""
         from fastmdxplora.setup.prepare import prepare_system
         from fastmdxplora.setup.pdbfix import fix_pdb_with_pdbfixer
 
         prepared = tmp_path / "prepared.pdb"
         fix_pdb_with_pdbfixer(str(mini_pdb), str(prepared), ph=7.0)
 
-        out = tmp_path / "out"
-        with pytest.raises(ValueError, match="cutoff.*exceeds half"):
-            prepare_system(
-                prepared,
-                out,
-                solvent_padding_nm=0.4,   # tiny box
-                nonbonded_cutoff_nm=1.5,  # cutoff > half the box
-            )
+        made = prepare_system(prepared, tmp_path / "out",
+                              solvent_padding_nm=0.4, nonbonded_cutoff_nm=1.5)
+        assert made["box"]["smallest_width_nm"] == pytest.approx(3.3, abs=1e-3)
+        assert made["resolved"]["solvent_padding_nm"] == pytest.approx(1.65)
+
+    def test_cutoff_larger_than_half_box_raises_clear_error(self, tmp_path):
+        """A cutoff > half the box yields an actionable error, not OpenMM's.
+
+        Two tripeptides 1.2 nm apart, a solute about 1.8 nm across that sizes
+        its own box: with 0.4 nm of padding and a 1.5 nm cutoff it needs more
+        than a little padding added, and the refusal names what would run.
+        """
+        from fastmdxplora.setup.prepare import prepare_system
+        from fastmdxplora.setup.pdbfix import fix_pdb_with_pdbfixer
+
+        atoms = [line for line in MINI_PDB.splitlines() if line.startswith("ATOM")]
+        second = [
+            f"{line[:21]}B{line[22:46]}{float(line[46:54]) + 12.0:8.3f}{line[54:]}"
+            for line in atoms]
+        (tmp_path / "two.pdb").write_text(
+            "\n".join(atoms + ["TER"] + second + ["END"]) + "\n")
+        prepared = tmp_path / "prepared.pdb"
+        fix_pdb_with_pdbfixer(str(tmp_path / "two.pdb"), str(prepared), ph=7.0)
+
+        with pytest.raises(ValueError, match="solvent_padding_nm: 1.") as refused:
+            prepare_system(prepared, tmp_path / "out",
+                           solvent_padding_nm=0.4, nonbonded_cutoff_nm=1.5)
+        assert refused.value.refusal.code == "config.option.conflicting"
+
+
+class TestTheSoftwareDoesNotAdvertiseWhatItCannotDo:
+    """A sequence is recognised and then refused, because building a structure
+    from one needs a predictor this software does not carry.
+
+    The message for an unrecognised input listed a one-letter sequence among
+    the accepted forms. Anyone reading it would try one and reach a
+    NotImplementedError two steps later, and the claim also found its way into
+    a manuscript describing the software.
+    """
+
+    def test_an_unrecognised_input_is_told_what_actually_works(self) -> None:
+        import pytest
+
+        from fastmdxplora.setup.pipeline import _classify_input
+
+        with pytest.raises(ValueError) as raised:
+            _classify_input("no-such-structure.xyz")
+
+        message = str(raised.value)
+        assert ".pdb" in message and "4-character PDB ID" in message
+        assert "or a one-letter amino-acid sequence." not in message
+
+    def test_and_told_that_a_sequence_is_not_one_of_them(self) -> None:
+        """Said rather than omitted, because a sequence is a reasonable thing
+        to try and silence about it is its own confusion."""
+        import pytest
+
+        from fastmdxplora.setup.pipeline import _classify_input
+
+        with pytest.raises(ValueError, match="cannot yet be built"):
+            _classify_input("no-such-structure.xyz")
+
+    def test_a_sequence_is_refused_with_what_to_do_instead(self) -> None:
+        import pytest
+
+        from fastmdxplora.setup.pipeline import _resolve_input
+
+        with pytest.raises(NotImplementedError) as raised:
+            _resolve_input("ACDEFGHIKLM", "sequence",
+                           __import__("pathlib").Path("/tmp"))
+
+        message = str(raised.value)
+        assert "structure predictor" in message
+        assert any(name in message for name in ("AlphaFold", "ESMFold"))
+
+
+class TestSetupSaysWhatItChose:
+    """`forcefield: auto` is not a force field until a registry says
+    which, and a switching distance left unset is nine tenths of the
+    cutoff -- a rule, not a number.
+
+    Both were worked out inside the phase and went no further, so the
+    file meant to reproduce the run wrote `null` for each and left the
+    question to whatever version replayed it. What the phase decided is
+    recorded now, and only what it decided: a value the caller supplied
+    is already in the config that asked for it, and repeating it here
+    would claim the phase had chosen something it merely accepted.
+    """
+
+    @staticmethod
+    def _resolved(params=None, forcefield=None, prepared=None):
+        from fastmdxplora.setup.pipeline import _resolved_settings
+
+        return _resolved_settings(params or {}, forcefield or {}, prepared)
+
+    def test_the_registry_choice_is_recorded(self) -> None:
+        got = self._resolved(forcefield={
+            "xmls": ["amber14-all.xml", "amber14/tip3p.xml"],
+            "water_model": "tip3p"})
+        assert got["force_field"] == ["amber14-all.xml", "amber14/tip3p.xml"]
+        assert got["water_model"] == "tip3p"
+
+    def test_what_the_caller_gave_is_left_alone(self) -> None:
+        got = self._resolved(
+            params={"water_model": "tip4pew", "force_field": ["mine.xml"]},
+            forcefield={"xmls": ["amber14-all.xml"], "water_model": "tip3p"})
+        assert "water_model" not in got
+        assert "force_field" not in got
+
+    def test_the_switching_distance_comes_from_preparation(self) -> None:
+        got = self._resolved(prepared={"switch_distance_nm": 0.9})
+        assert got["switch_distance_nm"] == 0.9
+
+    def test_a_method_without_a_switching_function_records_none(self) -> None:
+        """`None` means the question did not arise, and a key whose value
+        is None says nothing a default did not already say."""
+        got = self._resolved(prepared={"switch_distance_nm": None})
+        assert "switch_distance_nm" not in got
+
+    def test_the_small_molecule_force_field_follows_the_ligand(self) -> None:
+        got = self._resolved(forcefield={
+            "ligand": {"name": "BEN", "forcefield": "openff-2.2.1"}})
+        assert got["ligand_forcefield"] == "openff-2.2.1"
+
+    def test_the_ligand_name_is_never_written_back(self) -> None:
+        """The pipeline resolves it, and where several ligands are found
+        it becomes a list. The field is declared `str`, so a config
+        carrying the list fails its own validation on replay. What was
+        prepared is under `resolved_forcefield.ligand`, which is the shape
+        that question already had.
+        """
+        from fastmdxplora.config.schema import PHASE_SCHEMAS
+
+        assert PHASE_SCHEMAS["setup"].get("ligand_name").type is str
+        got = self._resolved(
+            params={"ligand_name": ["BEN", "LIG"]},
+            forcefield={"ligand": {"name": ["BEN", "LIG"]}})
+        assert "ligand_name" not in got
+
+    def test_nothing_private_is_carried(self) -> None:
+        """Setup injects `_retained_pdb` and its neighbours into its own
+        parameters. The record is built from named values rather than by
+        copying them, so there is nothing to filter."""
+        got = self._resolved(params={
+            "_retained_pdb": "/tmp/kept.pdb",
+            "_reinstated_heterogens": ("BEN",),
+            "_explained_heterogens": ("HOH",),
+        })
+        assert not any(name.startswith("_") for name in got)

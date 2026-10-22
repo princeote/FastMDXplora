@@ -7,14 +7,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
-from fastmdxplora.live import launcher as launch
-from fastmdxplora.live import live_frames as frames
-from fastmdxplora.live import telemetry
-from fastmdxplora.live import trajectory_playback as playback
-from fastmdxplora.live.ligand_detection import detect_ligands, filter_pdb_to_ligand
-from fastmdxplora.live.structure_info import _count_structure_cached, count_structure, ligand_atom_counts
+from fastmdxplora.gui import exploration as launch
+from fastmdxplora.gui import live_frames as frames
+from fastmdxplora.gui import telemetry
+from fastmdxplora.gui import trajectory_frames as binary
+from fastmdxplora.gui.ligand_detection import detect_ligands, filter_pdb_to_ligand
+from fastmdxplora.gui.structure_info import _count_structure_cached, count_structure, ligand_atom_counts
 from fastmdxplora.simulation import runner
 
 
@@ -37,126 +38,64 @@ def _launch_payload() -> dict:
     }
 
 
-class _Topology:
-    def __init__(self, selected=(0, 1), fail=False):
-        self.selected, self.fail = selected, fail
-
-    def select(self, _query):
-        if self.fail:
-            raise RuntimeError("selection failed")
-        return list(self.selected)
-
-
-class _BrowserTrajectory:
-    def __init__(self, times=(0.0, 0.0)):
-        self.time = list(times)
-
-    def save_pdb(self, path):
-        Path(path).write_text(_atom() + "\nEND\n", encoding="utf-8")
+def _history(sim: Path, count: int = 2) -> None:
+    for i in range(count):
+        (sim / f"h{i}.pdb").write_text(_atom(seq=i + 1, x=float(i)) + "\nEND\n",
+                                       encoding="utf-8")
+    (sim / "live_frame_history.json").write_text(json.dumps({"frames": [
+        {"path": f"h{i}.pdb", "sequence": i, "frame_index": i,
+         "simulation_time_ns": 0.1 * i} for i in range(count)]}), encoding="utf-8")
 
 
-class _Trajectory:
-    def __init__(self, n_frames=5, times=(0.0, 0.0)):
-        self.n_frames, self.times = n_frames, times
+def test_the_frames_cache_and_fall_back(tmp_path: Path) -> None:
+    md = pytest.importorskip("mdtraj")
+    out, sim = tmp_path / "run", tmp_path / "run" / "simulation"
+    sim.mkdir(parents=True)
+    topology = md.Topology()
+    residue = topology.add_residue("ALA", topology.add_chain())
+    for name in ("N", "CA", "C"):
+        topology.add_atom(name, md.element.carbon, residue)
+    xyz = np.random.default_rng(0).normal(size=(5, 3, 3)).astype(np.float32)
+    md.Trajectory(xyz[:1], topology).save_pdb(str(sim / "topology.pdb"))
+    md.Trajectory(xyz, topology).save_dcd(str(sim / "production.dcd"))
+    (sim / "live_status.json").write_text('{"status":"completed"}', encoding="utf-8")
 
-    def __getitem__(self, _indices):
-        return _BrowserTrajectory(self.times)
+    result = binary.frames_info(out, most_frames=3, simulation_time_ns_total=1.0)
+    assert result["source_kind"] == "production-dcd" and result["frame_times_ns"][-1] == 1.0
+    assert binary.frames_info(out, most_frames=3) == json.loads(
+        (sim / "frames_index.json").read_text())
+    assert binary._even(10, 2) == [0, 9]
+    assert binary._even(3, 5) == [0, 1, 2]
+    assert binary._load_json(tmp_path / "missing.json") == {}
+
+    # A trajectory that cannot be read now is played from the snapshots.
+    _history(sim)
+    (sim / "production.dcd").write_bytes(b"not a trajectory")
+    result = binary.frames_info(out, force=True)
+    assert result["source_kind"] == "live-history" and result["n_frames_browser"] == 2
 
 
-class _MD:
-    def __init__(self, *, n_frames=5, selected=(0, 1), select_fail=False, dcd_fail=False):
-        self.topology = _Topology(selected, select_fail)
-        self.trajectory = _Trajectory(n_frames)
-        self.dcd_fail = dcd_fail
-
-    def load_pdb(self, _path):
-        return SimpleNamespace(topology=self.topology)
-
-    def load_dcd(self, *_args, **_kwargs):
-        if self.dcd_fail:
-            raise RuntimeError("busy dcd")
-        return self.trajectory
-
-
-def test_playback_dcd_cache_fallback_and_helpers(tmp_path: Path, monkeypatch) -> None:
+def test_the_frames_say_why_there_are_none(tmp_path: Path) -> None:
     out, sim = tmp_path / "run", tmp_path / "run" / "simulation"
     sim.mkdir(parents=True)
     (sim / "topology.pdb").write_text(_atom() + "\nEND\n", encoding="utf-8")
-    (sim / "production.dcd").write_bytes(b"dcd")
-    (sim / "live_status.json").write_text('{"status":"completed"}', encoding="utf-8")
-    monkeypatch.setattr(playback, "_import_mdtraj", lambda: _MD())
-
-    result = playback.playback_info(out, max_browser_frames=3, simulation_time_ns_total=1.0)
-    assert result["source_kind"] == "production-dcd" and result["frame_times_ns"][-1] == 1.0
-    assert playback.playback_info(out) == json.loads((sim / "playback_index.json").read_text())
-    assert playback._even_indices(10, 2) == [0, 9]
-    assert playback._even_indices(3, 5) == [0, 1, 2]
-    assert playback._load_index(tmp_path / "missing.json")["reason"] == "invalid-companion"
-
-    # A temporarily unreadable DCD falls back to completed live-history snapshots.
-    for i in range(2):
-        p = sim / f"h{i}.pdb"
-        p.write_text(_atom(seq=i + 1) + "\nEND\n", encoding="utf-8")
+    (sim / "production.dcd").write_bytes(b"not a trajectory")
+    said = binary.frames_info(out)
+    assert said["available"] is False and said["reason"].startswith("The frames could not")
+    # Snapshots that cannot be read are not frames either.
+    (sim / "production.dcd").unlink()
     (sim / "live_frame_history.json").write_text(json.dumps({"frames": [
-        {"path": "h0.pdb", "sequence": 0, "frame_index": 0, "simulation_time_ns": 0.0},
-        {"path": "h1.pdb", "sequence": 1, "frame_index": 1, "simulation_time_ns": 0.1},
-    ]}), encoding="utf-8")
-    monkeypatch.setattr(playback, "_import_mdtraj", lambda: _MD(dcd_fail=True))
-    result = playback.playback_info(out, force=True)
-    assert result["source_kind"] == "live-history"
+        {"path": "missing.pdb", "sequence": 0}, {"path": "gone.pdb", "sequence": 1}]}),
+        encoding="utf-8")
+    said = binary.frames_info(out)
+    assert said["reason"] == "Fewer than two of the frames written could be read."
 
 
-def test_playback_error_branches_and_neighborhood(tmp_path: Path) -> None:
-    topology = tmp_path / "top.pdb"
-    topology.write_text("\n".join([
-        _atom("HETATM", "LIG", seq=9),
-        _atom("ATOM", "ALA", seq=1, x=1),
-        "ATOM bad-coordinate-line",
-        "END",
-    ]), encoding="utf-8")
-    assert playback.neighborhood_residues(topology_path=topology, ligand_resname="LIG") == [("A", 1)]
-    assert playback.neighborhood_residues(topology_path=tmp_path / "none", ligand_resname="LIG") == []
-    assert playback.neighborhood_residues(topology_path=topology, ligand_resname="XXX") == []
-
-    idx = tmp_path / "index.json"
-    pdb = tmp_path / "playback.pdb"
-    one = playback._generate_from_dcd(
-        md=_MD(n_frames=1, selected=(), select_fail=True), topology_path=topology,
-        dcd_path=tmp_path / "x.dcd", companion_pdb=pdb, companion_idx=idx,
-        max_browser_frames=2, simulation_time_ns_total=None, source_signature="x",
-    )
-    assert one["reason"] == "not-enough-trajectory-frames"
-
-    unreadable = playback._generate_from_history(
-        sim_dir=tmp_path, records=[{"path": "missing"}, {"path": "also-missing"}],
-        companion_pdb=pdb, companion_idx=idx, max_browser_frames=2, source_signature="x",
-    )
-    assert unreadable["reason"] == "not-enough-readable-history-frames"
-
-
-def test_launcher_validation_command_and_runtime_branches(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(launch, "launcher_environment_error", lambda _config: None)
-    bad = _launch_payload()
-    bad.update(system="x" * 4097)
-    bad["setup"].update(ph="bad", forcefield="bad", ion_concentration_M="bad", solvent_padding_nm=99)
-    bad["simulation"].update(integrator="bad", platform="bad", precision="bad", nvt_steps="bad")
-    bad["workflow"].update(run_analysis=False, run_report=True, analyses="bad")
-    result = launch.validate_launcher_payload(bad)
-    assert not result["valid"] and result["warnings"]
-    assert {"system", "setup.ph", "setup.forcefield", "simulation.integrator"} <= result["errors"].keys()
-
-    cfg = launch.validate_launcher_payload(_launch_payload())["config"]
-    cfg["setup"].update(water_model="tip3p", keep_heterogens=True, keep_water=True)
-    cfg["simulation"]["minimize"] = False
-    cfg["workflow"].update(run_analysis=False, report_document=False, report_slides=False, report_bundle=False)
-    command = launch.build_launcher_command(cfg, tmp_path / "out")
-    for flag in ("--setup-water-model", "--setup-keep-heterogens", "--setup-keep-water",
-                 "--simulate-no-minimize", "--include", "--report-no-document",
-                 "--report-no-slides", "--report-no-bundle"):
-        assert flag in command
-
+def test_runtime_status_and_stop_branches(tmp_path: Path) -> None:
+    # What the runtime says of its process, and that Stop terminates it.
+    # The validation and command checks that stood here belonged to the
+    # explore/* launch, which the run page replaced and which is gone.
     runtime = launch.DashboardRuntime(tmp_path / "workspace", tmp_path / "runs")
-    assert runtime.launch({"system": ""})["valid"] is False
     runtime.process = SimpleNamespace(poll=lambda: 0)
     assert runtime.snapshot()["status"] == "completed"
     runtime.process = SimpleNamespace(poll=lambda: 2)
@@ -166,18 +105,6 @@ def test_launcher_validation_command_and_runtime_branches(tmp_path: Path, monkey
     terminated = []
     runtime.process = SimpleNamespace(poll=lambda: None, terminate=lambda: terminated.append(True))
     assert runtime.stop()["stopped"] and terminated
-    assert runtime.launch(_launch_payload())["errors"]["run"]
-
-    occupied = launch.DashboardRuntime(tmp_path / "w2", tmp_path / "runs2")
-    target = occupied.launch_root / "run"
-    target.mkdir()
-    (target / "file").write_text("x", encoding="utf-8")
-    assert "not empty" in occupied.launch(_launch_payload())["errors"]["run_name"]
-
-    failing = launch.DashboardRuntime(tmp_path / "w3", tmp_path / "runs3")
-    monkeypatch.setattr(launch.subprocess, "Popen", lambda *_a, **_k: (_ for _ in ()).throw(OSError("no")))
-    with pytest.raises(OSError):
-        failing.launch(_launch_payload())
 
 
 def test_live_frame_failure_fallbacks_and_bounded_archive(tmp_path: Path, monkeypatch) -> None:
@@ -230,7 +157,11 @@ def test_ligand_and_structure_edge_paths(tmp_path: Path) -> None:
     assert _count_structure_cached(str(tmp_path), 0, 0)["reason"].startswith("read-error")
 
     fake_path = SimpleNamespace(is_file=lambda: True, stat=lambda: (_ for _ in ()).throw(OSError("stat")), as_posix=lambda: "fake")
-    with patch("fastmdxplora.live.structure_info.Path", return_value=fake_path):
+    # `structure_info` moved out of the gui package -- it reads a file as
+    # text and the orchestrator needs it before any interface exists. The
+    # old path re-exports the function, so patching a name there no
+    # longer reaches the module the function actually lives in.
+    with patch("fastmdxplora.structure_info.Path", return_value=fake_path):
         assert count_structure(structure)["reason"].startswith("stat-error")
     with patch.object(Path, "open", side_effect=OSError("read")):
         assert ligand_atom_counts(structure) == {}
@@ -256,9 +187,9 @@ def test_orchestrator_dashboard_telemetry_paths(tmp_path: Path, monkeypatch) -> 
     writer = Writer()
     monkeypatch.setenv("FASTMDX_DASHBOARD_ACTIVE", "1")
     monkeypatch.setenv("FASTMDX_DASHBOARD_OUTPUT", str(app.output_dir))
-    monkeypatch.setattr("fastmdxplora.live.telemetry.TelemetryWriter", lambda *_a, **_k: writer)
+    monkeypatch.setattr("fastmdxplora.gui.telemetry.TelemetryWriter", lambda *_a, **_k: writer)
     assert app._dashboard_writer() is writer
-    monkeypatch.setattr("fastmdxplora.live.telemetry.TelemetryWriter", lambda *_a, **_k: 1 / 0)
+    monkeypatch.setattr("fastmdxplora.gui.telemetry.TelemetryWriter", lambda *_a, **_k: 1 / 0)
     assert app._dashboard_writer() is None
 
     FastMDXplora._initialize_dashboard_timeline(writer, ["setup", "simulation", "report"])
@@ -273,7 +204,7 @@ def test_orchestrator_dashboard_telemetry_paths(tmp_path: Path, monkeypatch) -> 
     ok = PhaseResult("simulation", "ok", app.output_dir)
     skipped = PhaseResult("report", "skipped", app.output_dir)
     failed = PhaseResult("analysis", "error", app.output_dir, message="boom")
-    monkeypatch.setattr("fastmdxplora.live.telemetry.read_status", lambda _root: {
+    monkeypatch.setattr("fastmdxplora.gui.telemetry.read_status", lambda _root: {
         "stage_states": {"minimization": "waiting", "nvt": "current",
                          "npt": "completed", "production": "waiting"}
     })
@@ -286,7 +217,7 @@ def test_orchestrator_dashboard_telemetry_paths(tmp_path: Path, monkeypatch) -> 
 
 
 def test_server_helpers_cover_changed_display_branches(tmp_path: Path, monkeypatch) -> None:
-    from fastmdxplora.live import server
+    from fastmdxplora.gui import server
 
     assert server.DashboardConfig(binding_pocket_cutoff_A=4.5).binding_pocket_cutoff_m == 4.5
     assert server._artifact_records(tmp_path / "missing") == []
@@ -331,10 +262,10 @@ def test_server_helpers_cover_changed_display_branches(tmp_path: Path, monkeypat
     assert server._open_local_path(tmp_path) == (False, "no opener")
 
 
-def test_server_error_and_launcher_routes(tmp_path: Path, monkeypatch) -> None:
+def test_server_error_and_exploration_routes(tmp_path: Path, monkeypatch) -> None:
     import urllib.error
     import urllib.request
-    from fastmdxplora.live import server as live_server
+    from fastmdxplora.gui import server as live_server
 
     root = tmp_path / "run"
     root.mkdir()
@@ -364,18 +295,16 @@ def test_server_error_and_launcher_routes(tmp_path: Path, monkeypatch) -> None:
             return exc.read()
 
     try:
-        get("/api/playback-info?max=bad")
+        get("/api/frames-info")
         get("/api/open-output")
-        get("/structure/playback.pdb", 404)
+        get("/structure/frames.dcd", 404)
         get("/analysis-figures-svg.zip", 404)
         get("/structure/topology.pdb", 404)
         get("/artifacts/missing.txt", 404)
         get("/static/missing.txt", 404)
         get("/not-found", 404)
-        post("/api/launcher/launch", {"system": ""}, 422)
-        post("/api/launcher/stop", {}, 200)
+        post("/api/explore/stop", {}, 200)
         post("/not-found", {}, 404)
-        post("/api/launcher/validate", [], 500)
 
         monkeypatch.setattr(live_server, "_results_payload", lambda _root: (_ for _ in ()).throw(RuntimeError("route")))
         get("/api/results", 500)
@@ -661,7 +590,7 @@ def test_cli_dashboard_remaining_lifecycle_and_startup_branches(
     monkeypatch.delenv("FASTMDX_DASHBOARD_URL", raising=False)
 
     url, enabled = cli._startup_dashboard_details(
-        ["dashboard", "serve", "--host=0.0.0.0", "--port", "9001"]
+        ["gui", "--host=0.0.0.0", "--port", "9001"]
     )
     assert (url, enabled) == ("http://127.0.0.1:9001", True)
 
@@ -697,37 +626,35 @@ def test_cli_dashboard_remaining_lifecycle_and_startup_branches(
     generated = cli._resolve_dashboard_output_dir(SimpleNamespace(output_dir=None))
     assert explicit == (tmp_path / "explicit").resolve()
     assert configured == (tmp_path / "configured").resolve()
-    assert generated.name.startswith("fastmdxplora_output_")
+    assert generated.name.startswith("fastmdxplora_") and "_study_" in generated.name
 
-    assert cli._cmd_dashboard(SimpleNamespace(dashboard_command=None)) == 2
-    dashboard_args = SimpleNamespace(
-        dashboard_command="serve",
+    gui_args = SimpleNamespace(
         output=tmp_path,
         host="127.0.0.1",
         port=8765,
+        no_browser=True,
         ligand_resname=None,
         binding_pocket_cutoff_A=None,
-        max_playback_frames=None,
-        open_browser=False,
     )
-    with patch("fastmdxplora.live.server.serve_dashboard") as serve:
-        assert cli._cmd_dashboard(dashboard_args) == 0
+    with patch("fastmdxplora.gui.server.serve_dashboard") as serve:
+        assert cli._cmd_gui(gui_args) == 0
     assert serve.call_args.kwargs["output"] == tmp_path
     assert serve.call_args.kwargs["config"].binding_pocket_cutoff_A == 5.0
 
-    dashboard_args.open_browser = True
+    gui_args.no_browser = False
     with (
-        patch("fastmdxplora.live.server.serve_dashboard"),
+        patch("fastmdxplora.gui.server.serve_dashboard"),
         patch("webbrowser.open", side_effect=RuntimeError("headless")),
     ):
-        assert cli._cmd_dashboard(dashboard_args) == 0
+        assert cli._cmd_gui(gui_args) == 0
 
-    with patch("fastmdxplora.live.server.serve_dashboard") as serve_home:
+    with patch("fastmdxplora.gui.server.serve_dashboard") as serve_home:
         assert cli._cmd_dashboard_home() == 0
     assert serve_home.call_args.kwargs == {
         "output": Path.cwd(),
         "host": "127.0.0.1",
         "port": 8765,
+        "home_mode": True,
     }
 
     stopped = []
@@ -753,3 +680,43 @@ def test_cli_dashboard_remaining_lifecycle_and_startup_branches(
         session, SimpleNamespace(dashboard_stop_on_complete=False)
     )
     assert waited and stopped[-1] == "after-wait"
+
+
+def test_the_live_temperature_counts_only_particles_with_mass():
+    """A virtual site has no mass and no kinetic energy. Counting the
+    TIP4P-Ew M site as three degrees of freedom read a 300 K box as 197.5 K
+    against OpenMM's 296.4 K, and the GUI flagged it as far from target."""
+    import io
+
+    mm = pytest.importorskip("openmm")
+    app = pytest.importorskip("openmm.app")
+    unit = pytest.importorskip("openmm.unit")
+
+    forcefield = app.ForceField("amber14-all.xml", "amber14/tip4pew.xml")
+    modeller = app.Modeller(app.Topology(), [])
+    modeller.addSolvent(forcefield, model="tip4pew",
+                        boxSize=mm.Vec3(1.6, 1.6, 1.6) * unit.nanometer)
+    system = forcefield.createSystem(
+        modeller.topology, nonbondedMethod=app.PME,
+        nonbondedCutoff=0.7 * unit.nanometer, constraints=app.HBonds,
+        rigidWater=True)
+    assert any(system.isVirtualSite(i) for i in range(system.getNumParticles()))
+    integrator = mm.LangevinMiddleIntegrator(
+        300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picoseconds)
+    simulation = app.Simulation(modeller.topology, system, integrator,
+                                mm.Platform.getPlatformByName("Reference"))
+    simulation.context.setPositions(modeller.positions)
+    simulation.context.setVelocitiesToTemperature(300 * unit.kelvin, 1)
+    simulation.context.applyConstraints(1e-6)
+    simulation.context.applyVelocityConstraints(1e-6)
+
+    buffer = io.StringIO()
+    reporter = app.StateDataReporter(buffer, 1, temperature=True,
+                                     separator=",")
+    reporter.report(simulation, simulation.context.getState(getEnergy=True))
+    openmm_says = float(buffer.getvalue().splitlines()[-1])
+
+    kinetic = simulation.context.getState(getEnergy=True).getKineticEnergy()
+    ours = runner._temperature_from_kinetic_energy(
+        simulation, kinetic.value_in_unit(unit.kilojoule_per_mole))
+    assert ours == pytest.approx(openmm_says, rel=0.01)

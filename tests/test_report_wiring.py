@@ -145,7 +145,9 @@ class TestReportDocument:
         text = (project_with_analysis / "report" / "report.md").read_text(encoding="utf-8")
         # We built a 25-frame, 5-residue trajectory
         assert "25 frames" in text
-        assert "5 residues" in text
+        # Protein residues apart from ions and cofactors, so a 20-residue
+        # peptide saved with "not water" does not read as 27 residues.
+        assert "5 protein residues" in text
 
     def test_report_includes_all_figures_for_multi_method(
         self, project_with_multi_method: Path
@@ -308,66 +310,48 @@ class TestDashboard:
         assert dashboard.is_file()
         text = dashboard.read_text(encoding="utf-8")
 
-        assets = project_with_analysis / "report" / "dashboard_assets"
-        assert (assets / "rmsd_dashboard.png").is_file()
-        assert (assets / "rg_dashboard.png").is_file()
         assert rmsd_png.read_bytes() == original_rmsd
         assert rg_png.read_bytes() == original_rg
 
-        assert '<aside class="sidebar">' in text
-        assert "Run Progress" in text
-        assert "Live Simulation" in text
-        assert "Live simulation telemetry was not recorded for this run" in text
-        assert "Top Metrics" in text
-        assert "Recent Outputs" in text
-        assert "Quick Actions" in text
-        assert 'class="plot-frame"' in text
-        assert 'class="plot-grid"' in text
-        assert "plot-card card-md" in text
-        assert "card-sm" in text
-        assert "card-lg" in text
-        assert "card-wide" in text
-        assert "resize-handle" in text
-        assert 'title="Drag to resize"' in text
-        assert 'data-card-size="sm"' in text
-        assert 'data-card-size="md"' in text
-        assert 'data-card-size="lg"' in text
-        assert 'data-card-size="wide"' in text
-        assert "Reset layout" in text
-        assert "data-reset-layout" in text
-        assert "grid-auto-flow: dense" in text
-        assert "grid-auto-rows: 8px" in text
-        assert "grid-column: span var(--col-span, 1)" in text
-        assert "grid-row: span var(--row-span, 20)" in text
-        assert "pointerdown" in text
-        assert "pointermove" in text
-        assert "setPointerCapture" in text
-        assert "localStorage" in text
-        assert "ResizeObserver" not in text
-        assert "resize: both" not in text
-        assert ".panels" not in text
-        assert "repeat(auto-fill, minmax(280px, 1fr))" in text
-        assert "min-height: 180px" in text
-        assert "overflow: hidden" in text
-        assert "max-height: 100%" in text
-        assert "object-fit: contain" in text
-        assert "plot-card large" not in text
-        assert ".plot-card.card-lg { --col-span: 2; --row-span: 38; }" in text
-        assert ".plot-card.card-wide { --col-span: 2; --row-span: 24; }" in text
-        assert "dashboard view" in text
-        assert "dashboard_assets/rmsd_dashboard.png" in text
-        assert "dashboard_assets/rg_dashboard.png" in text
-        assert "Open Markdown Report" in text
-        assert "Open Analysis Manifest" in text
-        assert "output-list" in text
-        assert "outputs-extra" in text
-        assert "repeat(auto-fit, minmax(220px, 1fr))" in text
-        assert "action-title" in text
-        assert "action-subtitle" in text
-        assert "artifact-path" in text
-        assert "Std. Dev." in text
-        assert "original: <a href=\"../analysis/rmsd/rmsd.png\"" in text
-        assert "original: <a href=\"../analysis/rg/rg.png\"" in text
+        # Laid out as the GUI is: its sidebar, its pages, its own stylesheet.
+        import fastmdxplora.gui as gui_pkg
+
+        sheet = (Path(gui_pkg.__file__).with_name("static") / "dashboard.css").read_text(
+            encoding="utf-8")
+        assert sheet in text
+        assert '<aside class="sidebar"' in text
+        assert 'class="sidebar-stages"' in text
+        for page in ("overview", "analysis", "report", "files"):
+            assert f'data-page="{page}"' in text
+        # The citation is a dialog, as in the GUI.
+        assert 'id="cite-dialog"' in text
+        assert "Study Overview" in text
+        # No simulation ran in this workflow and none left a live record,
+        # so the health card, which is about a simulation, is not shown,
+        # as the GUI does not show it.
+        assert 'id="live-simulation"' not in text
+        # The message used to advise starting the dashboard during a
+        # simulation, which is what somebody reading it has just done, and
+        # then said telemetry was off by default. It says what the live page
+        # says: on by default, and the setting that turned it off.
+        from fastmdxplora.gui.report_dashboard import _render_static_live_panel
+
+        panel = _render_static_live_panel(project_with_analysis)
+        assert "Live telemetry is on by default" in panel
+        assert "<code>live_telemetry: false</code>" in panel
+        assert "off by default" not in panel and "--live-telemetry" not in panel
+        assert "What the analyses determined" in text
+        assert "Mean ± standard error" in text and "Std. dev." not in text
+        # The figures as the GUI's Analysis page shows them; the resizable
+        # cards of the old page are not the GUI's and are gone.
+        assert '<article class="analysis-card"' in text
+        assert 'class="ac-frame"' in text
+        assert "data-card-size" not in text
+        assert "analysis/rmsd/rmsd.png" in text
+        assert "analysis/rg/rg.png" in text
+        # The report as the GUI's Report page shows it, with its downloads.
+        assert 'class="card report-document"' in text
+        assert '<a class="ghost-btn" href="report.md" download>Markdown</a>' in text
         assert "../analysis/analysis_manifest.json" in text
         assert "report.md" in text
         assert "slides.pptx" in text
@@ -377,9 +361,7 @@ class TestDashboard:
         assert "fake" not in text.lower()
         assert "dummy" not in text.lower()
         with zipfile.ZipFile(project_with_analysis / "report" / "project_bundle.zip") as zf:
-            names = set(zf.namelist())
-        assert "report/dashboard_assets/rmsd_dashboard.png" in names
-        assert "report/dashboard_assets/rg_dashboard.png" in names
+            set(zf.namelist())
 
     def test_dashboard_analysis_only_phase_aware_text(self, tmp_path: Path):
         root = tmp_path / "analysis_only_dashboard"
@@ -424,16 +406,24 @@ class TestDashboard:
             "simulation were not run in this workflow."
         ) in text
         assert "Existing trajectory analysis" in text
-        assert "<span>Setup</span><span class=\"phase-detail\">Not run</span>" in text
-        assert "<span>Simulation</span><span class=\"phase-detail\">Not run</span>" in text
-        assert "<span>Analysis</span><span class=\"phase-detail\">Completed</span>" in text
-        assert "<span>Report</span><span class=\"phase-detail\">Completed</span>" in text
-        assert 'class="plot-frame"' in text
-        assert "artifact fallback" in text
+        # The Phases table as the GUI's Overview gives it.
+        for name, status, detail in (("Setup", "not-run", "Not run"),
+                                     ("Simulation", "not-run", "Not run"),
+                                     ("Analysis", "ok", "Completed"),
+                                     ("Report", "ok", "Completed")):
+            assert (f'<tr><td>{name}</td><td><span class="stage-pill">{status}</span></td>'
+                    f'<td class="muted">{detail}</td></tr>') in text
+        # Only the stages this workflow reaches are listed, as in the GUI.
+        assert '<li class="stage-step" data-stage="nvt" data-state="waiting" hidden>' in text
+        assert ('<li class="stage-step" data-stage="analysis" data-state="completed">'
+                in text)
+        # No simulation here and no live record: no health card for one.
+        assert 'id="live-simulation"' not in text
+        assert 'class="ac-frame"' in text
         assert "dashboard_assets" not in text
-        assert "Quick Actions" in text
-        assert "Recent Outputs" in text
+        assert 'data-page="files"' in text
         assert "Simulation time" not in text
+        assert '<span class="metric-label">Production</span>' not in text
         assert "Temperature" not in text
         assert "Production MD completed" not in text
         assert "../analysis/rmsd/rmsd.png" in text
@@ -490,25 +480,25 @@ class TestDashboard:
 
         assert result.status == "ok"
         text = (root / "report" / "dashboard.html").read_text(encoding="utf-8")
-        assert text.count('class="plot-grid"') == 1
-        assert "Additional Analysis" in text
-        assert 'id="additional-analysis"' in text
-        assert 'id="sasa-section"' not in text
-        assert 'id="secondary-structure-section"' not in text
-        assert 'id="dimensionality-reduction"' not in text
+        # SASA, secondary structure, and dimensionality reduction each keep
+        # their own section now, rather than being pooled because they hold
+        # a single figure apiece.
+        assert text.count('class="analysis-grid"') == 3
+        for section in ("Solvent accessible surface area", "Secondary structure",
+                        "Dimensionality reduction"):
+            assert section in text
+        # Each analysis anchors its own section, whatever its figure count.
+        assert 'id="solvent-accessible-surface-area"' in text
+        assert 'id="secondary-structure"' in text
+        assert 'id="dimensionality-reduction"' in text
+        assert 'id="additional-analysis"' not in text
         assert "Total SASA" in text
         assert "Secondary structure" in text
         assert "PCA" in text
-        assert text.count('class="plot-card fallback card-md"') == len(artifacts)
-        assert text.count('class="resize-handle"') == len(artifacts)
-        assert text.count('class="plot-frame"') == len(artifacts)
-        assert "plot-card large" not in text
-        assert ".plot-card.card-lg { --col-span: 2; --row-span: 38; }" in text
-        assert ".plot-card.card-wide { --col-span: 2; --row-span: 24; }" in text
-        assert "section-secondary-structure-section { --plot-min" not in text
-        assert "section-sasa-section { --plot-min" not in text
-        assert "artifact fallback" in text
-        assert "data-card-key=" in text
+        assert text.count('<article class="analysis-card"') == len(artifacts)
+        assert text.count('class="ac-frame"') == len(artifacts)
+        # Each analysis's first card answers to its name, as in the GUI.
+        assert 'data-analysis="sasa"' in text
 
     def test_dashboard_multi_method_dark_assets(self, project_with_multi_method: Path):
         original_pngs = {
@@ -532,33 +522,13 @@ class TestDashboard:
         text = (
             project_with_multi_method / "report" / "dashboard.html"
         ).read_text(encoding="utf-8")
-        assets = project_with_multi_method / "report" / "dashboard_assets"
-        expected_assets = [
-            "pca_dashboard.png",
-            "tsne_dashboard.png",
-            "kmeans_trajectory_dashboard.png",
-            "kmeans_population_dashboard.png",
-            "dbscan_trajectory_dashboard.png",
-            "dbscan_population_dashboard.png",
-            "hierarchical_trajectory_dashboard.png",
-            "hierarchical_population_dashboard.png",
-            "hierarchical_dendrogram_dashboard.png",
-        ]
-        for name in expected_assets:
-            assert (assets / name).is_file()
-            assert f"dashboard_assets/{name}" in text
         assert "Hierarchical dendrogram" in text
-        assert "dashboard_assets/hierarchical_dendrogram_dashboard.png" in text
-        assert "original: <a href=\"../analysis/cluster/cluster_hierarchical_dendrogram.png\"" in text
-        assert "dashboard_assets/dbscan_trajectory_dashboard.png" in text
-        assert "dashboard_assets/dbscan_population_dashboard.png" in text
-        assert "dashboard view" in text
+        assert "analysis/cluster/cluster_hierarchical_dendrogram.png" in text
+        assert '<article class="analysis-card"' in text
         with zipfile.ZipFile(
             project_with_multi_method / "report" / "project_bundle.zip"
         ) as zf:
-            names = set(zf.namelist())
-        for name in expected_assets:
-            assert f"report/dashboard_assets/{name}" in names
+            set(zf.namelist())
         for path, data in original_pngs.items():
             assert path.read_bytes() == data
 
@@ -624,18 +594,12 @@ class TestDashboard:
 
         assert result.status == "ok"
         text = (root / "report" / "dashboard.html").read_text(encoding="utf-8")
-        assert text.count('<div class="plot-frame">') == len(artifact_names)
-        assert text.count('class="plot-card fallback card-md"') == len(artifact_names)
-        assert text.count('class="resize-handle"') == len(artifact_names)
-        assert text.count('<span class="tag">artifact fallback</span>') == len(artifact_names)
-        assert "artifact fallback" in text
+        assert text.count('<div class="ac-frame">') == len(artifact_names)
+        assert text.count('<article class="analysis-card"') == len(artifact_names)
         assert "dashboard view" not in text
-        assert "output-list" in text
-        assert "outputs-extra" in text
-        assert "Show all outputs" in text
-        assert "plot-card large" not in text
-        assert ".plot-card.card-lg { --col-span: 2; --row-span: 38; }" in text
-        assert ".plot-card.card-wide { --col-span: 2; --row-span: 24; }" in text
+        # Every file on the Files page, the run record folded, as in the GUI.
+        record = text[text.index('data-phase="record"'):]
+        assert 'aria-expanded="false"' in record[:record.index("</button>")]
         for rel in artifact_names:
             assert f"../{rel}" in text
         for label in (
@@ -660,7 +624,7 @@ class TestDashboard:
             assert label in text
         assert "Core Metrics" not in text
         assert "SASA" in text
-        assert "Dimensionality Reduction" in text
+        assert "Dimensionality reduction" in text
         assert "Clustering" in text
 
 
@@ -757,7 +721,18 @@ def test_report_phase_manifest_artifacts_exist(tmp_path: Path):
     assert report_phase is not None
     manifest = json.loads((fmdx.output_dir / "manifest.json").read_text(encoding="utf-8"))
     report_record = next(p for p in manifest["phases"] if p["name"] == "report")
-    assert report_record["artifacts"] == ["report.md", "dashboard.html"]
+    # A PDF is written where WeasyPrint is available and left out where it is
+    # not, so the list is checked for what must be there rather than for an
+    # exact sequence that depends on what somebody installed. Where it is left
+    # out, not_produced.json says so -- the two are alternatives, and exactly
+    # one of them appears.
+    written = report_record["artifacts"]
+    assert "report.md" in written and "dashboard.html" in written
+    assert set(written) <= {"report.md", "report.pdf", "dashboard.html",
+                            "not_produced.json"}
+    assert ("report.pdf" in written) != ("not_produced.json" in written), (
+        "a PDF was requested, so either it was written or the reason it was "
+        "not is recorded beside the outputs")
     for artifact in report_record["artifacts"]:
         assert (Path(report_record["output_dir"]) / artifact).is_file()
 
@@ -904,7 +879,11 @@ def test_full_pipeline_report_keeps_end_to_end_wording(tmp_path: Path):
 
     assert result.status == "ok"
     report = (root / "report" / "report.md").read_text(encoding="utf-8")
-    assert "end-to-end molecular dynamics study" in report
+    # The summary used to open with "end-to-end molecular dynamics study" for
+    # every full run. It now says what the study was, so the distinction this
+    # test is about -- a full pipeline against analysis from a supplied
+    # trajectory -- is checked by what it does not claim.
+    assert "1 ps" in report, "the summary states the run it is about"
     assert "Production MD was performed" in report
     assert "Setup and simulation were not run in this workflow" not in report
 
@@ -1091,3 +1070,2008 @@ def test_pymol_script_generation_uses_cartoon_and_regions(tmp_path: Path):
     assert "resi 7-9" in script
     assert "ray 1800, 1200" in script
     assert "png " in script
+
+
+class TestTheReportWritesAMethodsSection:
+    """A journal asks for a specific list of things, and the list is published:
+    JCIM's Guidelines for Reporting Molecular Dynamics Simulations (Soares et
+    al. 2023) and Communications Biology's reproducibility checklist (2023).
+
+    Every value was already recorded here. What was missing was the assembly --
+    the report listed each setting as a bullet, which is what the software
+    knows rather than what a reader needs. Nobody types this paragraph
+    correctly from memory, which is why the drMD authors described difficulty
+    reproducing a published protocol not for technical reasons but because of
+    ambiguity in how it was presented.
+    """
+
+    @staticmethod
+    def _run():
+        # The shape a real run writes: `parameters` holds what was asked for,
+        # and what the run resolved sits beside it. A flat fixture would let
+        # this pass while the real thing failed, which is how the first
+        # version shipped saying the force field was "amber-openff".
+        setup = {
+            "input": {"system": "181L", "form": "pdb_id"},
+            "parameters": {
+                "ph": 7.4, "heterogens": "auto", "forcefield": "amber-openff",
+                # Written by setup when it prepares a ligand; a manifest
+                # without it is a run that had none.
+                "ligand": ["ligands/BNZ.sdf"],
+                "ligand_name": "BNZ", "ligand_net_charge": 0,
+                "solvent_padding_nm": 0.8, "box_shape": "cube",
+                "ion_concentration_M": 0.15, "nonbonded_method": "PME",
+                "nonbonded_cutoff_nm": 1.0, "constraints": "HBonds",
+                "rigid_water": True,
+            },
+            "resolved_forcefield": {
+                "xmls": ["amber14-all.xml", "amber14/tip3p.xml"],
+                "water_model": "tip3p",
+                "small_molecule_forcefield": "openff-2.2.1",
+            },
+            "n_atoms_solvated": 34020,
+        }
+        sim = {
+            "parameters": {
+                "timestep_fs": 2.0, "integrator": "langevin_middle",
+                "temperature_K": 300.0, "friction_per_ps": 1.0,
+                "pressure_bar": 1.0, "barostat_frequency": 25,
+                "nvt_steps": 200, "npt_steps": 200, "production_steps": 2000,
+                "trajectory_interval_steps": 20, "precision": "mixed",
+                "minimize": True, "random_seed": 7,
+            },
+            "platform_used": "CPU",
+        }
+        return setup, sim
+
+    def test_it_states_what_the_checklists_require(self) -> None:
+        from pathlib import Path
+
+        from fastmdxplora.report.methods import methods_paragraphs
+
+        setup, sim = self._run()
+        text = methods_paragraphs(Path("."), setup, sim)
+        for required in ("181L", "pH 7.4", "amber14", "tip3p", "openff-2.2.1",
+                         "PME", "HBonds", "Langevin", "300.0 K",
+                         "1.0 bar", "34,020"):
+            assert required in text, f"the methods section omits {required}"
+
+    def test_steps_are_given_as_time(self) -> None:
+        """Nobody reads "2000 steps". The reader needs to know it was 4 ps."""
+        from pathlib import Path
+
+        from fastmdxplora.report.methods import methods_paragraphs
+
+        setup, sim = self._run()
+        text = methods_paragraphs(Path("."), setup, sim)
+        assert "4 ps" in text
+        assert "2000 steps" not in text
+
+    def test_a_missing_seed_is_reported_as_missing(self) -> None:
+        """Its absence is what makes a run irreproducible, so it is as
+        reportable as its value."""
+        from pathlib import Path
+
+        from fastmdxplora.report.methods import methods_paragraphs
+
+        setup, sim = self._run()
+        sim["parameters"]["random_seed"] = None
+        text = methods_paragraphs(Path("."), setup, sim)
+        assert "No random seed was fixed" in text
+
+    def test_what_was_not_recorded_is_named(self) -> None:
+        """A methods section quietly stating a default nobody chose is worse
+        than one with a visible gap."""
+        from pathlib import Path
+
+        from fastmdxplora.report.methods import (
+            methods_paragraphs,
+            missing_from_methods,
+        )
+
+        setup, sim = self._run()
+        del setup["resolved_forcefield"]["water_model"]
+        assert "water model" in missing_from_methods(setup, sim)
+        text = methods_paragraphs(Path("."), setup, sim)
+        assert "Not recorded" in text
+        assert "water model" in text
+
+    def test_nothing_is_invented(self) -> None:
+        """An empty run produces no claims about it."""
+        from pathlib import Path
+
+        from fastmdxplora.report.methods import methods_paragraphs
+
+        text = methods_paragraphs(Path("."), {}, {})
+        assert "PME" not in text and "300" not in text
+        assert "Not recorded" in text
+
+    def test_the_software_is_named_with_its_version(self) -> None:
+        """Naming a tool without its version names a moving target: the
+        defaults change and a reader gets different numbers with no way to
+        know why."""
+        from fastmdxplora.report.document import _software_versions
+
+        found = _software_versions()
+        assert found, "nothing reported a version"
+        assert all(version for version in found.values())
+
+    def test_the_report_puts_the_prose_before_the_settings(self, tmp_path) -> None:
+        # The settings list follows the paragraph rather than replacing it.
+        text = _methods_of_a_study(tmp_path)
+        settings = text.index("### System preparation")
+        assert "181L" in text[:settings], "no paragraph before the settings"
+        assert text.index("### Every setting used") < settings
+
+class TestTheMethodsSectionReadsTheRealManifests:
+    """The first version read only ``parameters`` and produced a methods
+    section saying the coordinates came from "the input structure", the force
+    field was "amber-openff", and the water model was not recorded.
+
+    None of that was true. The manifests nest: the system sits under
+    ``input``, and what the run resolved -- the actual XML files, the water
+    model, the small-molecule force field -- sits beside ``parameters`` rather
+    than inside it. Guessing at key names produced a paragraph that read well
+    and said the wrong thing, which is worse than one that reads badly.
+    """
+
+    @staticmethod
+    def _manifests():
+        """The shape a real run writes, not a convenient flat one."""
+        setup = {
+            "input": {"system": "181L", "form": "pdb_id"},
+            "parameters": {
+                "ph": 7.4, "heterogens": "auto", "forcefield": "amber-openff",
+                "solvent_padding_nm": 0.8, "box_shape": "cube",
+                "ion_concentration_M": 0.15, "nonbonded_method": "PME",
+                "nonbonded_cutoff_nm": 1.0, "constraints": "HBonds",
+                "rigid_water": True, "ligand": ["ligands/BNZ.sdf"],
+                "ligand_name": "BNZ", "ligand_net_charge": 0,
+            },
+            "resolved_forcefield": {
+                "source": "named", "name": "amber-openff",
+                "xmls": ["amber14-all.xml", "amber14/tip3p.xml"],
+                "water_model": "tip3p",
+                "small_molecule_forcefield": "openff-2.2.1",
+            },
+            "n_atoms_solvated": 35012,
+        }
+        sim = {
+            "parameters": {
+                "timestep_fs": 2.0, "integrator": "langevin_middle",
+                "temperature_K": 300.0, "friction_per_ps": 1.0,
+                "pressure_bar": 1.0, "barostat_frequency": 25,
+                "nvt_steps": 200, "npt_steps": 200, "production_steps": 2000,
+                "trajectory_interval_steps": 20, "platform": "auto",
+                "precision": "mixed", "minimize": True, "random_seed": None,
+            },
+            "platform_used": "CPU", "n_production_frames": 100,
+        }
+        return setup, sim
+
+    def _text(self):
+        from pathlib import Path
+
+        from fastmdxplora.report.methods import methods_paragraphs
+
+        setup, sim = self._manifests()
+        return methods_paragraphs(Path("."), setup, sim,
+                                  system_name=setup["input"]["system"])
+
+    def test_the_system_is_named(self) -> None:
+        text = self._text()
+        assert "181L" in text
+        assert "the input structure" not in text
+
+    def test_the_force_field_is_the_one_used_not_our_label(self) -> None:
+        """A reader cannot look up "amber-openff"; they can look up
+        amber14-all.xml."""
+        text = self._text()
+        assert "amber14-all.xml" in text
+        assert "tip3p" in text
+
+    def test_the_ligand_and_its_parameters_are_stated(self) -> None:
+        text = self._text()
+        assert "BNZ" in text
+        assert "openff-2.2.1" in text
+
+    def test_the_system_size_is_stated(self) -> None:
+        text = self._text()
+        assert "35,012" in text
+
+    def test_the_platform_is_what_ran_not_what_was_asked_for(self) -> None:
+        """A methods section saying a run used the "auto" platform says
+        nothing."""
+        text = self._text()
+        assert "CPU platform" in text
+        assert "auto platform" not in text
+
+    def test_the_integrator_is_named_as_the_literature_names_it(self) -> None:
+        text = self._text()
+        assert "Langevin middle-scheme" in text
+        assert "langevin_middle" not in text
+
+    def test_the_barostat_is_stated(self) -> None:
+        text = self._text()
+        assert "1.0 bar" in text and "every 25 steps" in text
+
+    def test_nothing_present_is_reported_as_missing(self) -> None:
+        """The water model was recorded, and saying otherwise sends somebody
+        looking for a number that is already there."""
+        text = self._text()
+        assert "Not recorded" not in text
+
+    def test_the_report_passes_the_whole_manifest(self, tmp_path) -> None:
+        """Passing only `parameters` loses the system and the resolution: the
+        first version said the coordinates came from "the input structure"."""
+        text = _methods_of_a_study(tmp_path)
+        prose = text[:text.index("### Every setting used")]
+        assert "181L" in prose
+        assert "amber14-all.xml" in prose            # what the run resolved to
+        assert "the input structure" not in text
+
+class TestWhatTheRunResolvedIsRecorded:
+    """Twice the methods section had to report something as unrecorded that
+    the run plainly knew.
+
+    The solvated atom count was printed to the terminal and discarded. The
+    pressure the barostat ran at was resolved inside the runner -- it can be
+    given in bar or atmospheres, and unset means one bar -- and never left it.
+    Both are on the checklist a journal applies, so a run of an NPT simulation
+    could not say what pressure it held.
+    """
+
+    def test_preparation_reports_the_system_size(self, a_real_setup) -> None:
+        # The size it reports is the size of the system it wrote.
+        openmm = pytest.importorskip("openmm")
+
+        written = openmm.XmlSerializer.deserialize(
+            (a_real_setup.root / "setup" / "system.xml").read_text(encoding="utf-8"))
+        assert a_real_setup.returned["n_atoms_solvated"] == written.getNumParticles()
+
+    def test_the_setup_manifest_records_it(self, a_real_setup) -> None:
+        record = json.loads((a_real_setup.root / "setup" / "setup_parameters.json")
+                            .read_text(encoding="utf-8"))
+        assert _found(record, "n_atoms_solvated") == a_real_setup.returned["n_atoms_solvated"]
+
+    def test_the_setup_manifest_records_the_box_it_built(self, a_real_setup) -> None:
+        """The periodic cell, as the system it wrote holds it. Computed on
+        every setup and read by nothing, so a methods section took it from
+        CRYST1 by hand; and in the terms the cutoff is judged against, so
+        the smallest perpendicular width is at least twice the cutoff, which
+        is the check the setup made when it built the box."""
+        import numpy as np
+        openmm = pytest.importorskip("openmm")
+
+        record = json.loads((a_real_setup.root / "setup" / "setup_parameters.json")
+                            .read_text(encoding="utf-8"))
+        box = record["box"]
+        system = openmm.XmlSerializer.deserialize(
+            (a_real_setup.root / "setup" / "system.xml").read_text(encoding="utf-8"))
+        vectors = np.array([[float(c.value_in_unit(openmm.unit.nanometer)) for c in v]
+                            for v in system.getDefaultPeriodicBoxVectors()])
+        assert np.allclose(box["vectors_nm"], vectors, atol=1e-6)
+        assert np.allclose(box["perpendicular_widths_nm"], np.diag(vectors), atol=1e-6)
+        assert box["smallest_width_nm"] == pytest.approx(float(np.diag(vectors).min()))
+        assert box["volume_nm3"] == pytest.approx(abs(float(np.linalg.det(vectors))))
+        cutoff = _found(record, "nonbonded_cutoff_nm")
+        assert cutoff is not None and box["smallest_width_nm"] >= 2 * cutoff
+
+    def test_the_box_record_reads_a_dodecahedron_by_its_perpendicular_widths(self) -> None:
+        """A cube's edge and its perpendicular width are the same number, so
+        the setup above cannot tell them apart. A rhombic dodecahedron's are
+        not: the smallest perpendicular width is the edge over root two, and
+        reading the edge overstates the room for the cutoff by 40%. The
+        volume is the determinant, which for OpenMM's reduced vectors is
+        the product of the diagonal."""
+        import numpy as np
+        openmm = pytest.importorskip("openmm")
+        from types import SimpleNamespace
+
+        from fastmdxplora.setup.prepare import _box_record
+
+        edge = 4.0
+        vectors = [openmm.Vec3(edge, 0, 0), openmm.Vec3(0, edge, 0),
+                   openmm.Vec3(edge / 2, edge / 2, edge * np.sqrt(2) / 2)] * openmm.unit.nanometer
+        topology = SimpleNamespace(getPeriodicBoxVectors=lambda: vectors)
+        box = _box_record(SimpleNamespace(topology=topology))
+        assert box["smallest_width_nm"] == pytest.approx(edge / np.sqrt(2))
+        assert box["perpendicular_widths_nm"] == pytest.approx([edge, edge, edge / np.sqrt(2)])
+        assert box["volume_nm3"] == pytest.approx(edge ** 3 / np.sqrt(2))
+
+    @pytest.mark.parametrize("asked, resolved", [
+        ({"pressure_atm": 2.0}, 2.0 * 1.01325),   # atmospheres, converted
+        ({"pressure_bar": 1.5}, 1.5),             # bar, as given
+        ({}, 1.0),                                # nothing: one bar
+    ])
+    def test_the_runner_reports_the_pressure_it_used(self, tmp_path, monkeypatch,
+                                                     asked, resolved) -> None:
+        """What it resolved, not what it was passed -- and what it resolved is
+        what the barostat was built with, so the report and the run agree."""
+        returned, barostat = _a_short_npt_run(tmp_path, monkeypatch, **asked)
+        assert returned.pressure_bar_used == pytest.approx(resolved)
+        assert barostat == [pytest.approx(resolved)]
+
+    def test_the_simulation_manifest_records_it(self, tmp_path, monkeypatch) -> None:
+        returned, _ = _a_short_npt_run(tmp_path, monkeypatch, through_the_phase=True,
+                                       pressure_atm=2.0)
+        record = json.loads((tmp_path / "simulation" / "simulation_parameters.json")
+                            .read_text(encoding="utf-8"))
+        assert _found(record, "pressure_bar_used") == pytest.approx(returned.pressure_bar_used)
+        assert _found(record, "pressure_bar_used") == pytest.approx(2.0 * 1.01325)
+
+    def test_the_methods_section_prefers_what_ran(self) -> None:
+        """A run asked for nothing and held one bar. Reporting the request
+        would say nothing; reporting the resolution says what happened."""
+        from pathlib import Path
+
+        from fastmdxplora.report.methods import methods_paragraphs
+
+        sim = {
+            "parameters": {"pressure_bar": None, "timestep_fs": 2.0,
+                           "npt_steps": 200, "integrator": "langevin_middle"},
+            "pressure_bar_used": 1.0,
+        }
+        text = methods_paragraphs(Path("."), {}, sim)
+        assert "1.0 bar" in text
+
+    def test_and_says_so_when_neither_is_known(self) -> None:
+
+        from fastmdxplora.report.methods import missing_from_methods
+
+        sim = {"parameters": {"timestep_fs": 2.0, "integrator": "verlet"}}
+        gaps = missing_from_methods({}, sim)
+        assert any("pressure" in gap for gap in gaps)
+
+
+class TestTheReportSaysWhatProductionRanIn:
+    """The ensemble and the pressure, as the run recorded them.
+
+    The settings list inferred the ensemble from `npt_steps`, which a study
+    leaving the NPT stage to its default does not set, so a default run --
+    NPT production at one bar -- was listed as NVT. The methods paragraph
+    wrote "in the NPT ensemble" for every production run and a pressure for
+    every run, and the slides called any run with a recorded pressure NPT,
+    so a study that asked for constant-volume production was described as
+    having run at constant pressure.
+    """
+
+    @staticmethod
+    def _record(*, asked=None, ran="npt", npt_stage=500_000, answered=True):
+        """A simulation record the shape the phase writes: every setting
+        under `parameters`, the unset ones as None, and what the runner
+        decided under `resolved`. `answered=False` is a record from before
+        the runner wrote down the ensemble."""
+        parameters = {
+            "duration_ns": 0.01, "timestep_fs": 2.0,
+            "integrator": "langevin_middle", "temperature_K": 300.0,
+            "friction_per_ps": 1.0, "barostat_frequency": 25,
+            "nvt_steps": None, "npt_steps": None, "production_steps": None,
+            "nvt_duration_ns": None, "npt_duration_ns": None,
+            "ensemble": None, "pressure_bar": None, "pressure_atm": None,
+            "trajectory_interval_steps": None, "platform": "auto",
+            "precision": "mixed", "minimize": True, "random_seed": 7,
+        }
+        parameters.update(asked or {})
+        resolved = {"nvt_steps": 250_000, "npt_steps": npt_stage,
+                    "production_steps": 5_000, "trajectory_interval_steps": 100,
+                    "checkpoint_interval_steps": 1_000, "pressure_bar": 1.0}
+        if answered:
+            resolved["ensemble"] = ran
+        # The runner records the pressure it resolved whatever the
+        # ensemble, which is why a pressure alone says nothing.
+        return {"phase": "simulation", "parameters": parameters,
+                "platform_used": "CPU", "pressure_bar_used": 1.0,
+                "resolved": resolved}
+
+    @staticmethod
+    def _report(root, record):
+        """What the methods paragraph, the settings list and the slides
+        say of a study with this record, built the way the report builds
+        them."""
+        import re
+        from types import SimpleNamespace
+
+        from fastmdxplora.report.context import load_phase_context
+        from fastmdxplora.report.document import _methods_section
+        from fastmdxplora.report.slides import _simulation_bullets
+
+        setup, _ = TestTheMethodsSectionReadsTheRealManifests._manifests()
+        for phase, written in (("setup", setup), ("simulation", record)):
+            (root / phase).mkdir(parents=True)
+            (root / phase / f"{phase}_parameters.json").write_text(
+                json.dumps(written), encoding="utf-8")
+        text = _methods_section(root, load_phase_context(root))
+        prose, settings = text.split("### Every setting used")
+        production = re.search(r"Production dynamics were run for [^.]*\.", prose)
+        assert production, "the methods paragraph says nothing of production"
+        pressure = [s for s in re.split(r"(?<=\.) ", prose)
+                    if " bar" in s or "barostat" in s]
+        return SimpleNamespace(production=production.group(0),
+                               pressure=pressure, settings=settings,
+                               slides=_simulation_bullets(root))
+
+    @pytest.mark.parametrize("answered", [True, False],
+                             ids=["recorded", "resolved from the record"])
+    def test_a_default_run_is_npt_at_one_bar_throughout(self, tmp_path, answered):
+        said = self._report(tmp_path, self._record(answered=answered))
+        assert "in the NPT ensemble" in said.production
+        assert said.pressure == ["Pressure was maintained at 1.0 bar, with "
+                                 "the barostat applied every 25 steps."]
+        assert "- **ensemble**: `npt`" in said.settings
+        assert r"- **pressure\_bar**: `1.0`" in said.settings
+        assert "300 K, 1 bar (NPT)" in said.slides
+
+    def test_constant_volume_production_is_nvt_throughout(self, tmp_path):
+        # Equilibrated at constant pressure, then produced at constant
+        # volume: the pressure belongs to the NPT stage and is said so.
+        said = self._report(
+            tmp_path, self._record(asked={"ensemble": "nvt"}, ran="nvt"))
+        assert "in the NVT ensemble" in said.production
+        assert "NPT" not in said.production
+        assert said.pressure
+        assert all("during NPT equilibration" in s for s in said.pressure)
+        assert "- **ensemble**: `nvt`" in said.settings
+        assert "- **ensemble**: `npt`" not in said.settings
+        assert "300 K (NVT)" in said.slides
+
+    def test_with_no_barostat_anywhere_no_pressure_is_stated(self, tmp_path):
+        said = self._report(
+            tmp_path, self._record(asked={"ensemble": "nvt", "npt_steps": 0},
+                                   ran="nvt", npt_stage=0))
+        assert "in the NVT ensemble" in said.production
+        assert said.pressure == []
+        assert "- **ensemble**: `nvt`" in said.settings
+        assert r"- **pressure\_bar**: `None`" in said.settings
+        assert "300 K (NVT)" in said.slides
+
+    @pytest.mark.parametrize("ensemble, npt_steps", [
+        ("npt", 0), ("nvt", 0), (None, 10), (None, 0)])
+    def test_the_runner_records_what_production_ran_in(
+            self, tmp_path, ensemble, npt_steps) -> None:
+        """The report's first source, so it has to be the runner's own
+        answer: stated where the config states it, inferred as the
+        runner inferred it where not."""
+        from fastmdxplora.simulation import runner
+        from tests._the_phase import a_prepared_water_box
+
+        files = a_prepared_water_box(tmp_path)
+        result = runner.run_simulation(
+            **files, output_dir=str(tmp_path / "out"), production_steps=10,
+            nvt_steps=0, npt_steps=npt_steps, minimize=False, platform="CPU",
+            ensemble=ensemble)
+        expected = ensemble or ("npt" if npt_steps else "nvt")
+        assert result.resolved["ensemble"] == expected
+
+
+class TestConvergenceSaysWhatARunCanSupport:
+    """A hundred frames look like a hundred measurements.
+
+    Consecutive frames of a molecular dynamics run are almost the same
+    structure, so an error bar computed over them is too small by the square
+    root of the correlation time -- a factor of three or four is ordinary.
+    This is the same mistake fixed for interaction occupancies, in the
+    analyses everybody reads first.
+    """
+
+    def test_uncorrelated_data_is_counted_in_full(self) -> None:
+        import numpy as np
+
+        from fastmdxplora.report.convergence import autocorrelation_time
+
+        rng = np.random.RandomState(0)
+        assert autocorrelation_time(rng.normal(size=1000)) < 2.0
+
+    def test_correlated_data_is_not(self) -> None:
+        import numpy as np
+
+        from fastmdxplora.report.convergence import autocorrelation_time
+
+        rng = np.random.RandomState(0)
+        smoothed = np.convolve(rng.normal(size=1200), np.ones(40) / 40,
+                               mode="valid")
+        assert autocorrelation_time(smoothed) > 10.0
+
+    def test_the_error_bar_counts_independent_samples(self) -> None:
+        """Dividing by the frame count would understate it several-fold."""
+        import numpy as np
+
+        from fastmdxplora.report.convergence import assess_series
+
+        rng = np.random.RandomState(0)
+        # Long enough to resolve its own correlation, as an error needs.
+        smoothed = np.convolve(rng.normal(size=6000), np.ones(40) / 40,
+                               mode="valid")[:4000]
+        found = assess_series("correlated", smoothed)
+        naive = found.spread / np.sqrt(found.n_frames)
+        assert found.standard_error > naive * 2, (
+            "the honest error bar should be markedly larger than the naive one"
+        )
+
+    def test_a_run_too_short_to_measure_correlation_says_so(self) -> None:
+        """The estimate truncates at half the series, so a short run cannot
+        see a memory longer than that -- and would report the independence it
+        failed to rule out, which is the wrong direction for a convergence
+        report to err in.
+        """
+        import numpy as np
+
+        from fastmdxplora.report.convergence import assess_series
+
+        rng = np.random.RandomState(1)
+        slow = np.convolve(rng.normal(size=400), np.ones(60) / 60,
+                           mode="valid")[:60]
+        found = assess_series("slow", slow)
+        assert not found.correlation_is_measurable
+        assert not found.is_sampled_enough, (
+            "independence that could not be measured must not count as found"
+        )
+
+    def test_a_drifting_observable_is_reported_as_still_drifting(self) -> None:
+        import numpy as np
+
+        from fastmdxplora.report.convergence import assess_series
+
+        rng = np.random.RandomState(2)
+        climbing = np.linspace(0, 5, 300) + rng.normal(scale=0.1, size=300)
+        assert not assess_series("climbing", climbing).has_equilibrated
+
+    def test_an_equilibrated_observable_is_not(self) -> None:
+        import numpy as np
+
+        from fastmdxplora.report.convergence import assess_series
+
+        rng = np.random.RandomState(3)
+        assert assess_series("flat", rng.normal(size=300)).has_equilibrated
+
+    def test_a_run_that_cannot_be_interpreted_says_so_plainly(self) -> None:
+        """Returning a number for everything would launder a short run into
+        an apparently validated one, which is worse than no report: a reader
+        would have less reason to doubt than they started with."""
+        import numpy as np
+
+        from fastmdxplora.report.convergence import assess_run
+
+        rng = np.random.RandomState(4)
+        climbing = np.linspace(0, 5, 120) + rng.normal(scale=0.1, size=120)
+        out = assess_run({"rmsd": climbing})
+        assert out["interpretable"] is False
+        assert out["findings"]
+
+    def test_a_thermostat_off_its_target_is_reported(self) -> None:
+        import numpy as np
+
+        from fastmdxplora.report.convergence import assess_run
+
+        rng = np.random.RandomState(5)
+        out = assess_run({"temperature": 340 + rng.normal(scale=2, size=500)},
+                         target_temperature_K=300.0)
+        assert any("thermostat" in finding for finding in out["findings"])
+
+    def test_a_thermostat_holding_its_target_is_not(self) -> None:
+        import numpy as np
+
+        from fastmdxplora.report.convergence import assess_run
+
+        rng = np.random.RandomState(6)
+        out = assess_run({"temperature": 300 + rng.normal(scale=2, size=500)},
+                         target_temperature_K=300.0)
+        assert not any("thermostat" in finding for finding in out["findings"])
+
+
+class TestTheReportSaysHowMuchTheRunSupports:
+    """The convergence assessment reaches the report, after the results,
+    because it is about them: every mean and error bar above rests on how many
+    independent observations the run holds, and that is usually far fewer than
+    the frame count suggests.
+    """
+
+    @staticmethod
+    def _a_run(tmp_path, n_frames=400):
+        """Analyses written where a real run writes them."""
+        import mdtraj as md
+        import numpy as np
+
+        import fastmdxplora.analysis  # noqa: F401
+        from fastmdxplora.analysis.orchestrator import get_analysis_class
+
+        top = md.Topology()
+        chain = top.add_chain()
+        previous_c = None
+        for index in range(6):
+            residue = top.add_residue("ALA", chain, resSeq=index + 1)
+            n = top.add_atom("N", md.element.nitrogen, residue)
+            ca = top.add_atom("CA", md.element.carbon, residue)
+            c = top.add_atom("C", md.element.carbon, residue)
+            o = top.add_atom("O", md.element.oxygen, residue)
+            for first, second in ((n, ca), (ca, c), (c, o)):
+                top.add_bond(first, second)
+            if previous_c is not None:
+                top.add_bond(previous_c, n)
+            previous_c = c
+
+        rng = np.random.RandomState(1)
+        xyz = rng.normal(scale=0.2, size=(n_frames, top.n_atoms, 3))
+        traj = md.Trajectory(xyz=xyz.astype(np.float32), topology=top)
+        for name in ("rmsd", "rg"):
+            get_analysis_class(name)(
+                output_dir=str(tmp_path / "analysis")).run(traj)
+        return tmp_path
+
+    def test_the_section_appears(self, tmp_path) -> None:
+        from fastmdxplora.report.document import _convergence_section
+
+        text = _convergence_section(self._a_run(tmp_path))
+        assert "## Convergence" in text
+        assert "RMSD" in text and "Rg" in text
+
+    def test_it_reports_independent_samples_not_frames(self, tmp_path) -> None:
+        from fastmdxplora.report.document import _convergence_section
+
+        text = _convergence_section(self._a_run(tmp_path))
+        assert "independent" in text
+        assert "A frame is not an observation" in text
+
+    def test_it_reads_a_bare_array_as_well_as_a_table(self, tmp_path) -> None:
+        """An analysis returning an array writes plain numbers; one returning
+        a frame writes a header. Both shapes are read rather than one
+        assumed."""
+        from fastmdxplora.report.document import _last_numeric_column
+
+        plain = tmp_path / "plain.dat"
+        plain.write_text("1.0\n2.0\n3.0\n", encoding="utf-8")
+        assert _last_numeric_column(plain) == [1.0, 2.0, 3.0]
+
+        table = tmp_path / "table.dat"
+        table.write_text("frame,value\n0,1.0\n1,2.0\n", encoding="utf-8")
+        assert _last_numeric_column(table) == [1.0, 2.0]
+
+    def test_a_run_with_no_data_produces_no_section(self, tmp_path) -> None:
+        """Rather than a heading over an empty table."""
+        from fastmdxplora.report.document import _convergence_section
+
+        assert _convergence_section(tmp_path) == ""
+
+    def test_it_sits_after_the_results(self, tmp_path) -> None:
+        from types import SimpleNamespace
+
+        from fastmdxplora.report.document import build_document
+
+        root = _a_reported_run(tmp_path, n_frames=400)
+        (root / "report").mkdir()
+        build_document(orchestrator=SimpleNamespace(output_dir=root), output_dir=root / "report",
+                       title="t", author=None, include_methods=False,
+                       include_reproducibility=False)
+        report = (root / "report" / "report.md").read_text(encoding="utf-8")
+        assert report.index("## Results") < report.index("## Convergence")
+
+class TestTheReportIsAlsoAPDF:
+    """A Markdown file is not a document somebody sends on.
+
+    It renders differently in every viewer, it cannot be printed with the
+    figures where the text put them, and attaching one invites the question of
+    what to open it with. The package docstring had claimed a PDF for some
+    time; nothing produced one.
+    """
+
+    @staticmethod
+    def _report(tmp_path):
+        path = tmp_path / "report.md"
+        path.write_text(
+            "# A report\n\n## Methods\n\nThe protein was described by the "
+            "amber14-all.xml force field.\n\n## Convergence\n\n"
+            "| measure | frames | independent |\n|---|---|---|\n"
+            "| rmsd | 4,999 | 20.3 |\n",
+            encoding="utf-8")
+        return path
+
+    def test_it_renders(self, tmp_path) -> None:
+        import pytest
+
+        pytest.importorskip("weasyprint", reason="requires the [pdf] extra")
+        pytest.importorskip("markdown", reason="requires the [pdf] extra")
+
+        from fastmdxplora.report.pdf import render_pdf
+
+        written = render_pdf(self._report(tmp_path))
+        assert written.suffix == ".pdf"
+        assert written.read_bytes().startswith(b"%PDF")
+
+    def test_it_is_written_beside_the_markdown(self, tmp_path) -> None:
+        import pytest
+
+        pytest.importorskip("weasyprint", reason="requires the [pdf] extra")
+        pytest.importorskip("markdown", reason="requires the [pdf] extra")
+
+        from fastmdxplora.report.pdf import render_pdf
+
+        source = self._report(tmp_path)
+        assert render_pdf(source).parent == source.parent
+
+    def test_a_missing_report_says_so(self, tmp_path) -> None:
+        import pytest
+
+        from fastmdxplora.report.pdf import PdfUnavailable, render_pdf
+
+        with pytest.raises(PdfUnavailable, match="No report to convert"):
+            render_pdf(tmp_path / "nothing.md")
+
+    def test_it_does_not_fail_the_run_when_it_cannot(self, tmp_path) -> None:
+        """A phase that produced a document, a dashboard, slides and a bundle
+        should not be marked failed because a fifth format needed a library
+        nobody installed."""
+        from fastmdxplora.report.pdf import try_render_pdf
+
+        written, reason = try_render_pdf(tmp_path / "nothing.md")
+        assert written is None
+        assert reason and "No report to convert" in reason
+
+    def test_the_reason_names_what_to_install(self, tmp_path, monkeypatch) -> None:
+        """Somebody told a shared library is missing has been told the
+        symptom, not the remedy. Asked with the library absent."""
+        import builtins
+
+        from fastmdxplora.report.pdf import try_render_pdf
+
+        real_import = builtins.__import__
+
+        def without_weasyprint(name, *args, **kwargs):
+            if name.startswith("weasyprint"):
+                raise ImportError("No module named 'weasyprint'")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", without_weasyprint)
+        (tmp_path / "report.md").write_text("# R\n", encoding="utf-8")
+        path, reason = try_render_pdf(tmp_path / "report.md", title="t")
+        assert path is None
+        assert "fastmdxplora[pdf]" in reason and "conda-forge" in reason
+        assert "Pango" in reason and "Cairo" in reason
+
+    @pytest.mark.parametrize("absent, named, not_named", [
+        ({"weasyprint", "markdown"}, ["WeasyPrint and Markdown", "weasyprint markdown"], []),
+        ({"markdown"}, ["needs Markdown, which is", "conda-forge markdown."], ["WeasyPrint needs"]),
+    ])
+    def test_everything_missing_is_named_at_once(self, tmp_path, monkeypatch,
+                                                absent, named, not_named) -> None:
+        """It stopped at the first thing missing, so somebody without either
+        installed WeasyPrint, ran again, and only then heard about Markdown.
+        With WeasyPrint present, only Markdown is named."""
+        import builtins
+        import sys
+        import types
+
+        from fastmdxplora.report.pdf import PdfUnavailable, render_pdf
+
+        real_import = builtins.__import__
+
+        def without(name, *args, **kwargs):
+            if name.split(".")[0] in absent:
+                raise ImportError(f"No module named {name!r}")
+            return real_import(name, *args, **kwargs)
+
+        if "weasyprint" not in absent:
+            present = types.ModuleType("weasyprint")
+            present.HTML = present.CSS = object
+            monkeypatch.setitem(sys.modules, "weasyprint", present)
+        monkeypatch.setattr(builtins, "__import__", without)
+        (tmp_path / "report.md").write_text("# R\n", encoding="utf-8")
+        with pytest.raises(PdfUnavailable) as raised:
+            render_pdf(tmp_path / "report.md")
+        said = str(raised.value)
+        assert all(phrase in said for phrase in named), said
+        assert not any(phrase in said for phrase in not_named), said
+
+    def test_it_converts_the_document_not_the_dashboard(self, tmp_path, monkeypatch) -> None:
+        """A PDF of the browser dashboard would be a picture of an interface.
+        The report is a document, and a document is what a PDF should be:
+        what reaches the renderer is report.md's text, and nothing else."""
+        import sys
+        import types
+
+        from fastmdxplora.report import pdf
+
+        given = {}
+
+        class HTML:
+            def __init__(self, string="", base_url=None):
+                given["html"] = string
+                given["base_url"] = base_url
+
+            def write_pdf(self, target, stylesheets=None):
+                Path(target).write_bytes(b"%PDF-1.4 stand-in")
+
+        class CSS:
+            def __init__(self, string=""):
+                pass
+
+        stand_in = types.ModuleType("weasyprint")
+        stand_in.HTML, stand_in.CSS = HTML, CSS
+        monkeypatch.setitem(sys.modules, "weasyprint", stand_in)
+        monkeypatch.setattr(pdf, "_markdown_to_html", lambda text, title: f"<body>{text}</body>")
+        (tmp_path / "report.md").write_text("# The document\n\nA sentence.\n", encoding="utf-8")
+        (tmp_path / "dashboard.html").write_text("<h1>the interface</h1>", encoding="utf-8")
+        target = pdf.render_pdf(tmp_path / "report.md", title="t")
+        assert target.is_file()
+        assert "A sentence." in given["html"] and "the interface" not in given["html"]
+        assert given["base_url"] == str(tmp_path)          # figures resolve beside the document
+
+    def test_the_setting_is_declared_like_the_others(self) -> None:
+        from fastmdxplora.config.schema import PHASE_SCHEMAS
+
+        field = PHASE_SCHEMAS["report"].get("pdf")
+        assert field is not None and field.default is True
+        assert field.help and "WeasyPrint" in field.help
+
+    def test_the_phase_asks_for_it(self, tmp_path, monkeypatch) -> None:
+        # Asked when the setting is on, which is the default; not asked when
+        # it is off. Where the run's document goes, with the run's title.
+        from types import SimpleNamespace
+
+        import importlib
+
+        # The function is re-exported over the module of the same name.
+        report_run_module = importlib.import_module("fastmdxplora.report.run")
+        asked = []
+        monkeypatch.setattr(
+            "fastmdxplora.report.pdf.try_render_pdf",
+            lambda markdown_path, *, title: asked.append((markdown_path, title)) or (None, "stood down"))
+        for switch, expected in ((True, 1), (False, 0)):
+            asked.clear()
+            root = _a_reported_run(tmp_path / f"pdf_{switch}", n_frames=40)
+            report_run_module.run(orchestrator=SimpleNamespace(output_dir=root, system="1UBQ"),
+                                  output_dir=root / "report", pdf=switch, slides=False,
+                                  bundle=False, title="The study")
+            assert len(asked) == expected, switch
+            if switch:
+                assert asked[0] == (root / "report" / "report.md", "The study")
+
+class TestAShortSeriesSaysWhatItCannotJudge:
+    """A real run reported "settled: yes" for a two-point series, beside "too
+    few independent samples" about the same numbers.
+
+    Two points cannot show a trend. Reporting one as settled is a claim from
+    no evidence, and it is the same defect as reporting independence that was
+    never measured -- which this module was written to avoid.
+    """
+
+    def test_two_points_cannot_say_whether_it_settled(self) -> None:
+        from fastmdxplora.report.convergence import assess_series
+
+        found = assess_series("potential_energy", [-490000.0, -476830.0])
+        assert found.has_equilibrated is None
+        assert not found.drift_is_measurable
+
+    def test_a_long_series_still_can(self) -> None:
+        import numpy as np
+
+        from fastmdxplora.report.convergence import assess_series
+
+        rng = np.random.RandomState(0)
+        assert assess_series("t", 300 + rng.normal(scale=2, size=400)).has_equilibrated
+
+    def test_energy_drift_needs_more_than_two_samples(self) -> None:
+        """It reported ninety-four kJ/mol per ns per atom from two samples of
+        a run that had just been minimized. The range of two numbers is not a
+        drift rate."""
+        from fastmdxplora.report.convergence import assess_run
+
+        out = assess_run({"potential_energy": [-490000.0, -476830.0]},
+                         duration_ns=0.004, n_atoms=34979)
+        assert not any("kJ/mol per ns per atom" in f for f in out["findings"])
+
+    def test_but_a_real_drift_is_still_caught(self) -> None:
+        import numpy as np
+
+        from fastmdxplora.report.convergence import assess_run
+
+        climbing = np.linspace(-490000, -400000, 50)
+        out = assess_run({"potential_energy": climbing},
+                         duration_ns=0.004, n_atoms=100)
+        assert any("integration" in f for f in out["findings"])
+
+    def test_the_report_says_too_short_rather_than_yes(self, tmp_path) -> None:
+        # Three frames cannot be judged, and the table says so rather than
+        # "yes"; four hundred can, and it says "yes".
+        from fastmdxplora.report.document import _convergence_section
+
+        run = TestTheReportSaysHowMuchTheRunSupports._a_run
+        short = _rows(_convergence_section(run(tmp_path / "short", n_frames=3)))
+        assert short and all(row.endswith("| too short to say |") for row in short), short
+        long = _rows(_convergence_section(run(tmp_path / "long", n_frames=400)))
+        assert long and all(row.endswith("| yes |") for row in long), long
+
+class TestFindingsAreSummarisedNotDumped:
+    """The report printed two pages of raw tuples of atom indices.
+
+    What an analysis worked out was recorded in ``options``, which is where
+    settings live, and the report lists every setting. A binding-mode list and
+    a transition matrix are structures somebody might want; they are not
+    something anybody reads in a document.
+    """
+
+    def test_settings_and_findings_are_kept_apart(self, tmp_path) -> None:
+        import mdtraj as md
+        import numpy as np
+        import pandas as pd
+
+        from fastmdxplora.analysis.base import Analysis
+
+        class _Learns(Analysis):
+            name = "learns"
+            description = "records what it found"
+
+            def compute(self, traj):
+                self.findings["what_it_worked_out"] = list(range(500))
+                return pd.DataFrame({"frame": [0], "value": [1.0]})
+
+            def plot(self, result, ax):
+                ax.plot([0], [1])
+
+        top = md.Topology()
+        residue = top.add_residue("ALA", top.add_chain(), resSeq=1)
+        top.add_atom("CA", md.element.carbon, residue)
+        traj = md.Trajectory(
+            xyz=np.zeros((1, 1, 3), dtype=np.float32), topology=top)
+
+        analysis = _Learns(output_dir=str(tmp_path))
+        analysis.run(traj)
+
+        import json
+
+        written = json.loads(
+            next(tmp_path.rglob("options.json")).read_text(encoding="utf-8"))
+        assert "what_it_worked_out" in written["findings"]
+        assert "what_it_worked_out" not in written["options"]
+
+    def test_the_interaction_analysis_records_them_as_findings(self, tmp_path) -> None:
+        """What the analysis worked out (the ligand's chemistry, the binding
+        modes, how they changed) is a finding, kept apart from the settings
+        it was given: the report lists settings as parameters and findings
+        as results. Run on a bound complex; needs the chemistry stack."""
+        pytest.importorskip("rdkit")
+        from fastmdxplora.analysis.pl_interactions import ProteinLigandInteractions
+        from tests.test_analyses_do_not_disturb_each_other import _system
+
+        analysis = ProteinLigandInteractions(ligand_resname="BEN", kinds=("hydrophobic",),
+                                             periodic=True, output_dir=tmp_path / "pl")
+        analysis.compute(_system()[:])
+        for name in ("ligand_chemistry", "binding_modes", "mode_transitions"):
+            assert name in analysis.findings, name
+            assert name not in analysis.options, name
+        assert isinstance(analysis.findings["binding_modes"], list)
+
+    def test_the_report_says_what_they_amount_to(self) -> None:
+        from fastmdxplora.report.document import _findings_notes
+
+        notes = _findings_notes({
+            "ligand_chemistry": {"source": "run", "charge_was_ambiguous": False},
+            "binding_modes": [{"fraction": 0.42}],
+            "mode_transitions": {"observed_transitions": 96, "supported": True},
+        })
+        joined = " ".join(notes)
+        assert "resolved during setup" in joined
+        assert "42%" in joined
+        assert "96 changes" in joined
+        # And nothing that would run to pages.
+        assert all(len(note) < 200 for note in notes)
+
+    def test_a_guessed_chemistry_is_named_as_a_guess(self) -> None:
+        from fastmdxplora.report.document import _findings_notes
+
+        notes = _findings_notes({"ligand_chemistry": {"source": "perceived"}})
+        assert "guess" in " ".join(notes)
+
+    def test_an_unsupportable_rate_is_reported_as_such(self) -> None:
+        from fastmdxplora.report.document import _findings_notes
+
+        notes = _findings_notes({
+            "mode_transitions": {"observed_transitions": 2, "supported": False}})
+        assert "too few for a rate" in " ".join(notes)
+
+    def test_a_refused_measurement_is_mentioned(self) -> None:
+        from fastmdxplora.report.document import _findings_notes
+
+        notes = _findings_notes({"not_measured": {"salt_bridge": "charge unknown"}})
+        assert "Not computed" in " ".join(notes)
+
+
+class TestTheMethodsSectionReportsTheRestraints:
+    """A restrained equilibration is part of a protocol. A reader cannot
+    repeat a run that held the protein at a thousand kilojoules and released
+    it in four steps unless the paragraph says so.
+    """
+
+    @staticmethod
+    def _text(**extra):
+        from pathlib import Path
+
+        from fastmdxplora.report.methods import methods_paragraphs
+
+        sim = {"parameters": dict({
+            "timestep_fs": 2.0, "integrator": "langevin_middle",
+            "temperature_K": 300.0, "friction_per_ps": 1.0,
+            "nvt_steps": 25000, "npt_steps": 25000,
+            "production_steps": 500000, "minimize": True,
+        }, **extra), "platform_used": "CUDA", "pressure_bar_used": 1.0}
+        return methods_paragraphs(Path("."), {}, sim)
+
+    def test_what_was_held_and_how_hard(self) -> None:
+        text = self._text(restrain="protein and not element H",
+                          restraint_release=[1000, 500, 100, 0])
+        assert "protein and not element H" in text
+        assert "1000, 500, 100, 0" in text
+        assert "kJ/mol/nm" in text
+
+    def test_that_they_came_off_for_production(self) -> None:
+        text = self._text(restrain="protein", restrain_production=False)
+        assert "released before production" in text
+
+    def test_and_that_they_did_not_where_they_did_not(self) -> None:
+        """A biased trajectory reported as a free one is a claim the
+        simulation does not support."""
+        text = self._text(restrain="protein", restrain_production=True)
+        assert "retained during production" in text
+        assert "biased" in text
+
+    def test_an_unrestrained_run_says_nothing_about_restraints(self) -> None:
+        text = self._text()
+        assert "restrained" not in text
+
+    def test_a_clause_with_no_value_is_left_out(self) -> None:
+        """It read "a friction coefficient of None ps⁻¹" when the number was
+        absent, which is worse than omitting it: a reader cannot tell whether
+        the run had no friction or the software lost it."""
+        from pathlib import Path
+
+        from fastmdxplora.report.methods import methods_paragraphs
+
+        sim = {"parameters": {"timestep_fs": 2.0, "integrator": "verlet",
+                              "temperature_K": 300.0, "production_steps": 1000}}
+        text = methods_paragraphs(Path("."), {}, sim)
+        assert "None" not in text
+
+
+class TestTheReportDoesNotStateWhatDidNotHappen:
+    """A methods section is the part of a report that gets published.
+
+    Run on a tri-alanine in water, with no ligand in it, the methods paragraph
+    read: "The ligand LIG was parameterized with openff-2.2.1." Both values
+    behind that sentence are defaults --- LIG is the naming convention for a
+    ligand if there is one, and the small-molecule force field is a property
+    of the protein force field, present whether or not it was used --- so the
+    sentence appeared in every run.
+    """
+
+    @staticmethod
+    def _setup(**over):
+        base = {
+            "input": {"system": "/home/someone/ala3.pdb", "form": "pdb_file"},
+            "parameters": {
+                "ph": 7.4, "ligand": None, "ligand_name": "LIG",
+                "ligand_forcefield": None, "solvent_padding_nm": 1.2,
+                "box_shape": "cube", "water_model": "tip3p",
+            },
+            "resolved_forcefield": {
+                "xmls": ["amber14-all.xml"], "water_model": "tip3p",
+                "supports_ligand": True,
+                "small_molecule_forcefield": "openff-2.2.1",
+            },
+            "n_atoms_solvated": 1271,
+        }
+        base["parameters"].update(over)
+        return base
+
+    def test_no_ligand_is_claimed_when_none_was_parameterised(
+        self, tmp_path
+    ) -> None:
+        from fastmdxplora.report.methods import methods_paragraphs
+
+        text = methods_paragraphs(tmp_path, self._setup(), {})
+        assert "ligand" not in text.lower()
+
+    def test_one_is_claimed_when_a_ligand_was(self, tmp_path) -> None:
+        from fastmdxplora.report.methods import methods_paragraphs
+
+        text = methods_paragraphs(
+            tmp_path,
+            self._setup(ligand=["ligands/BNZ.sdf"], ligand_name="BNZ",
+                        ligand_forcefield="openff-2.2.1"),
+            {})
+        assert "BNZ" in text
+        assert "openff-2.2.1" in text
+
+    def test_the_coordinate_source_is_read_not_guessed(self, tmp_path) -> None:
+        """A four-character filename is not a deposited structure. The origin
+        was decided by the length of the string, so any such name was
+        described as coming from the Protein Data Bank."""
+        from fastmdxplora.report.methods import methods_paragraphs
+
+        setup = self._setup()
+        setup["input"] = {"system": "abcd", "form": "pdb_file"}
+        assert "Protein Data Bank" not in methods_paragraphs(tmp_path, setup, {})
+
+        setup["input"] = {"system": "181L", "form": "pdb_id"}
+        assert "Protein Data Bank entry" in methods_paragraphs(tmp_path, setup, {})
+
+
+class TestTheTitleNamesTheSystem:
+    """The title read "FastMDXplora Study --- /home/aaina/ala3.pdb": the
+    author's home directory, on the first line of a document meant to be sent
+    to somebody."""
+
+    def test_a_path_becomes_a_name(self) -> None:
+        from fastmdxplora.report.run import _system_label
+
+        assert _system_label("/home/someone/ala3.pdb") == "ala3"
+        assert _system_label("/Users/someone/runs/1UBQ.cif") == "1UBQ"
+
+    def test_a_pdb_entry_stays_one(self) -> None:
+        from fastmdxplora.report.run import _system_label
+
+        assert _system_label("181L") == "181L"
+        assert _system_label("1ubq") == "1UBQ"
+
+    def test_two_suffixes_both_come_off(self) -> None:
+        """Taking one left "trp_cage.pdb" as the name of a study."""
+        from fastmdxplora.report.run import _system_label
+
+        assert _system_label("trp_cage.pdb.gz") == "trp_cage"
+
+
+class TestARequestedOutputThatCouldNotBeMadeIsRecorded:
+    """The terminal warned that no PDF could be written and the manifest did
+    not. Read from its files afterwards, the run showed four formats where
+    five were asked for, with nothing to say the fifth had been attempted."""
+
+    def test_the_reason_is_written_beside_the_outputs(self, tmp_path, monkeypatch) -> None:
+        # A PDF that could not be made is recorded beside what was, with
+        # its reason, and named among the artifacts.
+        from types import SimpleNamespace
+
+        import importlib
+
+        report_run_module = importlib.import_module("fastmdxplora.report.run")
+        monkeypatch.setattr("fastmdxplora.report.pdf.try_render_pdf",
+                            lambda markdown_path, *, title: (None, "WeasyPrint is not installed."))
+        root = _a_reported_run(tmp_path, n_frames=40)
+        artifacts = report_run_module.run(orchestrator=SimpleNamespace(output_dir=root, system="1UBQ"),
+                                          output_dir=root / "report", slides=False, bundle=False)
+        record = json.loads((root / "report" / "not_produced.json").read_text(encoding="utf-8"))
+        assert record == [{"artifact": "report.pdf", "code": "report.format.unavailable",
+                           "reason": "WeasyPrint is not installed."}]
+        assert "not_produced.json" in artifacts and "report.md" in artifacts
+
+    def test_a_later_run_that_made_it_clears_the_record(self, tmp_path, monkeypatch) -> None:
+        # The record was written when the PDF could not be made and never
+        # removed, so after a later run made it the page said the PDF was
+        # missing beside a link to download it.
+        from types import SimpleNamespace
+
+        import importlib
+
+        from fastmdxplora.gui.report_page import report_payload
+
+        report_run_module = importlib.import_module("fastmdxplora.report.run")
+        root = _a_reported_run(tmp_path, n_frames=40)
+        report = root / "report"
+
+        def made(markdown_path, *, title):
+            target = Path(markdown_path).with_suffix(".pdf")
+            target.write_bytes(b"%PDF-1.4 stand-in")
+            return target, None
+
+        for renderer in (lambda markdown_path, *, title: (None, "Markdown is not installed."), made):
+            monkeypatch.setattr("fastmdxplora.report.pdf.try_render_pdf", renderer)
+            report_run_module.run(orchestrator=SimpleNamespace(output_dir=root, system="1UBQ"),
+                                  output_dir=report, slides=False, bundle=False)
+        assert (report / "report.pdf").is_file()
+        assert not (report / "not_produced.json").exists()
+        assert report_payload(root)["not_produced"] == []
+
+class TestTheSummarySaysWhatTheStudyWas:
+    """The first section a reader reads said "This report was generated
+    automatically by FastMDXplora from the outputs of an end-to-end molecular
+    dynamics study" --- a statement about the software, in a document about
+    their system."""
+
+    def test_it_states_the_system_and_the_run(self, tmp_path) -> None:
+        import json
+
+        from fastmdxplora.report.document import _study_in_one_paragraph
+
+        (tmp_path / "setup").mkdir()
+        (tmp_path / "setup" / "setup_parameters.json").write_text(
+            json.dumps({"n_atoms_solvated": 37098}), encoding="utf-8")
+        (tmp_path / "simulation").mkdir()
+        (tmp_path / "simulation" / "simulation_parameters.json").write_text(
+            json.dumps({"duration_ns_actual": 20.0,
+                        "parameters": {"temperature_K": 300.0}}),
+            encoding="utf-8")
+
+        said = _study_in_one_paragraph(tmp_path)
+        assert "37,098 atoms" in said
+        assert "20 ns" in said and "300 K" in said
+
+    def test_a_short_run_is_given_in_picoseconds(self, tmp_path) -> None:
+        """"0.008 ns" is a number nobody says out loud."""
+        import json
+
+        from fastmdxplora.report.document import _study_in_one_paragraph
+
+        (tmp_path / "simulation").mkdir()
+        (tmp_path / "simulation" / "simulation_parameters.json").write_text(
+            json.dumps({"duration_ns_actual": 0.008}), encoding="utf-8")
+        assert "8 ps" in _study_in_one_paragraph(tmp_path)
+
+    def test_nothing_recorded_means_nothing_claimed(self, tmp_path) -> None:
+        """A sentence assembled from three absent values is worse than the
+        generic one it replaces."""
+        from fastmdxplora.report.document import _study_in_one_paragraph
+
+        assert _study_in_one_paragraph(tmp_path) is None
+
+    def test_the_convergence_counts_add_up(self, tmp_path, monkeypatch) -> None:
+        """A first version counted settled and unjudged from overlapping
+        conditions, and reported three and six out of six. The three states
+        are exclusive: with two equilibrated, one drifting and one that could
+        not be judged, the summary says two, one and one of four."""
+        from fastmdxplora.report import document
+
+        assessed = {"observables": {
+            "rmsd": {"equilibrated": True, "sampled_enough": True},
+            "rg": {"equilibrated": True, "sampled_enough": True},
+            "sasa": {"equilibrated": False, "sampled_enough": True},
+            "potential": {"equilibrated": None, "sampled_enough": True},
+        }}
+        monkeypatch.setattr(document, "_assess_this_run", lambda root: assessed)
+        text = document._what_the_run_supports(tmp_path)
+        assert text.startswith("Of 4 observables assessed, ")
+        assert "2 had equilibrated" in text and "1 had not" in text
+        assert "1 could not be judged" in text
+
+class TestTheSlidesArePresentable:
+    """Twenty-one slides, twelve figures, not one number; three of them
+    displaying filesystem paths from the machine that produced them; and the
+    whole deck in 4:3."""
+
+    @staticmethod
+    def _recorded(tmp_path):
+        import json
+
+        (tmp_path / "setup").mkdir(exist_ok=True)
+        (tmp_path / "setup" / "setup_parameters.json").write_text(json.dumps({
+            "n_atoms_solvated": 37098,
+            "parameters": {"ph": 7.4, "solvent_padding_nm": 1.0,
+                           "box_shape": "cube", "ion_concentration_M": 0.15,
+                           "ligand": ["ligands/BNZ.sdf"], "ligand_name": "BNZ",
+                           "ligand_forcefield": "openff-2.2.1"},
+            "resolved_forcefield": {"xmls": ["amber14-all.xml"],
+                                    "water_model": "tip3p"},
+        }), encoding="utf-8")
+        (tmp_path / "simulation").mkdir(exist_ok=True)
+        (tmp_path / "simulation" / "simulation_parameters.json").write_text(
+            json.dumps({
+                "duration_ns_actual": 20.0, "pressure_bar_used": 1.0,
+                "platform_used": "CUDA",
+                "parameters": {"temperature_K": 300.0, "timestep_fs": 2.0,
+                               "integrator": "langevin_middle",
+                               "constraints": "HBonds", "random_seed": 7},
+            }), encoding="utf-8")
+
+    def test_the_deck_is_widescreen(self, tmp_path) -> None:
+        # 4:3 shows black bands on a projector. Built, then opened.
+        from types import SimpleNamespace
+
+        pptx = pytest.importorskip("pptx")
+        from fastmdxplora.report.slides import _build_pptx
+
+        self._recorded(tmp_path)
+        deck = tmp_path / "slides.pptx"
+        _build_pptx(SimpleNamespace(output_dir=tmp_path, system="1UBQ"), "A study", deck)
+        opened = pptx.Presentation(str(deck))
+        assert opened.slide_width / opened.slide_height == pytest.approx(16 / 9, rel=1e-3)
+        assert opened.slide_width == pptx.util.Inches(13.333)
+
+    def test_the_setup_slide_states_the_system_not_a_path(self, tmp_path) -> None:
+        from fastmdxplora.report.slides import _setup_bullets
+
+        self._recorded(tmp_path)
+        bullets = _setup_bullets(tmp_path)
+
+        assert any("37,098 atoms" in b for b in bullets)
+        assert any("amber14-all.xml" in b for b in bullets)
+        assert any("BNZ" in b for b in bullets)
+        assert not any("/" in b and b.startswith("  •") for b in bullets)
+
+    def test_the_ensemble_comes_from_what_ran(self, tmp_path) -> None:
+        """`pressure_bar` is what was asked for and is None when the default
+        was taken; reading it called an NPT run at 1 bar an NVT one."""
+        from fastmdxplora.report.slides import _simulation_bullets
+
+        self._recorded(tmp_path)
+        assert any("1 bar (NPT)" in b for b in _simulation_bullets(tmp_path))
+
+    def test_the_seed_is_stated_either_way(self, tmp_path) -> None:
+        from fastmdxplora.report.slides import _simulation_bullets
+
+        self._recorded(tmp_path)
+        assert any("Random seed: 7" in b for b in _simulation_bullets(tmp_path))
+
+    def test_the_outline_does_not_also_point_at_the_json(self, tmp_path) -> None:
+        """`list.extend` returns None, so "extend(...) or append(fallback)"
+        ran the fallback every time: the outline carried the bullets and then
+        told the reader to go and look at the manifest anyway. Where a
+        section has bullets, it has no fallback line; where it has none,
+        the fallback is the whole section."""
+        from types import SimpleNamespace
+
+        from fastmdxplora.report.slides import _outline_markdown
+
+        self._recorded(tmp_path)
+        outline = _outline_markdown(SimpleNamespace(output_dir=tmp_path, system="1UBQ"), "A study")
+        built = outline[outline.index("How the system was built"):]
+        built = built[:built.index("\n## ")] if "\n## " in built else built
+        assert "37,098 atoms" in built
+        assert "See `setup/setup_parameters.json`" not in built
+        # And a run with nothing recorded for a section falls back to the file.
+        (tmp_path / "setup" / "setup_parameters.json").write_text("{}", encoding="utf-8")
+        again = _outline_markdown(SimpleNamespace(output_dir=tmp_path, system="1UBQ"), "A study")
+        assert "See `setup/setup_parameters.json`" in again
+
+class TestTheBundleCarriesTheRunRecord:
+    """The archive is the thing a study is sent as. It carried the outputs,
+    including the trajectory, and not the manifest recording what produced
+    them nor the configuration file that reproduces them.
+
+    Not by exclusion: those two are written once every phase has finished, and
+    the bundle is built during the report phase, so they did not exist yet.
+    The module's own docstring claimed it contained "the top-level manifest".
+    """
+
+    def test_the_manifest_and_the_config_are_inside(self, tmp_path) -> None:
+        import zipfile
+
+        from fastmdxplora.orchestrator import FastMDXplora
+
+        root = tmp_path / "run"
+        (root / "report").mkdir(parents=True)
+        with zipfile.ZipFile(root / "report" / "project_bundle.zip", "w") as z:
+            z.writestr("analysis/rmsd/rmsd.dat", "0.1\n")
+        (root / "manifest.json").write_text('{"phases": []}', encoding="utf-8")
+        (root / "resolved_config.yml").write_text("output: run\n", encoding="utf-8")
+
+        fmdx = FastMDXplora(system="1L2Y", output_dir=root)
+        fmdx._add_run_record_to_bundle()
+
+        inside = zipfile.ZipFile(root / "report" / "project_bundle.zip").namelist()
+        assert "manifest.json" in inside
+        assert "resolved_config.yml" in inside
+        assert "analysis/rmsd/rmsd.dat" in inside, "nothing already there is lost"
+
+    def test_it_is_added_after_they_are_written(self, tmp_path, monkeypatch) -> None:
+        """Which is the whole point: called earlier, there is nothing to add.
+        A study is run with its phases stood in, the report phase building a
+        bundle as the real one does. The manifest inside the bundle has to
+        be the one written once every phase has finished, phases and all,
+        not the one written before the loop so a running study has a
+        record."""
+        import zipfile
+
+        from fastmdxplora.orchestrator import FastMDXplora, PhaseResult
+
+        root = tmp_path / "run"
+        fmdx = FastMDXplora(system="1L2Y", output_dir=root)
+
+        def stood_in(self, phase, kwargs):
+            (root / phase).mkdir(parents=True, exist_ok=True)
+            if phase == "report":
+                with zipfile.ZipFile(root / "report" / "project_bundle.zip", "w") as z:
+                    z.writestr("report/report.md", "# R\n")
+            return PhaseResult(name=phase, status="ok", output_dir=root / phase)
+
+        monkeypatch.setattr(FastMDXplora, "_run_phase", stood_in)
+        fmdx.explore(include_phase=["setup", "report"], report=True)
+        on_disk = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        with zipfile.ZipFile(root / "report" / "project_bundle.zip") as z:
+            inside = json.loads(z.read("manifest.json"))
+        assert [p["name"] for p in on_disk["phases"]] == ["setup", "report"]
+        assert inside == on_disk
+
+    def test_a_missing_bundle_is_not_an_error(self, tmp_path) -> None:
+        """Bundles are optional, and a study that finished should not fail for
+        want of an archive nobody asked for."""
+        from fastmdxplora.orchestrator import FastMDXplora
+
+        root = tmp_path / "run"
+        root.mkdir()
+        FastMDXplora(system="1L2Y", output_dir=root)._add_run_record_to_bundle()
+
+    def test_nothing_is_added_twice(self, tmp_path) -> None:
+        import zipfile
+
+        from fastmdxplora.orchestrator import FastMDXplora
+
+        root = tmp_path / "run"
+        (root / "report").mkdir(parents=True)
+        with zipfile.ZipFile(root / "report" / "project_bundle.zip", "w") as z:
+            z.writestr("manifest.json", "{}")
+        (root / "manifest.json").write_text('{"phases": []}', encoding="utf-8")
+
+        fmdx = FastMDXplora(system="1L2Y", output_dir=root)
+        fmdx._add_run_record_to_bundle()
+
+        names = zipfile.ZipFile(root / "report" / "project_bundle.zip").namelist()
+        assert names.count("manifest.json") == 1
+
+
+class TestTheDashboardHeaderNamesTheSystem:
+    """The same field the report and the slides show. The output folder and
+    the `fastmdx gui --output ...` instruction keep their paths: that page is
+    opened on the machine that produced the run, and both need one."""
+
+    def test_the_header_shows_a_name(self) -> None:
+        from fastmdxplora.gui.report_dashboard import _system_label
+
+        assert _system_label("/home/someone/ala3.pdb") == "ala3"
+        assert _system_label("181L") == "181L"
+
+
+class TestTheResultsCarryTheMeasurement:
+    """A results subsection showed the settings that produced a figure, and
+    the figure, and no number --- while the mean, its uncertainty and the
+    independent samples behind it were already recorded for every per-frame
+    analysis.
+    """
+
+    def test_the_mean_and_its_error_are_stated(self) -> None:
+        from fastmdxplora.report.document import _findings_notes
+
+        notes = _findings_notes({"mean": {
+            "mean": 0.01208, "standard_error": 0.00292,
+            "effective_samples": 8.1, "discard": 40,
+        }})
+        said = " ".join(notes)
+
+        # The error to two figures, the mean to the same place: as the GUI
+        # beside the report gives it.
+        assert "0.0121 ± 0.0029" in said
+        assert "8 independent samples" in said
+        assert "discarding 40 frames" in said
+
+    def test_a_mean_that_is_not_a_measurement_says_so(self) -> None:
+        from fastmdxplora.report.document import _findings_notes
+
+        notes = _findings_notes({"mean": {
+            "mean": 1.0, "standard_error": 0.1, "effective_samples": 3,
+            "not_a_measurement": "3.0 independent samples in 40 frames.",
+        }})
+        assert any("independent samples in 40 frames" in n for n in notes)
+
+    def test_nothing_recorded_says_nothing(self) -> None:
+        from fastmdxplora.report.document import _findings_notes
+
+        assert _findings_notes({}) == []
+        assert _findings_notes({"mean": {}}) == []
+
+    def test_default_options_are_not_claimed_beside_a_list_of_options(
+        self, tmp_path
+    ) -> None:
+        """A `for ... else` runs its else when the loop finishes without a
+        break, which is every time: the report listed an analysis's parameters
+        and then said it had run with the defaults."""
+        from fastmdxplora.report.document import _results_section
+
+        root = _a_reported_run(tmp_path, n_frames=40)
+        cleared = root / "analysis" / "rg" / "options.json"
+        record = json.loads(cleared.read_text(encoding="utf-8"))
+        record.update(options={}, selection=None, findings={})
+        cleared.write_text(json.dumps(record), encoding="utf-8")
+
+        blocks = _blocks(_results_section(root))
+        assert "**Parameters:**" in blocks["rmsd"]
+        assert "_Ran with default options._" not in blocks["rmsd"]
+        assert "_Ran with default options._" in blocks["rg"]
+
+class TestOneMeanPerObservable:
+    """A real study reported the RMSD twice in one document: 0.08895 in the
+    convergence table and 0.09461 in its own results section, both labelled
+    the mean, with nothing to say why they differed.
+
+    The table averaged the whole series; the per-analysis finding discarded
+    the relaxation first, as the method requires. A reader comparing the two
+    had no way to know which to quote.
+    """
+
+    @staticmethod
+    def _relaxing(n=200, seed=0):
+        rng = np.random.RandomState(seed)
+        return (0.05 * np.exp(-np.arange(n) / 40.0) + 0.089
+                + rng.normal(0, 0.004, n))
+
+    def test_the_table_and_the_findings_agree(self) -> None:
+        from fastmdxplora.report.convergence import assess_series
+        from fastmdxplora.statistics import summarise
+
+        series = self._relaxing()
+        assessed = assess_series("rmsd", series)
+        settled, _reason = summarise(series)
+
+        assert assessed.mean == settled.mean
+        assert assessed.effective_samples == settled.effective_samples
+        assert assessed.discard == settled.discard
+
+    def test_the_relaxation_is_discarded(self) -> None:
+        """Otherwise the mean describes the approach to equilibrium as much as
+        the equilibrium."""
+        from fastmdxplora.report.convergence import assess_series
+
+        series = self._relaxing()
+        assessed = assess_series("rmsd", series)
+
+        assert assessed.discard > 0
+        assert assessed.mean < float(series.mean()), (
+            "a decaying series averaged from the start reads high")
+
+    def test_drift_is_measured_over_what_is_averaged(self) -> None:
+        """Over the frames the mean is taken over, as the analyses' record
+        judges it. Measured over the whole run, the relaxation the mean
+        leaves out read as drift, and the report said "still moving" of a
+        mean every page called determined. A series that relaxes and then
+        settles: its relaxation is set aside, and what is averaged has no
+        drift."""
+        from fastmdxplora.report.convergence import _drift_in_noise, assess_series
+
+        series = self._relaxing(n=200)
+        assessed = assess_series("rmsd", series)
+        assert assessed.discard > 0                          # the relaxation was set aside
+        over_the_whole_run = _drift_in_noise(series)
+        over_the_settled_part = _drift_in_noise(series[assessed.discard:])
+        assert assessed.drift_in_noise == pytest.approx(over_the_settled_part)
+        assert abs(over_the_whole_run) > 2.0
+        assert abs(over_the_settled_part) < 1.0
+        assert assessed.has_equilibrated is True
+
+    def test_the_table_says_what_it_discarded(self, tmp_path) -> None:
+        # A series that relaxes before it settles: the table carries how many
+        # frames were set aside, which is neither none nor all of them.
+        from fastmdxplora.report.convergence import assess_run
+        from fastmdxplora.report.document import _convergence_section
+
+        root = TestTheReportSaysHowMuchTheRunSupports._a_run(tmp_path, n_frames=400)
+        frames = np.arange(400)
+        relaxing = 0.2 + np.exp(-frames / 40.0) + np.random.RandomState(3).normal(0, 0.01, 400)
+        (root / "analysis" / "rmsd" / "rmsd.dat").write_text(
+            "# frame rmsd\n" + "".join(f"{i} {v:.6f}\n" for i, v in zip(frames, relaxing)),
+            encoding="utf-8")
+        # The analysis's record of the series it wrote: the table reads it.
+        from fastmdxplora.statistics import mean_record
+
+        record = {k: (str(v) if k == "not_a_measurement" else v)
+                  for k, v in mean_record(relaxing).items()}
+        (root / "analysis" / "rmsd" / "options.json").write_text(json.dumps(
+            {"analysis": "rmsd", "findings": {"mean": record}}), encoding="utf-8")
+        text = _convergence_section(root)
+        assert "| observable | frames | discarded | independent" in text
+        row = next(r for r in _rows(text) if r.startswith("| RMSD |"))
+        shown = int(row.split("|")[3].strip().replace(",", ""))
+        expected = assess_run({"rmsd": list(relaxing)})["observables"]["rmsd"]["discard"]
+        assert expected == record["discard"]
+        assert shown == expected and 0 < shown < 400, (shown, expected)
+
+class TestEquilibratedIsNotTheSameAsSampled:
+    """The summary said "All 5 observables assessed had settled" for a run
+    whose RMSD held six independent samples and whose density held ten -- at
+    or under the point where a mean stops describing the system."""
+
+    def test_an_equilibrated_but_thinly_sampled_run_says_so(self) -> None:
+        from fastmdxplora.report.document import _what_the_run_supports
+
+        records = {
+            "observables": {
+                "a": {"settled": True, "sampled_enough": True,
+                      "correlation_measurable": True},
+                "b": {"settled": True, "sampled_enough": False,
+                      "correlation_measurable": True},
+            }
+        }
+        import unittest.mock as mock
+
+        with mock.patch("fastmdxplora.report.document._assess_this_run",
+                        return_value=records):
+            said = _what_the_run_supports(Path("/nowhere"))
+
+        assert "had equilibrated" in said
+        assert "too few independent samples" in said
+
+    def test_a_run_that_is_both_says_neither(self) -> None:
+        from fastmdxplora.report.document import _what_the_run_supports
+
+        records = {
+            "observables": {
+                "a": {"settled": True, "sampled_enough": True,
+                      "correlation_measurable": True},
+            }
+        }
+        import unittest.mock as mock
+
+        with mock.patch("fastmdxplora.report.document._assess_this_run",
+                        return_value=records):
+            said = _what_the_run_supports(Path("/nowhere"))
+
+        assert "too few" not in said
+        assert "each mean is determined" in said
+class TestReproducibilitySaysWhatItReproduces:
+    """What running the configuration again gives, read from the study's
+    records. Setup records the random seed it placed hydrogens and ions with
+    (1130) and minimises on one thread, so a rerun prepares the same system;
+    this section said, before and after that, that solvation could not be
+    seeded and a rerun gave a different atom count. A study prepared before
+    the seed was recorded is still said to be one that does.
+
+    Worth stating where somebody reads the run's provenance, because the
+    section otherwise implies the file is enough.
+    """
+
+    def test_a_recorded_seed_prepares_the_same_system(self, tmp_path) -> None:
+        text = _reproducibility_of(tmp_path, prepared=True, seed={"seed": 42, "drawn": True})
+        assert "prepares the same system" in text
+        assert "(42, drawn for this study)" in text
+        assert "cannot be seeded" not in text and "bilayer" not in text
+
+    def test_a_bilayer_packed_before_its_packing_was_seeded_is_the_exception(
+            self, tmp_path) -> None:
+        text = _reproducibility_of(tmp_path, prepared=True, seed={"seed": 7, "drawn": False},
+                                   config={"setup": {"membrane": "POPC"}},
+                                   bilayer={"lipid": "POPC", "lipids": 442})
+        assert "(7)" in text and "except the bilayer" in text
+
+    def test_a_bilayer_with_its_packing_seed_is_prepared_again(self, tmp_path) -> None:
+        text = _reproducibility_of(tmp_path, prepared=True, seed={"seed": 7, "drawn": False},
+                                   config={"setup": {"membrane": "POPC"}},
+                                   bilayer={"lipid": "POPC", "packing_seed": 1234,
+                                            "packing_attempts": 1})
+        assert "(7)" in text and "prepares the same system" in text
+        assert "except the bilayer" not in text
+
+    def test_a_study_prepared_before_the_seed_was_recorded(self, tmp_path) -> None:
+        text = _reproducibility_of(tmp_path, prepared=True)
+        assert "without a recorded random seed" in text
+        assert "slightly different atom count" in text
+
+    def test_the_dynamics_repeat_their_start_only_with_a_seed(self, tmp_path) -> None:
+        unseeded = _reproducibility_of(tmp_path / "a", prepared=True)
+        assert "No `simulation.random_seed` was given" in unseeded
+        seeded = _reproducibility_of(tmp_path / "b", prepared=True,
+                                     config={"simulation": {"random_seed": 3}})
+        assert "`simulation.random_seed` 3" in seeded
+        assert "statistics rather than the frames" in seeded
+
+    def test_and_names_the_way_to_repeat_it_exactly(self, tmp_path) -> None:
+        """Which the software supports: simulate from the prepared system
+        rather than preparing another -- named by the setting's current
+        name, not the earlier spelling that is on its way out."""
+        text = _reproducibility_of(tmp_path, prepared=True)
+        assert "`simulation.setup_from` at its `setup/`" in text
+        assert "prepared_from" not in text
+
+    def test_it_is_only_said_where_a_system_was_prepared(self, tmp_path) -> None:
+        """An analysis of a supplied trajectory did not solvate anything."""
+        assert "What rerunning" in _reproducibility_of(tmp_path / "a", prepared=True)
+        assert "What rerunning" not in _reproducibility_of(tmp_path / "b", prepared=False)
+
+class TestABiasedTrajectorySaysWhatItIs:
+    """The restraint case said this well and the three enhanced-sampling
+    methods said nothing at all -- the cases where biasing is the entire
+    point of the run. Ten analyses of a metadynamics trajectory were
+    reported beside the free energy with no distinction, and a reader would
+    take a mean RMSD over them as a measurement of the system.
+
+    The three are not alike, and one caveat covering all of them would be
+    wrong about two."""
+
+    def _protocol(self, tmp_path=None, **simulation) -> str:
+        import tempfile
+        from pathlib import Path
+
+        from fastmdxplora.report.methods import methods_paragraphs
+
+        return methods_paragraphs(
+            Path(tmp_path or tempfile.mkdtemp()),
+            {"ph": 7.4},
+            {"nvt_steps": 1000, "npt_steps": 0, "production_steps": 4000,
+             "timestep_fs": 2.0, **simulation},
+        )
+
+    def test_metadynamics_says_the_weights_exist(self) -> None:
+        """A known bias on a known coordinate: exp(V/RT) recovers the
+        unbiased ensemble, so the honest note says so."""
+        text = self._protocol(metadynamics={"collective_variable": "torsion"})
+        assert "not a Boltzmann ensemble" in text
+        assert "reweighted" in text
+        assert "recoverable" in text
+
+    def test_umbrella_says_the_windows_do_not_combine(self) -> None:
+        """Each is a separate biased simulation. What combines them is the
+        free energy, not an average of any quantity across them."""
+        text = self._protocol(umbrella={"centre": 0.7})
+        assert "one window" in text
+        assert "not\ncomparable between windows" in text or (
+            "not comparable between windows" in text)
+        assert "potential of mean force" in text
+
+    def test_steered_says_no_reweighting_exists(self) -> None:
+        """Not an equilibrium ensemble at all, so there are no weights to
+        recover -- unlike metadynamics, where there are."""
+        text = self._protocol(steered={"to": 0.95})
+        assert "not an equilibrium ensemble" in text
+        assert "no reweighting" in text
+
+    def test_an_unbiased_run_says_none_of_it(self) -> None:
+        text = self._protocol()
+        for phrase in ("Boltzmann", "one window", "steered pull"):
+            assert phrase not in text
+
+    def test_the_three_notes_differ(self) -> None:
+        """One caveat covering all three would be wrong about two of them."""
+        metad = self._protocol(metadynamics={"collective_variable": "torsion"})
+        umbrella = self._protocol(umbrella={"centre": 0.7})
+        steered = self._protocol(steered={"to": 0.95})
+
+        assert "reweighted" in metad and "reweighted" not in steered
+        assert "potential of mean force" in umbrella
+        assert "no reweighting" in steered and "no reweighting" not in metad
+
+
+class TestTheReportSaysWhatItMeans:
+    """Read line by line, a report of a real study turned up things a
+    reader would stumble on. Each is held here."""
+
+    def test_the_header_says_software(self):
+        from fastmdxplora.report.document import build_document  # noqa: F401
+
+        src = Path(__file__).resolve().parents[1] / "src" / "fastmdxplora" / "report" / "document.py"
+        text = src.read_text(encoding="utf-8")
+        assert '"_Software: FastMDXplora_  "' in text
+        assert '"_Tool: FastMDXplora_  "' not in text
+
+    def test_see_convergence_is_a_link(self):
+        src = Path(__file__).resolve().parents[1] / "src" / "fastmdxplora" / "report" / "document.py"
+        text = src.read_text(encoding="utf-8")
+        assert "see [Convergence](#convergence)" in text
+
+    def test_the_auto_policy_is_explained_not_named(self, tmp_path):
+        from fastmdxplora.report.methods import methods_paragraphs
+
+        text = methods_paragraphs(
+            tmp_path, setup={"parameters": {"heterogens": "auto", "ph": 7.4}},
+            sim={"parameters": {}}, versions={})
+        assert "decided per component" in text
+        assert "under the `auto` policy" not in text
+
+    def test_software_and_tools_are_two_sentences(self, tmp_path):
+        from fastmdxplora.report.methods import methods_paragraphs
+
+        text = methods_paragraphs(
+            tmp_path, setup={"parameters": {}}, sim={"parameters": {}},
+            versions={"FastMDXplora": "2.5", "OpenMM": "8.4", "NumPy": "2.1"})
+        assert "**Software.** System setup, simulation and analysis were performed with FastMDXplora 2.5." in text
+        assert "**Tools.** FastMDXplora uses NumPy 2.1, OpenMM 8.4." in text
+        assert "Analysis and orchestration" not in text
+
+    def test_the_tools_list_includes_what_the_arithmetic_stands_on(self):
+        from fastmdxplora.report.document import _software_versions
+
+        found = _software_versions()
+        for lib in ("NumPy", "SciPy", "matplotlib"):
+            assert lib in found
+
+    def test_determined_settings_are_filled_in(self):
+        from fastmdxplora.report.document import _resolve_derived
+
+        out = _resolve_derived({"duration_ns": 0.5, "nvt_steps": 50000, "timestep_fs": 2.0,
+                                "production_steps": None, "nvt_duration_ns": None,
+                                "pressure_bar": None, "pressure_atm": None})
+        assert out["production_steps"] == 250000
+        assert out["nvt_duration_ns"] == 0.1
+        assert out["pressure_bar"] == 1.0
+        assert abs(out["pressure_atm"] - 0.98692) < 1e-5
+
+    def test_the_ensemble_is_read_from_npt_steps_when_absent(self):
+        # Absent means "read it from npt_steps", which is how it always
+        # worked. "ensemble: None" in the record told a reader nothing.
+        from fastmdxplora.report.document import _resolve_derived
+
+        assert _resolve_derived({"npt_steps": 50000, "timestep_fs": 2.0})["ensemble"] == "npt"
+        assert _resolve_derived({"npt_steps": 0, "timestep_fs": 2.0})["ensemble"] == "nvt"
+        assert _resolve_derived({"ensemble": "nvt", "npt_steps": 50000,
+                                 "timestep_fs": 2.0})["ensemble"] == "nvt"
+
+    def test_a_given_value_is_not_overwritten(self):
+        from fastmdxplora.report.document import _resolve_derived
+
+        out = _resolve_derived({"pressure_atm": 2.0, "pressure_bar": None, "timestep_fs": 2.0})
+        assert out["pressure_atm"] == 2.0
+        assert abs(out["pressure_bar"] - 2.0265) < 1e-4
+
+    def test_every_analysis_section_says_what_it_measures(self):
+        src = Path(__file__).resolve().parents[1] / "src" / "fastmdxplora" / "report" / "document.py"
+        text = src.read_text(encoding="utf-8")
+        assert 'explain_analysis(str(analysis)).get("summary")' in text
+
+    def test_the_summary_figure_takes_one_panel_per_analysis_up_to_twelve(self):
+        from fastmdxplora.report.summary_figure import EXPECTED_PANELS, MAX_PANELS
+
+        assert MAX_PANELS == 12
+        first_twelve = [p[1].split("/")[1] for p in EXPECTED_PANELS[:12]]
+        # Twelve distinct analyses before any second figure of one.
+        assert len(set(first_twelve)) == 12
+
+    def test_the_report_page_rerenders_only_on_change(self):
+        js = (Path(__file__).resolve().parents[1] / "src" / "fastmdxplora" / "gui"
+              / "static" / "report-page.js").read_text(encoding="utf-8")
+        # The text with its numbers marked, and the records written again
+        # since: what they trace to changes with the records, not the text.
+        assert "var drawn = shown + JSON.stringify(data.records_changed || []);" in js
+        assert "if (doc.dataset.rendered === drawn) return;" in js
+
+
+
+@pytest.fixture(scope="module")
+def a_real_setup(tmp_path_factory):
+    """The setup phase, run on a peptide as it runs on anything -- PDBFixer,
+    hydrogens, solvent: what prepare_system returned, and where it wrote."""
+    from types import SimpleNamespace
+
+    pytest.importorskip("openmm")
+    from fastmdxplora.setup import pipeline, prepare
+    from tests.test_a_real_study_runs_end_to_end import TRI_ALANINE
+
+    root = tmp_path_factory.mktemp("setup_run")
+    structure = root / "peptide.pdb"
+    structure.write_text(TRI_ALANINE, encoding="utf-8")
+    (root / "setup").mkdir()
+    returned: dict = {}
+    real = prepare.prepare_system
+
+    def watched(*args, **kwargs):
+        produced = real(*args, **kwargs)
+        returned.update(produced)
+        return produced
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(prepare, "prepare_system", watched)
+        pipeline.run(orchestrator=SimpleNamespace(system=str(structure),
+                                                  _structure_provenance=None, _presenter=None),
+                     output_dir=root / "setup",
+                     # A peptide this small needs the padding to fit the
+                     # cutoff inside half the box, as the end-to-end run has.
+                     solvent_padding_nm=1.2, nonbonded_cutoff_nm=0.9)
+    return SimpleNamespace(root=root, returned=returned)
+
+
+def _a_short_npt_run(root, monkeypatch, *, through_the_phase=False, **pressure):
+    """Ten steps at constant pressure on a small water box. Returns what the
+    runner returned and the pressure each barostat was built with."""
+    from types import SimpleNamespace
+
+    from fastmdxplora.simulation import pipeline, runner
+    from tests._the_phase import a_prepared_water_box
+
+    built: list = []
+    add_barostat, run_simulation = runner._add_barostat, runner.run_simulation
+
+    def recording_barostat(*args, **kwargs):
+        built.append(kwargs["pressure_bar"])
+        return add_barostat(*args, **kwargs)
+
+    returned: list = []
+
+    def recording_run(**kwargs):
+        result = run_simulation(**kwargs)
+        returned.append(result)
+        return result
+
+    monkeypatch.setattr(runner, "_add_barostat", recording_barostat)
+    monkeypatch.setattr(runner, "run_simulation", recording_run)
+    files = a_prepared_water_box(root)
+    settings = dict(production_steps=10, nvt_steps=0, npt_steps=0, minimize=False,
+                    platform="CPU", ensemble="npt", **pressure)
+    if through_the_phase:
+        (root / "simulation").mkdir()
+        pipeline.run(orchestrator=SimpleNamespace(output_dir=root, _presenter=None),
+                     output_dir=root / "simulation", **settings)
+    else:
+        runner.run_simulation(**files, output_dir=str(root / "out"), **settings)
+    return returned[0], built
+
+
+def _found(record, key):
+    """The value under `key` wherever it sits in a written record."""
+    if isinstance(record, dict):
+        if key in record:
+            return record[key]
+        for value in record.values():
+            hit = _found(value, key)
+            if hit is not None:
+                return hit
+    elif isinstance(record, list):
+        for value in record:
+            hit = _found(value, key)
+            if hit is not None:
+                return hit
+    return None
+
+
+
+def _methods_of_a_study(root):
+    """The methods section of a study whose manifests are the shape a real
+    run writes, built the way the report builds it."""
+    from fastmdxplora.report.context import load_phase_context
+    from fastmdxplora.report.document import _methods_section
+
+    setup, sim = TestTheMethodsSectionReadsTheRealManifests._manifests()
+    for phase, record in (("setup", setup), ("simulation", sim)):
+        (root / phase).mkdir(parents=True)
+        (root / phase / f"{phase}_parameters.json").write_text(json.dumps(record), encoding="utf-8")
+    return _methods_section(root, load_phase_context(root))
+
+
+def _reproducibility_of(root, *, prepared, seed=None, config=None, bilayer=None):
+    """The reproducibility section of a study that prepared its own system,
+    or of an analysis of a trajectory it was given; ``seed`` is what setup
+    recorded, ``bilayer`` its record of a packed bilayer, and ``config`` the
+    study's resolved config."""
+    from types import SimpleNamespace
+
+    import yaml
+
+    from fastmdxplora.report.context import load_phase_context
+    from fastmdxplora.report.document import _reproducibility_section
+
+    for phase in (("setup", "simulation", "analysis") if prepared else ("analysis",)):
+        (root / phase).mkdir(parents=True)
+    if seed is not None:
+        (root / "setup" / "setup_parameters.json").write_text(
+            json.dumps({"random_seed": seed,
+                        **({"bilayer": bilayer} if bilayer is not None else {})}),
+            encoding="utf-8")
+    if config is not None:
+        (root / "resolved_config.yml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    return _reproducibility_section(SimpleNamespace(system="181L", output_dir=root),
+                                    load_phase_context(root))
+
+
+def _rows(section: str) -> list[str]:
+    """The data rows of the section's first markdown table, header and rule
+    left out. The convergence section has a second, the checks the run was
+    held to, whose rows end in a verdict rather than a yes."""
+    rows: list[str] = []
+    for line in section.splitlines():
+        if line.strip().startswith("|"):
+            rows.append(line.strip())
+        elif rows:
+            break
+    return rows[2:]
+
+
+def _blocks(section: str) -> dict[str, str]:
+    """Each analysis's part of the results section, by the analysis it is."""
+    blocks: dict[str, str] = {}
+    name = None
+    for line in section.splitlines():
+        if line.startswith("### "):
+            name = line[4:].strip().split()[0].strip("`").lower()
+            blocks[name] = ""
+        elif name is not None:
+            blocks[name] += line + "\n"
+    return blocks
+
+
+def _a_reported_run(root, *, n_frames):
+    """A run's analyses, with the manifest the analysis phase writes beside
+    them -- the plan the results section reads to know what ran."""
+    run = TestTheReportSaysHowMuchTheRunSupports._a_run(root, n_frames=n_frames)
+    (run / "analysis" / "analysis_manifest.json").write_text(json.dumps({
+        "plan": ["rmsd", "rg"],
+        "results": {"rmsd": {"status": "ok"}, "rg": {"status": "ok"}}}), encoding="utf-8")
+    return run

@@ -1,0 +1,852 @@
+"""The resume path, run rather than read.
+
+The refusals around checkpoints were asserted by searching the source for
+the strings that raise them, which shows the code is written and not that
+it works. Two claims were resting on that and both are load-bearing:
+
+  - that a run continued from a checkpoint is the run it continued, rather
+    than something that merely starts from similar coordinates;
+  - that a checkpoint from a different system is refused rather than
+    quietly loaded, which would continue somebody's study from another
+    system's state with nothing downstream looking wrong.
+
+So these build a real ``System``, integrate it, write a real checkpoint
+and load it back. Twenty argon atoms on the CPU platform: small enough to
+run in a fraction of a second on any machine, real enough that OpenMM's
+own validation is what answers.
+
+Skipped where OpenMM is absent, because it is an optional backend and the
+rest of the suite runs without it.
+"""
+
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+from fastmdxplora.refusals import refusal_of
+
+try:  # pragma: no cover - the skip is the point
+    import openmm as mm
+    import openmm.app as app
+    from openmm import unit
+
+    HAVE_OPENMM = True
+except ImportError:  # pragma: no cover
+    HAVE_OPENMM = False
+
+
+def _a_small_system():
+    """Twenty argon atoms. Real dynamics, no force field files."""
+    system = mm.System()
+    topology = app.Topology()
+    chain = topology.addChain()
+    residue = topology.addResidue("AR", chain)
+    nonbonded = mm.NonbondedForce()
+    nonbonded.setNonbondedMethod(mm.NonbondedForce.NoCutoff)
+    argon = app.Element.getBySymbol("Ar")
+    for index in range(20):
+        system.addParticle(39.948 * unit.amu)
+        topology.addAtom(f"AR{index}", argon, residue)
+        nonbonded.addParticle(0.0, 0.34 * unit.nanometer,
+                              0.996 * unit.kilojoule_per_mole)
+    system.addForce(nonbonded)
+    positions = [mm.Vec3(0.4 * (i % 5), 0.4 * ((i // 5) % 2), 0.4 * (i // 10))
+                 for i in range(20)] * unit.nanometer
+    return system, topology, positions
+
+
+#: How far a resumed run may sit from a straight one, and the line every way
+#: of getting a resume wrong has to cross.
+#:
+#: Measured 2026-09-22 over _HORIZON_STEPS steps after the checkpoint, across
+#: random trajectories: a resume at the same thread count stays within
+#: 1.2e-9 nm. Every way of getting it wrong lands past 2e-2 -- a resume that
+#: restores positions and velocities but not the thermostat's random stream
+#: (2.4e-2), a resume at a different thread count (2.2e-2), and constant
+#: pressure (2.7e-2). One bound for all of them, four orders clear of the
+#: first and three short of the rest, so the tests below read as the contrast
+#: they are.
+_RESUME_DRIFT_NM = 1e-5
+
+#: Short enough that chaos cannot carry a last-digit difference to the bound,
+#: long enough that a lost random stream shows. Over a thousand steps a
+#: correct resume drifted 1.3e-7 on a typical trajectory and past 1e-5 on
+#: about one in 150 -- a Lyapunov lottery, not a defect -- which the pinned
+#: thread count and fixed seeds this replaces were holding still.
+_HORIZON_STEPS = 50
+
+
+def _a_simulation(system, topology, positions, *, threads=None):
+    """One simulation on the CPU platform, at `threads` threads if given.
+
+    Not pinned by default: a test that passes only at a particular thread
+    count measures the platform. Given where a test's claim depends on it.
+    OpenMM's CPU platform hands out the Langevin random numbers by thread,
+    so a checkpoint loaded at another thread count carries on with a
+    different noise sequence: the same trajectory continues only at the same
+    count, whichever count that is.
+    """
+    integrator = mm.LangevinMiddleIntegrator(
+        300 * unit.kelvin, 1 / unit.picosecond, 2 * unit.femtosecond)
+    properties = {"Threads": str(threads)} if threads else {}
+    simulation = app.Simulation(topology, system, integrator,
+                                mm.Platform.getPlatformByName("CPU"), properties)
+    simulation.context.setPositions(positions)
+    return simulation
+
+
+@unittest.skipUnless(HAVE_OPENMM, "OpenMM is not installed")
+class TestAResumedRunIsTheRunItContinued(unittest.TestCase):
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+
+    def test_resuming_reproduces_running_straight_through(self):
+        # The claim the whole segmentation design rests on. If a resumed
+        # run merely started from similar coordinates, ten segments would
+        # not be one trajectory and nothing in the output would say so.
+        system, topology, positions = _a_small_system()
+        simulation = _a_simulation(system, topology, positions)
+        simulation.minimizeEnergy(maxIterations=50)
+        simulation.context.setVelocitiesToTemperature(300 * unit.kelvin, 1234)
+        simulation.step(200)
+
+        checkpoint = self.root / "checkpoint.chk"
+        checkpoint.write_bytes(simulation.context.createCheckpoint())
+
+        simulation.step(200)
+        straight_through = simulation.context.getState(
+            getPositions=True).getPositions(asNumpy=True)
+
+        from fastmdxplora.simulation.runner import load_checkpoint
+
+        system2, topology2, _ = _a_small_system()
+        resumed = _a_simulation(system2, topology2, positions)
+        load_checkpoint({}, resumed, checkpoint)
+        resumed.step(200)
+        after_resume = resumed.context.getState(
+            getPositions=True).getPositions(asNumpy=True)
+
+        np.testing.assert_allclose(
+            straight_through.value_in_unit(unit.nanometer),
+            after_resume.value_in_unit(unit.nanometer),
+            atol=1e-6,
+            err_msg="a resumed run diverged from the run it continued")
+
+    def test_a_checkpoint_from_another_system_is_refused(self):
+        # The hazard this refusal exists for: loading it quietly would
+        # continue a study from another system's state, and nothing
+        # downstream would look wrong.
+        from fastmdxplora.refusals import UnstableRun
+        from fastmdxplora.simulation.runner import load_checkpoint
+
+        system, topology, positions = _a_small_system()
+        simulation = _a_simulation(system, topology, positions)
+        simulation.step(10)
+        checkpoint = self.root / "twenty.chk"
+        checkpoint.write_bytes(simulation.context.createCheckpoint())
+
+        smaller = mm.System()
+        topology2 = app.Topology()
+        chain = topology2.addChain()
+        residue = topology2.addResidue("AR", chain)
+        for index in range(5):
+            smaller.addParticle(39.948 * unit.amu)
+            topology2.addAtom(f"AR{index}",
+                              app.Element.getBySymbol("Ar"), residue)
+        other = _a_simulation(
+            smaller, topology2,
+            [mm.Vec3(0.4 * i, 0, 0) for i in range(5)] * unit.nanometer)
+
+        with self.assertRaises(UnstableRun) as caught:
+            load_checkpoint({}, other, checkpoint)
+        refusal = refusal_of(caught.exception)
+        self.assertEqual(refusal.code, "simulation.resume.checkpoint_rejected")
+        # OpenMM's own reason travels with it. "Could not be loaded" alone
+        # would send somebody looking at the disk; "wrong number of
+        # particles" sends them to the system they built.
+        self.assertIn("particles", refusal.message)
+
+    def test_a_missing_checkpoint_names_the_phase_not_the_path(self):
+        from fastmdxplora.refusals import MissingResultError
+        from fastmdxplora.simulation.runner import load_checkpoint
+
+        system, topology, positions = _a_small_system()
+        simulation = _a_simulation(system, topology, positions)
+        with self.assertRaises(MissingResultError) as caught:
+            load_checkpoint({}, simulation, self.root / "never-written.chk")
+        refusal = refusal_of(caught.exception)
+        self.assertEqual(refusal.code, "analysis.data.absent")
+        self.assertIn("previous segment", refusal.message)
+
+    def test_a_truncated_checkpoint_is_refused_rather_than_half_loaded(self):
+        # OpenMM will not catch this. Measured: a checkpoint truncated to
+        # half its length loads without complaint and gives the right
+        # positions; truncated to a tenth it loads without complaint and
+        # gives wrong ones. There is no length or checksum in the format,
+        # so the only way to know a checkpoint is whole is to have written
+        # down what whole meant.
+        from fastmdxplora.refusals import UnstableRun
+        from fastmdxplora.simulation.runner import (
+            load_checkpoint, seal_checkpoint)
+
+        system, topology, positions = _a_small_system()
+        simulation = _a_simulation(system, topology, positions)
+        simulation.step(10)
+        checkpoint = self.root / "truncated.chk"
+        whole = simulation.context.createCheckpoint()
+        checkpoint.write_bytes(whole)
+        seal_checkpoint(checkpoint)
+        checkpoint.write_bytes(whole[: len(whole) // 2])
+
+        system2, topology2, _ = _a_small_system()
+        other = _a_simulation(system2, topology2, positions)
+        with self.assertRaises(UnstableRun) as caught:
+            load_checkpoint({}, other, checkpoint)
+        refusal = refusal_of(caught.exception)
+        self.assertEqual(refusal.code,
+                         "simulation.resume.checkpoint_truncated")
+        self.assertEqual(refusal.details["expected"], len(whole))
+
+    def test_openmm_really_does_load_a_truncated_one(self):
+        # The premise the seal exists for, asserted rather than asserted
+        # about. If a future OpenMM starts refusing these, the seal is no
+        # longer load-bearing and this test is where that shows up.
+        system, topology, positions = _a_small_system()
+        simulation = _a_simulation(system, topology, positions)
+        simulation.step(10)
+        whole = simulation.context.createCheckpoint()
+
+        system2, topology2, _ = _a_small_system()
+        other = _a_simulation(system2, topology2, positions)
+        other.context.loadCheckpoint(whole[: len(whole) // 2])
+
+    def test_an_unsealed_checkpoint_is_refused_for_a_segment(self):
+        # A segment's predecessor was written by this software and is
+        # always sealed on a clean finish, so a missing seal means it was
+        # killed mid-write.
+        from fastmdxplora.refusals import MissingResultError
+        from fastmdxplora.simulation.runner import load_checkpoint
+
+        system, topology, positions = _a_small_system()
+        simulation = _a_simulation(system, topology, positions)
+        simulation.step(10)
+        checkpoint = self.root / "unsealed.chk"
+        checkpoint.write_bytes(simulation.context.createCheckpoint())
+
+        system2, topology2, _ = _a_small_system()
+        other = _a_simulation(system2, topology2, positions)
+        with self.assertRaises(MissingResultError) as caught:
+            load_checkpoint({}, other, checkpoint, require_seal=True)
+        self.assertEqual(refusal_of(caught.exception).code,
+                         "simulation.resume.unsealed")
+
+    def test_but_a_hand_made_checkpoint_is_not_refused_outside_a_segment(self):
+        # Refusing it would be refusing a legitimate use over a convention
+        # the person never agreed to.
+        from fastmdxplora.simulation.runner import load_checkpoint
+
+        system, topology, positions = _a_small_system()
+        simulation = _a_simulation(system, topology, positions)
+        simulation.step(10)
+        checkpoint = self.root / "by-hand.chk"
+        checkpoint.write_bytes(simulation.context.createCheckpoint())
+
+        system2, topology2, _ = _a_small_system()
+        other = _a_simulation(system2, topology2, positions)
+        load_checkpoint({}, other, checkpoint)
+
+    def test_a_sealed_checkpoint_verifies(self):
+        from fastmdxplora.simulation.runner import (
+            seal_checkpoint, verify_checkpoint)
+
+        system, topology, positions = _a_small_system()
+        simulation = _a_simulation(system, topology, positions)
+        simulation.step(10)
+        checkpoint = self.root / "sealed.chk"
+        checkpoint.write_bytes(simulation.context.createCheckpoint())
+        seal_checkpoint(checkpoint)
+        self.assertTrue(verify_checkpoint(checkpoint, require_seal=True))
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()
+
+
+def _a_periodic_system(n: int = 64, *, barostat: bool = False):
+    """Argon in a periodic box, optionally at constant pressure."""
+    system = mm.System()
+    length = 2.0
+    vectors = (mm.Vec3(length, 0, 0), mm.Vec3(0, length, 0),
+               mm.Vec3(0, 0, length))
+    system.setDefaultPeriodicBoxVectors(*[v * unit.nanometer for v in vectors])
+    topology = app.Topology()
+    topology.setUnitCellDimensions(
+        mm.Vec3(length, length, length) * unit.nanometer)
+    chain = topology.addChain()
+    residue = topology.addResidue("AR", chain)
+    nonbonded = mm.NonbondedForce()
+    nonbonded.setNonbondedMethod(mm.NonbondedForce.CutoffPeriodic)
+    nonbonded.setCutoffDistance(0.8 * unit.nanometer)
+    argon = app.Element.getBySymbol("Ar")
+    for index in range(n):
+        system.addParticle(39.948 * unit.amu)
+        topology.addAtom(f"AR{index}", argon, residue)
+        nonbonded.addParticle(0.0, 0.34 * unit.nanometer,
+                              0.996 * unit.kilojoule_per_mole)
+    system.addForce(nonbonded)
+    if barostat:
+        system.addForce(
+            mm.MonteCarloBarostat(1.0 * unit.bar, 300 * unit.kelvin, 5))
+    grid = int(round(n ** (1 / 3))) + 1
+    positions = [mm.Vec3(0.45 * (i % grid), 0.45 * ((i // grid) % grid),
+                         0.45 * (i // grid ** 2)) for i in range(n)]
+    return system, topology, positions * unit.nanometer
+
+
+@unittest.skipUnless(HAVE_OPENMM, "OpenMM is not installed")
+class TestWhatAJoinCostsUnderPressure(unittest.TestCase):
+    """Measured, because the answer differs between NVT and NPT."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+
+    def _continue_and_resume(self, *, barostat, threads=None, resumed_threads=None,
+                             restore="checkpoint"):
+        """Run on, checkpoint, then continue for _HORIZON_STEPS both straight
+        and from the checkpoint. `resumed_threads` runs the second segment at
+        another count; `restore="state"` rebuilds it from positions,
+        velocities and box alone, which is a resume that lost the random
+        stream."""
+        system, topology, positions = _a_periodic_system(barostat=barostat)
+        first = _a_simulation(system, topology, positions, threads=threads)
+        first.minimizeEnergy(maxIterations=50)
+        first.context.setVelocitiesToTemperature(300 * unit.kelvin, 99)
+        first.step(1000)
+
+        checkpoint = self.root / f"{'npt' if barostat else 'nvt'}.chk"
+        checkpoint.write_bytes(first.context.createCheckpoint())
+        state = first.context.getState(getPositions=True, getVelocities=True)
+        box_at_checkpoint = first.context.getState().getPeriodicBoxVectors(
+            asNumpy=True).value_in_unit(unit.nanometer)
+
+        first.step(_HORIZON_STEPS)
+        straight = first.context.getState(getPositions=True).getPositions(
+            asNumpy=True).value_in_unit(unit.nanometer)
+
+        system2, topology2, _ = _a_periodic_system(barostat=barostat)
+        second = _a_simulation(system2, topology2, positions,
+                               threads=resumed_threads or threads)
+        if restore == "checkpoint":
+            second.context.loadCheckpoint(checkpoint.read_bytes())
+        else:
+            second.context.setPeriodicBoxVectors(*state.getPeriodicBoxVectors())
+            second.context.setPositions(state.getPositions())
+            second.context.setVelocities(state.getVelocities())
+        box_after_load = second.context.getState().getPeriodicBoxVectors(
+            asNumpy=True).value_in_unit(unit.nanometer)
+        second.step(_HORIZON_STEPS)
+        resumed = second.context.getState(getPositions=True).getPositions(
+            asNumpy=True).value_in_unit(unit.nanometer)
+        return box_at_checkpoint, box_after_load, straight, resumed
+
+    def _state_at_checkpoint(self, *, barostat):
+        """The first run's state at the moment it was checkpointed."""
+        system, topology, positions = _a_periodic_system(barostat=barostat)
+        first = _a_simulation(system, topology, positions)
+        first.minimizeEnergy(maxIterations=50)
+        first.context.setVelocitiesToTemperature(300 * unit.kelvin, 99)
+        first.step(1000)
+        state = first.context.getState(getPositions=True, getVelocities=True)
+        return (
+            state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+            state.getVelocities(asNumpy=True).value_in_unit(
+                unit.nanometer / unit.picosecond),
+            bytes(first.context.createCheckpoint()),
+        )
+
+    def test_the_box_comes_back_exactly_under_pressure(self):
+        # The part that does work. Positions, velocities and box vectors
+        # are all in the checkpoint, so the state a second segment starts
+        # from is the state the first one ended at.
+        at_checkpoint, after_load, _, _ = self._continue_and_resume(
+            barostat=True)
+        np.testing.assert_allclose(at_checkpoint, after_load, atol=1e-9)
+
+    def test_the_state_a_resumed_run_starts_from_is_the_state_it_stopped_at(
+        self
+    ):
+        """The claim segmentation actually rests on, asked before any
+        dynamics can obscure it.
+
+        Positions and velocities both, because positions alone would pass
+        for a run that resumed from the right place at the wrong speed --
+        which is a different trajectory and a different temperature, and
+        nothing downstream would say so.
+
+        Tight, and it can afford to be: this compares a checkpoint with
+        what loading it produced, with no integration in between, so
+        there is nothing here for chaos to amplify. The test below runs a
+        thousand steps and cannot be this strict.
+        """
+        positions, velocities, checkpoint = self._state_at_checkpoint(
+            barostat=False)
+
+        system, topology, start = _a_periodic_system(barostat=False)
+        second = _a_simulation(system, topology, start)
+        second.context.loadCheckpoint(checkpoint)
+        state = second.context.getState(getPositions=True, getVelocities=True)
+
+        np.testing.assert_allclose(
+            state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+            positions, atol=1e-9)
+        np.testing.assert_allclose(
+            state.getVelocities(asNumpy=True).value_in_unit(
+                unit.nanometer / unit.picosecond),
+            velocities, atol=1e-9)
+
+    def test_constant_volume_continues_the_same_trajectory(self):
+        """Having started from the same state, the two runs stay together --
+        at any thread count, so long as both segments use the same one.
+
+        The state being exact is the test above. This is the thermostat's
+        random stream carrying on, which is what makes a resume the run it
+        continues rather than another run from the same place."""
+        for threads in (1, 4):
+            _, _, straight, resumed = self._continue_and_resume(
+                barostat=False, threads=threads)
+            np.testing.assert_allclose(straight, resumed, atol=_RESUME_DRIFT_NM,
+                                       err_msg=f"at {threads} thread(s) each")
+
+    def test_a_resume_that_loses_the_random_stream_is_caught(self):
+        # Why the comparison exists: positions and velocities restored
+        # exactly, as the state test checks, and the noise begun again. The
+        # same ensemble and a different trajectory -- past the bound.
+        _, _, straight, resumed = self._continue_and_resume(
+            barostat=False, restore="state")
+        self.assertFalse(np.allclose(straight, resumed, atol=_RESUME_DRIFT_NM))
+
+    def test_at_another_thread_count_it_continues_the_ensemble_not_the_trajectory(self):
+        # The condition on the claim above. If a future OpenMM draws the same
+        # noise at every thread count, this fails and the condition can go.
+        _, _, straight, resumed = self._continue_and_resume(
+            barostat=False, threads=2, resumed_threads=4)
+        self.assertFalse(
+            np.allclose(straight, resumed, atol=_RESUME_DRIFT_NM),
+            "a resume at another thread count now continues the trajectory")
+
+    def test_constant_pressure_does_not_and_that_is_why_it_is_qualified(self):
+        # The finding the qualification exists for. The barostat's adaptive
+        # volume-move size is not in the checkpoint and is not a Context
+        # parameter, so it restarts at its default and re-adapts after the
+        # join. The state is right and the ensemble is right; the
+        # trajectory is not the one an unsplit run would have produced.
+        #
+        # Against the same bound the constant-volume case is held to, so
+        # the two read as the contrast they are. It is not a close thing:
+        # 2.7e-2 nm or more over _HORIZON_STEPS, against 1.2e-9 for constant
+        # volume at a matched thread count -- three orders past the line. An
+        # earlier version compared against a number an unpinned thread count
+        # could produce on its own, which would have let this pass on
+        # rounding alone.
+        #
+        # If a future OpenMM starts carrying that state, this test fails
+        # and the qualification should come off rather than be kept out of
+        # habit.
+        _, _, straight, resumed = self._continue_and_resume(barostat=True)
+        self.assertFalse(
+            np.allclose(straight, resumed, atol=_RESUME_DRIFT_NM),
+            "constant pressure now resumes exactly; drop the qualification")
+
+    def test_the_qualification_is_attached_to_constant_pressure_studies(self):
+        from fastmdxplora.simulation.resume import segmentability
+
+        under_pressure = segmentability(
+            {"simulation": {"duration_ns": 10, "pressure_bar": 1.0}})
+        self.assertTrue(under_pressure.allowed)
+        self.assertIn("barostat", under_pressure.qualification)
+
+        # Constant volume is the ensemble, stated. A study naming none
+        # produces at constant pressure, so leaving the pressure out does
+        # not make it one.
+        constant_volume = segmentability(
+            {"simulation": {"duration_ns": 10, "ensemble": "nvt"}})
+        self.assertTrue(constant_volume.allowed)
+        self.assertEqual(constant_volume.qualification, "")
+
+    def test_it_is_a_qualification_rather_than_a_refusal(self):
+        # Refusing would refuse constant pressure, which is most work
+        # anybody does. Saying nothing would leave a volume artefact for
+        # somebody to find.
+        from fastmdxplora.simulation.resume import require_segmentable
+
+        require_segmentable(
+            {"simulation": {"duration_ns": 10, "pressure_bar": 1.0}},
+            segments=10)
+
+
+class TestACheckpointSaysWhatItIs(unittest.TestCase):
+    """A checkpoint carries positions, velocities and the integrator's
+    state, and nothing that says where in a run it was taken. Loading one
+    from production into a run that then minimises and equilibrates it
+    throws the velocities away and makes the continuation a new run from
+    a snapshot rather than the same trajectory; nothing refused, because
+    nothing knew. The sidecar is how the loader knows."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self.d = Path(tempfile.mkdtemp())
+        self.chk = self.d / "checkpoint.chk"
+        self.chk.write_bytes(b"not a real checkpoint")
+
+    def test_the_sidecar_records_the_stage_and_the_step(self):
+        from fastmdxplora.simulation.runner import (read_checkpoint_sidecar,
+                                                     write_checkpoint_sidecar)
+
+        write_checkpoint_sidecar(self.chk, stage="production", step=321000, ensemble="npt",
+                                 temperature_K=300.0, timestep_fs=2.0, study="/s")
+        side = read_checkpoint_sidecar(self.chk)
+        self.assertEqual(side["stage"], "production")
+        self.assertEqual(side["step"], 321000)
+        self.assertEqual(side["ensemble"], "npt")
+        self.assertEqual(side["timestep_fs"], 2.0)
+        self.assertTrue((self.d / "checkpoint.chk.json").is_file())
+
+    def test_a_production_checkpoint_continues_only_into_production(self):
+        from fastmdxplora.refusals import StudyError
+        from fastmdxplora.simulation.runner import check_continuation, write_checkpoint_sidecar
+
+        write_checkpoint_sidecar(self.chk, stage="production", step=1000, ensemble="npt",
+                                 temperature_K=300.0, timestep_fs=2.0)
+        self.assertIsNotNone(check_continuation(
+            self.chk, minimize=False, nvt_steps=0, npt_steps=0, timestep_fs=2.0))
+        for what, kw in (("minimise", dict(minimize=True, nvt_steps=0, npt_steps=0)),
+                         ("nvt", dict(minimize=False, nvt_steps=50000, npt_steps=0)),
+                         ("npt", dict(minimize=False, nvt_steps=0, npt_steps=50000))):
+            with self.subTest(what=what), self.assertRaises(StudyError) as caught:
+                check_continuation(self.chk, timestep_fs=2.0, **kw)
+            self.assertEqual(caught.exception.code, "simulation.resume.would_reequilibrate")
+            self.assertIn("velocities", str(caught.exception))
+            self.assertIn("nvt_steps: 0", str(caught.exception))
+
+    def test_a_different_timestep_is_refused(self):
+        from fastmdxplora.refusals import StudyError
+        from fastmdxplora.simulation.runner import check_continuation, write_checkpoint_sidecar
+
+        write_checkpoint_sidecar(self.chk, stage="production", step=1000, ensemble="npt",
+                                 temperature_K=300.0, timestep_fs=2.0)
+        with self.assertRaises(StudyError) as caught:
+            check_continuation(self.chk, minimize=False, nvt_steps=0, npt_steps=0, timestep_fs=4.0)
+        self.assertEqual(caught.exception.code, "simulation.resume.timestep_differs")
+
+    def test_a_checkpoint_with_no_sidecar_loads_with_a_warning(self):
+        # A hand-made checkpoint, or one from before the sidecar existed:
+        # nothing to check it against, and refusing would lock out every
+        # checkpoint made before this.
+        from fastmdxplora.simulation.runner import check_continuation
+
+        from fastmdxplora.simulation.runner import logger
+
+        with self.assertLogs(logger, level="WARNING") as logs:
+            self.assertIsNone(check_continuation(
+                self.chk, minimize=True, nvt_steps=1, npt_steps=1, timestep_fs=2.0))
+        self.assertTrue(any("no sidecar" in line for line in logs.output))
+
+    def test_the_fence_stands_before_the_load(self):
+        # A plan that would minimise and equilibrate a production
+        # checkpoint again is refused before the file is loaded at all.
+        import tempfile
+
+        import pytest
+
+        from fastmdxplora.simulation import runner
+        from fastmdxplora.simulation.runner import write_checkpoint_sidecar
+        from tests._the_phase import a_prepared_water_box
+
+        root = Path(tempfile.mkdtemp())
+        checkpoint = root / "before" / "checkpoint.chk"
+        checkpoint.parent.mkdir()
+        checkpoint.write_bytes(b"not read before the plan is checked")
+        write_checkpoint_sidecar(checkpoint, stage="production", step=1000, ensemble="nvt",
+                                 temperature_K=300.0, timestep_fs=2.0)
+        loaded = []
+        real = runner.load_checkpoint
+        runner.load_checkpoint = lambda *a, **k: loaded.append(a) or real(*a, **k)
+        try:
+            with pytest.raises(Exception) as raised:
+                runner.run_simulation(**a_prepared_water_box(root), output_dir=str(root / "out"),
+                                      resume_from=str(checkpoint), minimize=True, nvt_steps=10,
+                                      npt_steps=0, production_steps=10, platform="CPU")
+        finally:
+            runner.load_checkpoint = real
+        self.assertEqual(loaded, [], "the checkpoint was loaded before the plan was checked")
+        self.assertIn("continu", str(raised.value).lower())
+
+class TestContinuingAStudyThatStopped(unittest.TestCase):
+    """One new segment from a study that ran and stopped, with the
+    arithmetic done from the record. The Agent used to write resume_from
+    by hand, leaving minimisation and equilibration on, and ask the
+    person for the equilibration lengths; the parent's resolved config has
+    them, the checkpoint's sidecar has the step."""
+
+    def study(self, *, step=221000, duration=0.5, nvt=50000, npt=50000, sidecar=True):
+        import tempfile
+        from pathlib import Path
+
+        import yaml
+
+        from fastmdxplora.simulation.runner import write_checkpoint_sidecar
+
+        s = Path(tempfile.mkdtemp()) / "fastmdxplora_1UAO_study_1"
+        (s / "simulation").mkdir(parents=True)
+        (s / "resolved_config.yml").write_text(yaml.safe_dump({
+            "systems": [{"system": "1UAO", "id": "chignolin"}],
+            "simulation": {"duration_ns": duration, "nvt_steps": nvt, "npt_steps": npt,
+                           "timestep_fs": 2.0},
+            "agent": "assisted", "output": str(s)}), encoding="utf-8")
+        chk = s / "simulation" / "checkpoint.chk"
+        chk.write_bytes(b"x")
+        if sidecar:
+            write_checkpoint_sidecar(chk, stage="production", step=step, ensemble="npt",
+                                     temperature_K=300.0, timestep_fs=2.0, study=str(s))
+        return s
+
+    def test_the_arithmetic_is_done_from_the_record(self):
+        from fastmdxplora.simulation.resume import continuation_of
+
+        c = continuation_of(self.study(), total_ns=0.5)
+        self.assertTrue(c.possible)
+        # The checkpoint's step is a production step: 221,000 of them at
+        # 2 fs is 0.442 ns of production done.
+        self.assertAlmostEqual(c.production_done_ns, 0.442, places=6)
+        self.assertAlmostEqual(c.config["simulation"]["duration_ns"], 0.058, places=6)
+
+    def test_the_config_is_a_true_continuation(self):
+        from fastmdxplora.simulation.resume import continuation_of
+        from fastmdxplora.simulation.runner import check_continuation
+
+        s = self.study()
+        sim = continuation_of(s).config["simulation"]
+        self.assertFalse(sim["minimize"])
+        self.assertEqual((sim["nvt_steps"], sim["npt_steps"]), (0, 0))
+        # Resolved: on macOS /var is /private/var, and a config should
+        # carry the canonical path.
+        self.assertEqual(sim["setup_from"], str(s.resolve()))
+        self.assertTrue(sim["resume_from"].endswith("checkpoint.chk"))
+        self.assertEqual(sim["ensemble"], "npt")
+        # And the fence it would face agrees.
+        self.assertIsNotNone(check_continuation(
+            s / "simulation" / "checkpoint.chk", minimize=sim["minimize"],
+            nvt_steps=sim["nvt_steps"], npt_steps=sim["npt_steps"], timestep_fs=2.0))
+
+    def test_more_and_total_and_the_remainder(self):
+        from fastmdxplora.simulation.resume import continuation_of
+
+        s = self.study()
+        self.assertAlmostEqual(continuation_of(s, more_ns=1.0).config["simulation"]["duration_ns"], 1.0)
+        self.assertAlmostEqual(continuation_of(s).config["simulation"]["duration_ns"], 0.058, places=6)
+        self.assertIn("already written, which is at or past", continuation_of(s, total_ns=0.4).refusal)
+
+    def test_a_finished_study_is_told_a_command_that_exists(self):
+        # A study that ran its whole plan is told how to extend it past the
+        # plan. It named `fastmdx extend`, a command removed when continuing
+        # became a simulation setting; each command it names now parses.
+        import re
+        import shlex
+
+        from fastmdxplora.cli.main import _build_parser
+        from fastmdxplora.simulation.resume import continuation_of
+
+        s = self.study(step=100000 + 250000)
+        said = continuation_of(s).refusal or ""
+        commands = re.findall(r"`(fastmdx [^`]+)`", said)
+        self.assertTrue(commands, said)
+        parser = _build_parser()
+        for command in commands:
+            words = shlex.split(command.replace("<total>", "1.0").replace("<more>", "0.5"))[1:]
+            with self.subTest(command=command):
+                parser.parse_args(words)
+        # And the alternative it offers in place of the total.
+        self.assertIn("--simulate-extra-ns", said)
+        parser.parse_args(["explore", "--simulate-extra-ns", "0.5"])
+
+    def test_a_study_with_no_production_checkpoint_says_so(self):
+        from fastmdxplora.simulation.resume import continuation_of
+
+        s = self.study(sidecar=False)
+        self.assertIn("does not say it was written during production", continuation_of(s).refusal)
+
+    def test_the_new_study_records_its_parent(self):
+        from fastmdxplora.simulation.pipeline import _continuation_of
+
+        s = self.study()
+        cont = _continuation_of({"resume_from": str(s / "simulation" / "checkpoint.chk")})
+        self.assertEqual(cont["study"], str(s))
+        self.assertEqual(cont["from_step"], 221000)
+        self.assertTrue(cont["known_from_sidecar"])
+
+    def test_the_agent_is_handed_the_continuation(self):
+        from fastmdxplora.gui.agent_panel import _run_status
+
+        s = self.study()
+
+        class Runtime:
+            active_root = s
+
+            def snapshot(self):
+                return {"active_run": str(s), "status": "idle"}
+
+        status = _run_status(Runtime())
+        self.assertIn("continuing this study: production done 0.442 ns", status)
+        self.assertIn(f"resume_from: {s.resolve()}", status)
+        self.assertIn("duration_ns is the TOTAL", status)
+        self.assertIn("no minimisation or equilibration", status)
+        from fastmdxplora.agent.propose import prompt_for
+
+        self.assertIn("never write `resume_from` from scratch", prompt_for("x"))
+
+
+class TestProductionStepsAreProductionSteps(unittest.TestCase):
+    """The runner resets the step counter to zero before production, so
+    every statistic from the energy log measures production alone, and
+    the checkpoints are written after that reset. Subtracting the
+    equilibration from a checkpoint's step subtracted it twice: a 0.5 ns
+    production read as 0.3 ns, and "extend to 0.6 ns in all" asked for
+    0.3 ns more instead of 0.1 -- a run a fifth longer than the number
+    it was labelled with."""
+
+    def study(self, step, *, duration=0.5, nvt=50000, npt=50000):
+        import tempfile
+        from pathlib import Path
+
+        import yaml
+
+        from fastmdxplora.simulation.runner import write_checkpoint_sidecar
+
+        s = Path(tempfile.mkdtemp()) / "fastmdxplora_trpcage_study_x"
+        (s / "simulation").mkdir(parents=True)
+        (s / "resolved_config.yml").write_text(yaml.safe_dump({
+            "systems": [{"system": "1L2Y"}],
+            "simulation": {"duration_ns": duration, "nvt_steps": nvt,
+                           "npt_steps": npt, "timestep_fs": 2.0}}), encoding="utf-8")
+        chk = s / "simulation" / "checkpoint.chk"
+        chk.write_bytes(b"x")
+        write_checkpoint_sidecar(chk, stage="production", step=step, ensemble="npt",
+                                 temperature_K=300.0, timestep_fs=2.0, study=str(s))
+        return s
+
+    def test_a_finished_half_nanosecond_reads_as_half(self):
+        from fastmdxplora.simulation.resume import continuation_of
+
+        c = continuation_of(self.study(250_000))
+        self.assertAlmostEqual(c.production_done_ns, 0.5, places=6)
+
+    def test_extend_to_six_tenths_asks_for_one_tenth(self):
+        from fastmdxplora.simulation.resume import continuation_of
+
+        c = continuation_of(self.study(250_000), total_ns=0.6)
+        self.assertAlmostEqual(c.config["simulation"]["duration_ns"], 0.1, places=6)
+
+    def test_part_way_through_production(self):
+        from fastmdxplora.simulation.resume import continuation_of
+
+        c = continuation_of(self.study(120_000), total_ns=0.5)
+        self.assertAlmostEqual(c.production_done_ns, 0.24, places=6)
+        self.assertAlmostEqual(c.config["simulation"]["duration_ns"], 0.26, places=6)
+
+    def test_a_sidecar_with_a_whole_run_step_is_still_read_right(self):
+        # One written before this was understood: a step past the plan is
+        # recognised as a whole-run counter and converted.
+        from fastmdxplora.simulation.resume import continuation_of
+
+        c = continuation_of(self.study(350_000), total_ns=0.6)
+        self.assertAlmostEqual(c.production_done_ns, 0.5, places=6)
+        self.assertAlmostEqual(c.config["simulation"]["duration_ns"], 0.1, places=6)
+
+
+class TestTheAgentIsToldWhatTheBlockAnswers(unittest.TestCase):
+
+    def test_the_continuation_block_answers_only_a_continuation(self):
+        # Asked to simulate trp-cage, the Agent answered that the study
+        # could not be continued: the block in the run status spoke for a
+        # request that was not about it.
+        from fastmdxplora.agent.propose import prompt_for
+
+        prompt = prompt_for("simulate trpcage for 0.5ns")
+        self.assertIn("answers a request to continue, extend or resume THIS", prompt)
+        self.assertIn("A request for a new study, even of the same", prompt)
+
+    def test_a_system_named_in_words_is_written_as_its_identifier(self):
+        # "trpcage" became 1UAO, which is chignolin. The identifier is
+        # looked up, never recalled, and named back so a wrong one is
+        # visible.
+        from fastmdxplora.agent.propose import prompt_for
+
+        prompt = prompt_for("simulate trpcage")
+        self.assertIn("the PDB identifier find_structure\nfinds for it, never one "
+                      "recalled", prompt)
+        self.assertIn("ask the person which, naming the entries found", prompt)
+
+
+class TestAContinuationAnalysesWhatItWrote(unittest.TestCase):
+    """The parent's analysis block names the parent's own trajectory by
+    absolute path. Carried across, the continuation simulated its segment
+    into a new folder and then analysed the PARENT's file, reporting the
+    parent's numbers as the new study's."""
+
+    def study(self):
+        import tempfile
+        from pathlib import Path
+
+        import yaml
+
+        from fastmdxplora.simulation.runner import write_checkpoint_sidecar
+
+        s = Path(tempfile.mkdtemp()) / "fastmdxplora_trpcage_study_x"
+        (s / "simulation").mkdir(parents=True)
+        (s / "resolved_config.yml").write_text(yaml.safe_dump({
+            "systems": [{"id": "s1", "system": "1L2Y"}],
+            "simulation": {"duration_ns": 0.5, "nvt_steps": 50000,
+                           "npt_steps": 50000, "timestep_fs": 2.0},
+            "analysis": {"trajectory": str(s / "simulation" / "production.dcd"),
+                         "topology": str(s / "simulation" / "trajectory_topology.pdb"),
+                         "include": ["rmsd", "rg"], "scope": "solute"},
+            "output": str(s)}), encoding="utf-8")
+        chk = s / "simulation" / "checkpoint.chk"
+        chk.write_bytes(b"x")
+        write_checkpoint_sidecar(chk, stage="production", step=250_000, ensemble="npt",
+                                 temperature_K=300.0, timestep_fs=2.0, study=str(s))
+        return s
+
+    def test_the_parents_trajectory_is_not_carried_across(self):
+        from fastmdxplora.simulation.resume import continuation_of
+
+        analysis = continuation_of(self.study(), total_ns=0.6).config["analysis"]
+        self.assertNotIn("trajectory", analysis)
+        self.assertNotIn("topology", analysis)
+
+    def test_the_analysis_settings_survive(self):
+        # What to analyse and how is the person's choice and is kept; only
+        # the parent's file paths go.
+        from fastmdxplora.simulation.resume import continuation_of
+
+        analysis = continuation_of(self.study(), total_ns=0.6).config["analysis"]
+        self.assertEqual(analysis["include"], ["rmsd", "rg"])
+        self.assertEqual(analysis["scope"], "solute")
+
+    def test_the_agent_says_continuing_leaves_one_study(self):
+        # It used to say the person joins the segments themselves. The
+        # software does it, and the Agent told a user otherwise for three
+        # patches after it stopped being true.
+        from fastmdxplora.agent.propose import prompt_for
+
+        prompt = prompt_for("extend it")
+        self.assertIn("leaves one study, not two", prompt)
+        self.assertIn("The person joins nothing by hand", prompt)
+        self.assertIn("resume_from: ./fastmdxplora_1L2Y_study", prompt)

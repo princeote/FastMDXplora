@@ -23,7 +23,6 @@ import pytest
 
 from fastmdxplora.batch import (
     BatchExplorer,
-    RunSpec,
     SweepError,
     expand_runs,
     normalize_sweep,
@@ -42,7 +41,24 @@ from fastmdxplora.orchestrator import PhaseResult, RunResult
 def stub_pdb(tmp_path: Path) -> Path:
     p = tmp_path / "protein.pdb"
     p.write_text(
-        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        # A tripeptide, not a lone residue: one amino acid is simultaneously
+        # N- and C-terminal, and AMBER has no template for that. CHARMM36
+        # tolerated it, so this fixture survived until the default changed.
+        "ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N\n"
+        "ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      3  C   ALA A   1       2.009   1.420   0.000  1.00  0.00           C\n"
+        "ATOM      4  O   ALA A   1       1.251   2.390   0.000  1.00  0.00           O\n"
+        "ATOM      5  CB  ALA A   1       1.988  -0.773  -1.199  1.00  0.00           C\n"
+        "ATOM      6  N   GLY A   2       3.332   1.549   0.000  1.00  0.00           N\n"
+        "ATOM      7  CA  GLY A   2       3.972   2.849   0.000  1.00  0.00           C\n"
+        "ATOM      8  C   GLY A   2       5.486   2.705   0.000  1.00  0.00           C\n"
+        "ATOM      9  O   GLY A   2       6.008   1.593   0.000  1.00  0.00           O\n"
+        "ATOM     10  N   ALA A   3       6.171   3.845   0.000  1.00  0.00           N\n"
+        "ATOM     11  CA  ALA A   3       7.623   3.845   0.000  1.00  0.00           C\n"
+        "ATOM     12  C   ALA A   3       8.174   5.265   0.000  1.00  0.00           C\n"
+        "ATOM     13  O   ALA A   3       7.416   6.235   0.000  1.00  0.00           O\n"
+        "ATOM     14  CB  ALA A   3       8.153   3.072  -1.199  1.00  0.00           C\n"
+        "ATOM     15  OXT ALA A   3       9.400   5.400   0.000  1.00  0.00           O\n"
         "END\n"
     )
     return p
@@ -62,6 +78,8 @@ def _fake_worker_factory(*, fail_values: set[int], write_analysis: bool = False,
         exclude,
         verbose,
         device_override,
+        quiet: bool = True,
+        force: bool = False,
     ):
         out = Path(run_out)
         out.mkdir(parents=True, exist_ok=True)
@@ -104,13 +122,24 @@ def _fake_worker_factory(*, fail_values: set[int], write_analysis: bool = False,
 class _ImmediateProcessPoolExecutor:
     """Synchronous ProcessPoolExecutor stand-in for deterministic scheduler tests."""
 
-    def __init__(self, max_workers):
+    def __init__(self, max_workers, mp_context=None, initializer=None,
+                 initargs=()):
+        # A real ProcessPoolExecutor takes an initializer, and the study uses
+        # one to give each worker its share of the machine's cores. A double
+        # that refuses the argument reports the caller as broken. Recorded
+        # rather than run: this executor works in the test process, and
+        # setting thread-count environment variables there would leak into
+        # every test after it.
         self.max_workers = max_workers
+        self.initializer = initializer
+        self.initargs = initargs
 
-    def submit(self, fn, *args):
+    def submit(self, fn, *args, **kwargs):
+        # A real Executor.submit forwards keyword arguments; this stood in for
+        # one without them, so a caller that used any looked like a fault here.
         fut = Future()
         try:
-            fut.set_result(fn(*args))
+            fut.set_result(fn(*args, **kwargs))
         except Exception as exc:  # noqa: BLE001
             fut.set_exception(exc)
         return fut
@@ -374,12 +403,16 @@ sweep:
   setup.temperature_K: [300]
 """)
         BatchExplorer(config=str(cfg)).run()
-        # b has ph 6.5, a has default 7.0; both have temperature_K 300
+        # b overrides ph, a takes the default; both have temperature_K 300.
+        # The default is read rather than written out: what this test checks is
+        # that a per-system setting reaches one run and not the other, and
+        # spelling the value here made it fail when the default moved.
+        from fastmdxplora.setup.pipeline import DEFAULTS
         a = json.loads((tmp_path / "batch" / "runs" / "a__temperature-K-300"
                         / "setup" / "setup_parameters.json").read_text(encoding="utf-8"))
         b = json.loads((tmp_path / "batch" / "runs" / "b__temperature-K-300"
                         / "setup" / "setup_parameters.json").read_text(encoding="utf-8"))
-        assert a["parameters"]["ph"] == 7.0
+        assert a["parameters"]["ph"] == DEFAULTS["ph"]
         assert b["parameters"]["ph"] == 6.5
         assert a["parameters"]["temperature_K"] == 300
         assert b["parameters"]["temperature_K"] == 300
@@ -510,6 +543,43 @@ sweep:
         batch = BatchExplorer(config=str(cfg))
         assert batch._resolve_workers() <= 2
         assert batch._resolve_workers() >= 1
+
+    def test_a_card_freed_first_takes_the_next_run(self, tmp_path, stub_pdb, monkeypatch):
+        """Two cards, three runs, and the second run finishes before the first.
+
+        The third went to card 0 by its place in the queue, so two runs
+        shared card 0 while card 1 sat idle. It goes where the room is."""
+        from fastmdxplora.batch import explorer
+
+        given: list[str] = []
+
+        class FirstRunStillGoing:
+            def __init__(self, max_workers, mp_context=None, initializer=None, initargs=()):
+                self.held = []
+
+            def submit(self, fn, spec_dict, out, include, exclude, verbose, device, **kwargs):
+                given.append(device)
+                fut = Future()
+                result = RunResult(run_id=spec_dict["run_id"], system=spec_dict["system"],
+                                   status="ok", output_dir=Path(out),
+                                   sweep_values=spec_dict["sweep_values"], phases=[])
+                if len(given) == 1:
+                    self.held.append((fut, result))
+                else:
+                    fut.set_result(result)
+                if len(given) == 3:
+                    for held, done in self.held:
+                        held.set_result(done)
+                return fut
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                return None
+
+        monkeypatch.setattr(explorer, "ProcessPoolExecutor", FirstRunStillGoing)
+        cfg = self._cfg(tmp_path, stub_pdb,
+                        "execution:\n  mode: parallel\n  devices: [0, 1]\n", n_temps=3)
+        BatchExplorer(config=str(cfg)).run()
+        assert given == ["0", "1", "1"]
 
     def test_device_round_robin(self, tmp_path, stub_pdb):
         cfg = self._cfg(tmp_path, stub_pdb,
@@ -845,3 +915,341 @@ sweep:
         # phase() helper
         assert run.phase("setup").name == "setup"
         assert run.phase("report") is None
+
+
+class TestAParallelStudySaysWhatItIsDoing:
+    """Each worker's output goes to its own log, so three of them do not
+    interleave into one unreadable screen. That left the terminal showing the
+    last completion and then nothing at all.
+
+    A window of a real study runs for hours. A study that is working looked
+    exactly like one that had hung, and the only way to tell was to go looking
+    for files.
+    """
+
+    def test_a_duration_reads_at_a_glance(self) -> None:
+        from fastmdxplora.batch.explorer import _elapsed
+
+        assert _elapsed(9) == "0m09s"
+        assert _elapsed(65) == "1m05s"
+        assert _elapsed(3725) == "1h02m"
+
+    def test_the_line_says_running_finished_and_queued(self) -> None:
+        """Which together answer 'is anything happening, and how much is
+        left'."""
+        from fastmdxplora.batch.explorer import _progress_line
+
+        line = _progress_line(running=3, done=2, queued=2, total=7,
+                              seconds=745)
+        assert "3 running" in line
+        # "finished" became "done" when the sentence became a bar; the
+        # question the line answers did not change.
+        assert "2/7 done" in line
+        assert "2 queued" in line
+        assert "12m25s" in line
+
+    def test_a_run_is_named_when_it_starts_and_its_log_is_given(
+        self, tmp_path, capsys, monkeypatch
+    ) -> None:
+        """So a run still going has been named once, and can be followed while
+        it goes rather than read after it ends."""
+        from fastmdxplora.batch import explorer
+
+        monkeypatch.setattr(explorer, "HEARTBEAT_SECONDS", 0.05)
+        config = tmp_path / "campaign.yml"
+        config.write_text(
+            "output: out\ninclude: [setup]\n"
+            "execution: {mode: parallel, workers: 2}\n"
+            "systems:\n"
+            f"  - system: {tmp_path / 'no-such-a.pdb'}\n    id: one\n"
+            f"  - system: {tmp_path / 'no-such-b.pdb'}\n    id: two\n",
+            encoding="utf-8")
+        explorer.BatchExplorer(config=config,
+                              output_dir=str(tmp_path / "out")).run()
+
+        printed = capsys.readouterr().out
+        assert "started one" in printed and "started two" in printed
+        assert "run.log" in printed
+
+    def test_and_says_something_while_nothing_finishes(
+        self, tmp_path, capsys, monkeypatch
+    ) -> None:
+        """The heartbeat is the whole point: without it the terminal is silent
+        for as long as the longest run takes."""
+        from fastmdxplora.batch import explorer
+
+        # Zero means every wait times out at once, so the line appears even
+        # though these runs fail in under a second.
+        monkeypatch.setattr(explorer, "HEARTBEAT_SECONDS", 0.0)
+        config = tmp_path / "campaign.yml"
+        config.write_text(
+            "output: out\ninclude: [setup]\n"
+            "execution: {mode: parallel, workers: 1}\n"
+            "systems:\n"
+            f"  - system: {tmp_path / 'no-such-a.pdb'}\n    id: one\n"
+            f"  - system: {tmp_path / 'no-such-b.pdb'}\n    id: two\n",
+            encoding="utf-8")
+        explorer.BatchExplorer(config=config,
+                              output_dir=str(tmp_path / "out")).run()
+
+        assert "running," in capsys.readouterr().out
+
+
+class TestASingleRunIsNotSilenced:
+    """Each worker's output goes to its own log so three of them do not
+    interleave three PLUMED banners into one unreadable screen.
+
+    With one run there is nothing to interleave with, and redirecting it left
+    a config-driven study of a single system printing one line and then
+    nothing for as long as the run took.
+    """
+
+    @staticmethod
+    def _study(tmp_path, systems):
+        from fastmdxplora.batch.explorer import BatchExplorer
+
+        listed = "\n".join(f"  - system: {s}" for s in systems)
+        config = tmp_path / "study.yml"
+        config.write_text(f"output: out\ninclude: [setup]\nsystems:\n{listed}\n",
+                          encoding="utf-8")
+        return BatchExplorer(config=config, output_dir=str(tmp_path / "out"))
+
+    def test_one_system_speaks(self, tmp_path, monkeypatch) -> None:
+        from fastmdxplora.batch import explorer
+
+        seen: dict = {}
+        monkeypatch.setattr(
+            explorer, "_execute_run",
+            lambda *args, **kwargs: seen.update(quiet=kwargs.get("quiet"))
+            or _ok_result(args[0]))
+
+        self._study(tmp_path, [tmp_path / "a.pdb"]).run()
+        assert seen["quiet"] is False
+
+    def test_several_do_not(self, tmp_path, monkeypatch) -> None:
+        """Where their output would collide, it goes to their own logs."""
+        from fastmdxplora.batch import explorer
+
+        seen: list = []
+        monkeypatch.setattr(
+            explorer, "_execute_run",
+            lambda *args, **kwargs: seen.append(kwargs.get("quiet"))
+            or _ok_result(args[0]))
+
+        self._study(tmp_path, [tmp_path / "a.pdb", tmp_path / "b.pdb"]).run()
+        assert seen == [True, True]
+
+
+def _ok_result(spec_dict):
+    from fastmdxplora.orchestrator import RunResult
+
+    return RunResult(run_id=spec_dict["run_id"], system=spec_dict["system"],
+                     status="ok", sweep_values={}, phases=[])
+
+
+class TestSelectionsAreCheckedAgainstWhateverWillBeSimulated:
+    """The check was written inside the block that prepares the shared
+    system, so a study re-run with --force -- which finds one already there
+    and prepares nothing -- skipped it entirely and failed three windows in
+    parallel instead. The one case it covered was a freshly prepared system,
+    which is the case where the author has just watched the structure being
+    built."""
+
+    def test_it_runs_outside_the_preparation_block(self, tmp_path, monkeypatch) -> None:
+        # A study re-run finds its shared system already prepared, and the
+        # selections are still checked against it: one that matches nothing
+        # there is refused before a window runs. And freshly prepared too.
+        from fastmdxplora.batch import explorer
+        from fastmdxplora.refusals import StudyError
+
+        for already_prepared in (True, False):
+            where = tmp_path / str(already_prepared)
+            study = _an_umbrella_study(where, selection_a="resname XYZ and name CA")
+            shared = where / "out" / "shared_setup" / "setup"
+            if already_prepared:
+                _a_prepared_peptide(shared)
+            monkeypatch.setattr(explorer, "_execute_run",
+                                lambda *a, _s=shared, **k: _a_prepared_peptide(_s) or _ok())
+            with pytest.raises(StudyError) as raised:
+                study._maybe_prepare_once(["setup", "simulation"], None)
+            assert raised.value.code == "simulation.cv.selection_empty", already_prepared
+
+    def test_an_unresolvable_selection_is_not_a_verdict(self, tmp_path, monkeypatch) -> None:
+        """A selection this cannot resolve is not thereby wrong; refusing on
+        that basis would be worse than the wait it saves. A selection that
+        resolves to nothing is a verdict, and is refused."""
+        from fastmdxplora.batch import explorer
+        from fastmdxplora.refusals import StudyError
+
+        _a_prepared_peptide(tmp_path)
+        spec = {"umbrella": {"collective_variable": "distance",
+                             "selection_a": "name CA", "selection_b": "name CB"}}
+
+        def cannot_tell(*args, **kwargs):
+            raise RuntimeError("the resolver could not read this topology")
+
+        monkeypatch.setattr(explorer, "_resolve_umbrella_selections", cannot_tell)
+        assert explorer._check_selections_against(tmp_path, spec) is None
+
+        def matches_nothing(*args, **kwargs):
+            raise ValueError("selection_b 'name CB' matched no atoms")
+
+        monkeypatch.setattr(explorer, "_resolve_umbrella_selections", matches_nothing)
+        with pytest.raises(StudyError):
+            explorer._check_selections_against(tmp_path, spec)
+
+    def test_a_missing_topology_is_passed_over(self, tmp_path) -> None:
+        from fastmdxplora.batch.explorer import _check_selections_against
+
+        # Nothing raised: there is no system to check against yet.
+        _check_selections_against(tmp_path, {"umbrella": {
+            "collective_variable": "distance",
+            "selection_a": "resid 0 and name CA",
+            "selection_b": "resid 99 and name CA",
+        }})
+
+
+class TestEachMethodIsCheckedByItsOwnPlanner:
+    """The pre-flight check ran every block through `plan_from_config`, which
+    is metadynamics' planner and requires `sigma` -- the width of a hill. An
+    umbrella study has no hills and no sigma, so a valid umbrella config was
+    refused for lacking a setting the method does not have, after its shared
+    system had already been built.
+
+    The selection-resolving code is shared between the methods. The
+    validation around it is not."""
+
+    def _topology(self, tmp_path):
+
+        path = tmp_path / "topology.pdb"
+        lines, serial = [], 1
+        for index, name in enumerate(("ALA", "GLY", "ALA")):
+            for atom in ("N", "CA", "C", "O"):
+                lines.append(
+                    f"ATOM  {serial:>5} {atom:^4} {name:>3} A{index + 1:>4}    "
+                    f"{index * 1.5:>8.3f}{0.0:>8.3f}{0.0:>8.3f}  1.00  0.00")
+                serial += 1
+        path.write_text("\n".join(lines) + "\nEND\n", encoding="utf-8")
+        return path
+
+    def _umbrella(self, **overrides):
+        block = {
+            "collective_variable": "distance",
+            "selection_a": "resid 0 and name CA",
+            "selection_b": "resid 2 and name CA",
+            "from": 0.6, "to": 1.0, "n_windows": 5,
+            "force_constant": 2000.0,
+        }
+        block.update(overrides)
+        return {"umbrella": block}
+
+    def test_a_valid_umbrella_block_is_accepted(self, tmp_path) -> None:
+        """It has no `sigma` and does not need one."""
+        from fastmdxplora.batch.explorer import _check_selections_against
+
+        self._topology(tmp_path)
+        _check_selections_against(tmp_path, self._umbrella())
+
+    def test_an_empty_selection_is_still_caught(self, tmp_path) -> None:
+        """Which is what the check exists for: `resid 9` on a tripeptide cost
+        a full preparation and three failed windows to discover."""
+        from fastmdxplora.batch.explorer import _check_selections_against
+
+        self._topology(tmp_path)
+        with pytest.raises(ValueError) as caught:
+            _check_selections_against(
+                tmp_path, self._umbrella(selection_b="resid 9 and name CA"))
+        assert "matched no atoms" in str(caught.value)
+
+    def test_umbrella_windows_are_checked_too(self, tmp_path) -> None:
+        """Two checks catching different things: the coordinate through the
+        shared layer, the windows through umbrella's own planner."""
+        from fastmdxplora.batch.explorer import _check_selections_against
+
+        self._topology(tmp_path)
+        with pytest.raises(ValueError):
+            # One window is not an umbrella study.
+            _check_selections_against(tmp_path, self._umbrella(n_windows=1))
+
+    def test_a_metadynamics_block_still_needs_its_sigma(self, tmp_path) -> None:
+        """The requirement is real for the method that has hills."""
+        from fastmdxplora.batch.explorer import _check_selections_against
+
+        self._topology(tmp_path)
+        with pytest.raises(ValueError) as caught:
+            _check_selections_against(tmp_path, {"metadynamics": {
+                "collective_variable": "distance",
+                "selection_a": "resid 0 and name CA",
+                "selection_b": "resid 2 and name CA",
+            }})
+        assert "sigma" in str(caught.value)
+
+    def test_an_expanded_window_is_not_a_study(self, tmp_path) -> None:
+        """By the time the check runs, the block has been expanded: each
+        window carries the single `centre` it sits at, and `from`, `to` and
+        `n_windows` are gone. Asking the study's planner to validate a
+        window's spec reported `from` as missing from a config that had it --
+        a refusal for the absence of a key expansion had consumed on
+        purpose."""
+        from fastmdxplora.batch.explorer import _check_selections_against
+        from fastmdxplora.simulation.umbrella import expand_umbrella
+
+        self._topology(tmp_path)
+        study = self._umbrella()["umbrella"]
+        expanded = expand_umbrella({
+            "systems": [{"id": "t", "system": "x.pdb"}],
+            "simulation": {"umbrella": dict(study)},
+        })["systems"][0]["simulation"]["umbrella"]
+
+        assert "centre" in expanded and "from" not in expanded
+        _check_selections_against(tmp_path, {"umbrella": expanded})
+
+    def test_a_selection_is_checked_in_a_window_too(self, tmp_path) -> None:
+        """The coordinate applies to both shapes; only the window planning
+        does not."""
+        from fastmdxplora.batch.explorer import _check_selections_against
+        from fastmdxplora.simulation.umbrella import expand_umbrella
+
+        self._topology(tmp_path)
+        study = self._umbrella(selection_b="resid 9 and name CA")["umbrella"]
+        expanded = expand_umbrella({
+            "systems": [{"id": "t", "system": "x.pdb"}],
+            "simulation": {"umbrella": dict(study)},
+        })["systems"][0]["simulation"]["umbrella"]
+
+        with pytest.raises(ValueError) as caught:
+            _check_selections_against(tmp_path, {"umbrella": expanded})
+        assert "matched no atoms" in str(caught.value)
+
+
+def _a_prepared_peptide(setup: Path) -> None:
+    """What a prepared system leaves: its three files, the topology real."""
+    from tests.test_a_real_study_runs_end_to_end import TRI_ALANINE
+
+    setup.mkdir(parents=True, exist_ok=True)
+    (setup / "topology.pdb").write_text(TRI_ALANINE, encoding="utf-8")
+    for name in ("system.xml", "state.xml"):
+        (setup / name).write_text("<x/>", encoding="utf-8")
+    (setup / "setup_parameters.json").write_text(json.dumps(
+        {"input": {"system": "1UBQ"}, "parameters": {}}), encoding="utf-8")
+
+
+def _ok():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(status="ok", message="")
+
+
+def _an_umbrella_study(where: Path, *, selection_a: str):
+    from fastmdxplora.batch.explorer import BatchExplorer
+
+    where.mkdir(parents=True, exist_ok=True)
+    config = where / "umbrella.yml"
+    config.write_text(
+        "systems:\n  - system: 1UBQ\n"
+        "include: [setup, simulation]\n"
+        "simulation:\n  umbrella:\n    collective_variable: distance\n"
+        f"    selection_a: \"{selection_a}\"\n    selection_b: \"name CA\"\n"
+        "    from: 0.4\n    to: 1.2\n    n_windows: 3\n    force_constant: 500\n",
+        encoding="utf-8")
+    return BatchExplorer(config=config, output_dir=str(where / "out"))

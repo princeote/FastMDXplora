@@ -1,0 +1,256 @@
+/* FastMDXplora design tokens.
+ *
+ * The single source of truth for colour, type, and motion across both
+ * surfaces: the live GUI links this file, and the static report inlines
+ * it at generation time so a report stays a self-contained page. Change a
+ * value here and both follow.
+ */
+/* The interface's two typefaces, served with it (fonts/README.txt; SIL
+ * Open Font License 1.1): named first in the stacks below, they were
+ * installed on almost no machine, so the page read in whatever the system
+ * had. Latin and Greek; anything else falls through to the system's. */
+@font-face {
+    font-family: "Inter";
+    font-style: normal;
+    font-weight: 100 900;
+    font-display: swap;
+    src: url("/static/fonts/inter-latin-wght-normal.woff2?v=5.3.0") format("woff2");
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+                   U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+                   U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+    font-family: "Inter";
+    font-style: normal;
+    font-weight: 100 900;
+    font-display: swap;
+    src: url("/static/fonts/inter-greek-wght-normal.woff2?v=5.3.0") format("woff2");
+    unicode-range: U+0370-0377, U+037A-037F, U+0384-038A, U+038C, U+038E-03A1, U+03A3-03FF;
+}
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: normal;
+    font-weight: 100 800;
+    font-display: swap;
+    src: url("/static/fonts/jetbrains-mono-latin-wght-normal.woff2?v=5.3.0") format("woff2");
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+                   U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+                   U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: normal;
+    font-weight: 100 800;
+    font-display: swap;
+    src: url("/static/fonts/jetbrains-mono-greek-wght-normal.woff2?v=5.3.0") format("woff2");
+    unicode-range: U+0370-0377, U+037A-037F, U+0384-038A, U+038C, U+038E-03A1, U+03A3-03FF;
+}
+
+:root {
+    /* The Viewer's ground, as the scheme's (molecule-viewer.js). */
+    --viewer-ground: #000000;
+    color-scheme: dark;
+
+    /* Dark, the default: a black ground under raised cards, nothing tinted.
+       The cards sat on a grey 1.10:1 from them (light 1.05:1) and the page
+       read as one flat surface; on black they stand at 1.27:1 (light
+       1.12:1). */
+
+    /* Backgrounds */
+    --background-primary: #000000;
+    --background-secondary: #1b1f23;
+    --background-elevated: #22272c;
+    --background-soft: #2c3137;
+
+    /* Cards */
+    --panel-glass: #1b1f23;
+    --panel-hover: #252a2f;
+
+    /* Borders */
+    --border-primary: rgba(255, 255, 255, 0.12);
+    --border-strong: rgba(255, 255, 255, 0.24);
+    --border-subtle: rgba(255, 255, 255, 0.07);
+
+    /* Text: solid colours, not white at an opacity, as the same token sits
+       on cards, menus and chips. At least 4.5:1 on every ground of its
+       scheme (WCAG AA for text); tests/test_five_accents_on_a_black_ground.py
+       works the ratios out from this file. */
+    --text-primary: #e8e9e9;
+    --text-secondary: #c6c7c8;
+    --text-muted: #a4a5a7;
+
+    /* The accent: one of five, chosen in the settings popup (frame.js,
+       `data-accent` on the root element) or by the service hosting the GUI
+       (`fastmdx gui --accent`). Each scheme's value of each is below;
+       `--accent` fills (buttons, the focus ring, the tab chosen, sliders),
+       `--accent-text` is words in the accent, `--accent-soft` the tint
+       behind a row or chip chosen, `--on-accent` text on a fill. Cyan is
+       the default. Words are 5.0:1 or more on every ground of the scheme,
+       text on a fill 8.0:1 (dark) or 5.95:1 (light). The values of each
+       are under "The five accents" below. */
+    --accent: var(--accent-d);
+    --accent-text: var(--accent-d);
+    --accent-soft: var(--accent-soft-d);
+    /* Text on a filled accent. */
+    --on-accent: #000000;
+
+    /* Fixed hues: a chart's series, the Viewer's marks, the product's
+       mark. They are hues, not the accent, and stay whatever is chosen. */
+    --accent-white: #f5f5f7;
+    --accent-silver: #d8d8dd;
+    --hue-cyan: #00aed8;
+    --accent-blue: #6ea8ff;
+    --accent-violet: #a78bfa;
+    --accent-green: #67e8a3;
+    --accent-orange: #ffb86b;
+    --accent-red: #ff7272;
+
+    /* Status: never the accent. Live is cyan under every accent, so a
+       running study never reads as a stale one under Graphite. */
+    --status-live: var(--hue-cyan);
+    --status-waiting: var(--accent-orange);
+    --status-error: var(--accent-red);
+    --status-completed: var(--accent-green);
+    --status-stale: var(--text-muted);
+
+    /* Surfaces */
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3);
+    --shadow-modal: 0 24px 64px rgba(0, 0, 0, 0.5);
+
+    /* Layout */
+    --sidebar-width: 248px;
+    --topbar-height: 64px;
+
+    /* Typography */
+    --font-stack: "Inter", "IBM Plex Sans", "Segoe UI", system-ui,
+                  -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: "JetBrains Mono", "SFMono-Regular", "IBM Plex Mono",
+                 "Consolas", "Menlo", monospace;
+
+    /* Type: every size on the page is one of these. There were eighteen,
+       from 10px to 28px, and the smallest were the uppercase labels on the
+       controls, which is where reading was hardest. */
+    --text-2xs: 11px;
+    --text-xs: 12px;
+    --text-sm: 13px;
+    --text-md: 14.5px;
+    --text-lg: 16px;
+    --text-xl: 20px;
+    --text-2xl: 24px;
+    --text-3xl: 27px;
+
+    /* Controls: one corner, and one ring where the keyboard is. */
+    --radius-control: 6px;
+    --focus-ring: 2px solid var(--accent);
+
+    /* Motion */
+    --duration-fast: 120ms;
+    --duration-medium: 220ms;
+    --duration-slow: 460ms;
+    --ease: cubic-bezier(.2, .8, .2, 1);
+}
+
+/* Colour used inside composed box-shadows. */
+:root { --shadow-color: rgba(0, 0, 0, 0.35); }
+
+/* ---------------------------------------------------------------------------
+   Two schemes over one set of tokens, and the system's choice between them.
+
+   Every rule in the dashboard reads a token, so a scheme is an override of
+   the tokens and nothing else. Dark is the default the tokens above
+   describe; Light redefines the ground and the text and darkens the
+   status colours to read on white -- green done, amber qualified, red
+   refused mean the same in both, which is the rule a scheme must not
+   break. System, the default, follows the operating system as it changes;
+   Light or Dark chosen in the settings popup is remembered in
+   localStorage. Graphite and Ink, chosen before, are Dark; Paper is Light.
+
+   A scheme is set on the root element as well as the body. The status
+   tokens are declared on :root as var(--accent-green) and the rest, and a
+   custom property is resolved where it is declared: overriding
+   --accent-green on the body alone left --status-completed at the dark
+   scheme's green. The body keeps data-theme so a page can style for one.
+   --------------------------------------------------------------------------- */
+:root[data-theme="light"],
+body[data-theme="light"] {
+    --viewer-ground: #ffffff;
+    color-scheme: light;
+    /* A warm grey ground under white cards, each card drawn with a hairline
+       as white on that grey needs. */
+    --background-primary: #f4f2ee;
+    --background-secondary: #ffffff;
+    --background-elevated: #ffffff;
+    --background-soft: #edebe7;
+    --border-subtle: rgba(0, 0, 0, 0.08);
+    --border-primary: rgba(0, 0, 0, 0.14);
+    --border-strong: rgba(0, 0, 0, 0.22);
+    --text-primary: #191919;
+    --text-secondary: #404040;
+    --text-muted: #666666;
+    --accent-white: #141413;
+    --accent: var(--accent-l);
+    --accent-text: var(--accent-l);
+    --accent-soft: var(--accent-soft-l);
+    --hue-cyan: #056c87;
+    --shadow-color: rgba(0, 0, 0, 0.14);
+    --shadow-card: 0 0 0 1px rgba(140, 140, 140, 0.2), 0 1px 2px rgba(0, 0, 0, 0.06);
+    --shadow-modal: 0 20px 60px rgba(0, 0, 0, 0.16);
+    --panel-glass: #ffffff;
+    --panel-hover: #f3f2f0;
+    /* The same hues, dark enough to read on white: the pastels that read
+       on black measured 1.5:1 here. Each is at least 4.5:1 on the ground.
+       The status tokens are these, so green is still done and red still
+       refused; only the shade is the scheme's. */
+    --accent-silver: #3a3a38;
+    --accent-blue: #1f5fa8;
+    --accent-violet: #6541c8;
+    /* #1b7a45 was 4.50:1 on the soft ground, the edge. */
+    --accent-green: #17703f;
+    --accent-orange: #a65300;
+    --accent-red: #c0262d;
+    --on-accent: #ffffff;
+}
+
+/* ---------------------------------------------------------------------------
+   The five accents, set as `data-accent` on the root element (Cyan, the
+   default, is the first). Kept clear of the three status
+   hues: green done, amber qualified, red refused. Graphite has no hue: a
+   grey for words would be the muted text, so its words are the main text,
+   underlined where they are links, and its fill the main text colour.
+   --------------------------------------------------------------------------- */
+:root {
+    --accent-d: #00aed8; --accent-soft-d: #173640;
+    --accent-l: #056c87; --accent-soft-l: #e6f0f3;
+}
+:root[data-accent="blue"] {
+    --accent-d: #61a1fe; --accent-soft-d: #263446;
+    --accent-l: #1760c3; --accent-soft-l: #e8eff9;
+}
+:root[data-accent="violet"] {
+    --accent-d: #b68afd; --accent-soft-d: #343046;
+    --accent-l: #7b48bf; --accent-soft-l: #f2edf9;
+}
+:root[data-accent="magenta"] {
+    --accent-d: #f872b7; --accent-soft-d: #3e2c3b;
+    --accent-l: #b02e79; --accent-soft-l: #f7eaf2;
+}
+:root[data-accent="graphite"] {
+    --accent-d: #e8e9e9; --accent-soft-d: #303437;
+    --accent-l: #191919; --accent-soft-l: #efefef;
+}
+/* Graphite's links, in the main text's colour, are underlined: the links
+   in running text alone (a plain link, and the few named here). Links
+   drawn as buttons, tiles, menu items, a table's names or the sidebar's
+   places are not. */
+:root[data-accent="graphite"] :is(a:not([class]):not([role]):not([data-goto-analysis]),
+                                  a.ghost-link, a.builder-agent-link, a.files-mono,
+                                  a.overview-all-link, a.sidebar-fix) {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+/* Words marked by the accent's colour alone (a setting changed, a study in
+   the picker) would read as the main text under Graphite: bold there. */
+:root[data-accent="graphite"] :is(.builder-field.is-changed > .builder-head .builder-default,
+                                  .fastmdx-picker-row.is-study .name) {
+    font-weight: 600;
+}

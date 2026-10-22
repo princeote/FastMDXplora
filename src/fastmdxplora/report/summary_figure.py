@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 
 from fastmdxplora.analysis.plotting import apply_style
 from fastmdxplora.utils.logging import get_logger
+from fastmdxplora.analysis.plotting import closes_what_it_opens as _closes_what_it_opens
 
 logger = get_logger("report.summary_figure")
 
@@ -22,25 +23,36 @@ class SummaryPanel:
     source: Path
 
 
+# One panel per analysis, in the order a reader takes them, up to twelve.
+# The list used to name twelve specific files, two of which exist only in
+# per-residue SASA mode, so a study with twelve analyses got a ten-panel
+# summary. Each analysis contributes its first figure; a study with more
+# than twelve fills the grid with the first twelve here.
 EXPECTED_PANELS: tuple[tuple[str, str], ...] = (
     ("RMSD over frames", "analysis/rmsd/rmsd.png"),
     ("RMSF by residue", "analysis/rmsf/rmsf.png"),
     ("Radius of gyration", "analysis/rg/rg.png"),
     ("Hydrogen bonds", "analysis/hbonds/hbonds.png"),
+    ("Secondary structure", "analysis/ss/ss.png"),
     ("Total SASA", "analysis/sasa/sasa.png"),
+    ("Backbone dihedrals", "analysis/dihedrals/dihedrals.png"),
+    ("Native contacts (Q)", "analysis/qvalue/qvalue.png"),
+    ("Order parameters", "analysis/order_parameters/order_parameters.png"),
+    ("Thermodynamics", "analysis/thermodynamics/thermodynamics.png"),
+    ("End-to-end distance", "analysis/end_to_end/end_to_end.png"),
+    ("Moments of inertia", "analysis/moments_of_inertia/moments_of_inertia.png"),
+    ("Cluster timeline", "analysis/cluster/cluster_kmeans.png"),
+    ("PCA / dimensionality reduction", "analysis/dimred/dimred_pca.png"),
     ("SASA heatmap", "analysis/sasa/sasa_heatmap.png"),
     ("Average SASA by residue", "analysis/sasa/sasa_by_residue.png"),
-    ("Secondary structure", "analysis/ss/ss.png"),
-    ("PCA / dimensionality reduction", "analysis/dimred/dimred_pca.png"),
-    ("Cluster timeline", "analysis/cluster/cluster_kmeans.png"),
     ("Cluster populations", "analysis/cluster/cluster_kmeans_counts.png"),
-    (
-        "Hierarchical dendrogram",
-        "analysis/cluster/cluster_hierarchical_dendrogram.png",
-    ),
+    ("Hierarchical dendrogram", "analysis/cluster/cluster_hierarchical_dendrogram.png"),
 )
+MAX_PANELS = 12
 
 
+
+@_closes_what_it_opens()
 def build_analysis_summary_figure(
     *,
     project_root: Path,
@@ -59,6 +71,8 @@ def build_analysis_summary_figure(
     panels: list[SummaryPanel] = []
     skipped: list[dict[str, str]] = []
     for title, rel_source in EXPECTED_PANELS:
+        if len(panels) >= MAX_PANELS:
+            break
         source = project_root / rel_source
         if source.is_file():
             panels.append(SummaryPanel(title=title, source=source))
@@ -125,6 +139,12 @@ def build_analysis_summary_figure(
         ax.axis("off")
 
     fig.tight_layout(pad=0.6)
+    # Composed from the analyses' own panels and saved directly, so the
+    # ambient mark has to be applied by hand here -- see the note in
+    # `report/region_highlights.py`.
+    from fastmdxplora.analysis.plotting import stamp_current
+
+    stamp_current(fig)
     figure_path = output_dir / "analysis_summary.png"
     fig.savefig(
         figure_path,

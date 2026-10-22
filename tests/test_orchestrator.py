@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from fastmdxplora import FastMDXplora
-from fastmdxplora.orchestrator import PHASES
+from fastmdxplora.orchestrator import PHASES, PhaseResult
 
 # Orchestration tests verify the pipeline wiring, not MD physics. We mock the
 # MD engine (see _mock_md below) so the simulation phase produces a real, tiny
@@ -56,9 +56,50 @@ def _mock_md():
             duration_ns_actual=0.0,
         )
 
+    def _fake_setup(*, orchestrator, output_dir, **kwargs):
+        """Provide chemistry artifacts without requiring OpenMM in wiring tests."""
+        import shutil
+
+        source = Path(orchestrator.system)
+        if source.exists():
+            shutil.copy2(source, output_dir / "input.pdb")
+            shutil.copy2(source, output_dir / "prepared.pdb")
+            shutil.copy2(source, output_dir / "topology.pdb")
+        else:
+            pdb_text = (
+                "ATOM      1  N   ALA A   1       0.000   0.000   0.000  "
+                "1.00  0.00           N\n"
+            )
+            for name in ("input.pdb", "prepared.pdb", "topology.pdb"):
+                (output_dir / name).write_text(pdb_text, encoding="utf-8")
+        (output_dir / "system.xml").write_text("<System/>\n", encoding="utf-8")
+        (output_dir / "state.xml").write_text("<State/>\n", encoding="utf-8")
+        (output_dir / "setup_parameters.json").write_text(
+            json.dumps({
+                "phase": "setup",
+                "input": {
+                    "system": orchestrator.system,
+                    "form": "pdb_id" if len(str(orchestrator.system)) == 4 else "pdb_file",
+                },
+                "parameters": kwargs,
+                "artifacts_written": [
+                    "input.pdb", "prepared.pdb", "topology.pdb", "system.xml", "state.xml",
+                ],
+                "notes": [],
+            }),
+            encoding="utf-8",
+        )
+        return [
+            "input.pdb", "prepared.pdb", "topology.pdb", "system.xml", "state.xml",
+            "setup_parameters.json",
+        ]
+
     with patch(
         "fastmdxplora.simulation.runner.run_simulation",
         side_effect=_fake_run_simulation,
+    ), patch(
+        "fastmdxplora.setup.pipeline.run",
+        side_effect=_fake_setup,
     ):
         yield
 
@@ -67,7 +108,25 @@ def _mock_md():
 def _make_pdb_stub(tmp_path: Path) -> Path:
     """Create a minimal PDB file good enough for the setup phase classifier."""
     p = tmp_path / "stub.pdb"
-    p.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N\n")
+    p.write_text(# A tripeptide rather than a lone residue: one amino acid is
+        # simultaneously N- and C-terminal, which AMBER has no template for.
+        # These fixtures test pipeline mechanics, not force-field edge cases.
+                "ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N\n"
+                "ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      3  C   ALA A   1       2.009   1.420   0.000  1.00  0.00           C\n"
+        "ATOM      4  O   ALA A   1       1.251   2.390   0.000  1.00  0.00           O\n"
+        "ATOM      5  CB  ALA A   1       1.988  -0.773  -1.199  1.00  0.00           C\n"
+        "ATOM      6  N   GLY A   2       3.332   1.549   0.000  1.00  0.00           N\n"
+        "ATOM      7  CA  GLY A   2       3.972   2.849   0.000  1.00  0.00           C\n"
+        "ATOM      8  C   GLY A   2       5.486   2.705   0.000  1.00  0.00           C\n"
+        "ATOM      9  O   GLY A   2       6.008   1.593   0.000  1.00  0.00           O\n"
+        "ATOM     10  N   ALA A   3       6.171   3.845   0.000  1.00  0.00           N\n"
+        "ATOM     11  CA  ALA A   3       7.623   3.845   0.000  1.00  0.00           C\n"
+        "ATOM     12  C   ALA A   3       8.174   5.265   0.000  1.00  0.00           C\n"
+        "ATOM     13  O   ALA A   3       7.416   6.235   0.000  1.00  0.00           O\n"
+        "ATOM     14  CB  ALA A   3       8.153   3.072  -1.199  1.00  0.00           C\n"
+        "ATOM     15  OXT ALA A   3       9.400   5.400   0.000  1.00  0.00           O\n"
+        "END\n")
     return p
 
 
@@ -114,6 +173,50 @@ def test_explore_writes_manifest(tmp_path: Path) -> None:
     assert manifest["tool"] == "FastMDXplora"
     assert manifest["doi"] == "10.1002/jcc.70350"
     assert len(manifest["phases"]) == len(PHASES)
+
+
+def test_single_phase_manifest_preserves_existing_phases(tmp_path: Path) -> None:
+    """A direct phase command must not erase earlier phase provenance."""
+    pdb = _make_pdb_stub(tmp_path)
+    output = tmp_path / "run"
+    output.mkdir()
+    (output / "manifest.json").write_text(json.dumps({
+        "tool": "FastMDXplora",
+        "phases": [
+            {"name": "simulation", "status": "stale"},
+            {"name": "simulation", "status": "ok"},
+        ],
+    }))
+    fmdx = FastMDXplora(system=str(pdb), output_dir=output)
+    fmdx.results.append(PhaseResult(name="analysis", status="ok"))
+
+    fmdx._write_manifest()
+
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert [phase["name"] for phase in manifest["phases"]] == [
+        "simulation", "analysis"
+    ]
+    assert manifest["phases"][0]["status"] == "ok"
+
+
+def test_manifest_with_invalid_phase_and_option_shapes_is_recoverable(
+    tmp_path: Path,
+) -> None:
+    """A malformed prior manifest must not block recording a new phase."""
+    pdb = _make_pdb_stub(tmp_path)
+    output = tmp_path / "run"
+    output.mkdir()
+    (output / "manifest.json").write_text(json.dumps({
+        "phases": None,
+        "options": "not-a-mapping",
+    }))
+    fmdx = FastMDXplora(system=str(pdb), output_dir=output)
+    fmdx.results.append(PhaseResult(name="analysis", status="ok"))
+
+    fmdx._write_manifest()
+
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert [phase["name"] for phase in manifest["phases"]] == ["analysis"]
 
 
 def test_explore_include(tmp_path: Path) -> None:
@@ -185,26 +288,40 @@ def test_setup_classifies_pdb_id(tmp_path: Path) -> None:
 
 
 def test_analysis_module_taxonomy() -> None:
-    """The registry should be a tuple, populated as concrete analyses land.
+    """Every registered analysis is a usable one.
 
-    Sub-delivery 2 adds: rmsd, rmsf, rg, dihedrals
-    Sub-delivery 3 adds: hbonds, ss, cluster, sasa, dimred, qvalue
-    Until then this only verifies the registry surface exists and is
-    iterable; the concrete set is checked in test_analysis_layer.py.
+    This used to hold a list of the analyses expected to exist, written when
+    they were being delivered one sub-delivery at a time. A list like that
+    fails when a fifteenth analysis is added -- not because anything is wrong,
+    but because nobody updated the list -- and passes when an analysis is
+    registered under a name nothing can reach.
+
+    So it checks the property instead: whatever is registered can be got at,
+    says what it is, and appears in the registry the rest of the software
+    reads.
     """
     from fastmdxplora.analysis import AVAILABLE_ANALYSES
+    from fastmdxplora.analysis.orchestrator import (
+        available_analyses,
+        get_analysis_class,
+    )
 
     assert isinstance(AVAILABLE_ANALYSES, tuple)
-    # Names that are eventually expected — once the relevant sub-delivery
-    # registers them, this test will pass through the subset assertion.
-    expected_after_full_implementation = {
-        "rmsd", "rmsf", "rg", "hbonds", "ss",
-        "cluster", "sasa", "dimred", "qvalue", "dihedrals",
-        # Ligand-aware analyses (protein-ligand complexes)
-        "ligand_rmsd", "ligand_rmsf", "contacts", "pl_hbonds",
-    }
-    # Allow partial registration during incremental delivery
-    assert set(AVAILABLE_ANALYSES).issubset(expected_after_full_implementation)
+    assert AVAILABLE_ANALYSES, "nothing is registered at all"
+    assert set(AVAILABLE_ANALYSES) == set(available_analyses()), (
+        "the tuple and the registry disagree about what exists"
+    )
+
+    for name in AVAILABLE_ANALYSES:
+        cls = get_analysis_class(name)
+        assert cls is not None, f"{name} is registered but cannot be got"
+        # An analysis renamed for consistency keeps its old name registered,
+        # so a config somebody has kept still runs. Such a name answers to the
+        # class's current one.
+        assert cls.name in (name, getattr(cls, "name", name)), name
+        assert getattr(cls, "description", ""), (
+            f"{name} does not say what it is, so nothing can offer it usefully"
+        )
 
 
 def test_report_phase_writes_markdown_document(tmp_path: Path) -> None:
@@ -248,3 +365,439 @@ def test_bundle_does_not_recursively_include_itself(tmp_path: Path) -> None:
     with zipfile.ZipFile(bundle) as zf:
         names = zf.namelist()
     assert "report/project_bundle.zip" not in names
+
+
+def test_a_preserved_phase_keeps_the_version_that_produced_it(tmp_path: Path) -> None:
+    """The merge keeps old phases; it must not relabel them as ours.
+
+    Preserving the records was the fix in 742c125. But every other manifest
+    field is recomputed by whoever writes the file, so a run simulated under
+    2.5.4 on the cluster and analysed under 2.5.5 on a workstation came back
+    claiming 2.5.5 produced all of it. That is worse than the gap it
+    replaced: a missing record makes you go and look, a confident wrong one
+    does not.
+    """
+    from fastmdxplora import __version__
+
+    (tmp_path / "manifest.json").write_text(json.dumps({
+        "tool": "FastMDXplora", "version": "2.5.4",
+        "phases": [
+            {"name": "setup", "status": "ok",
+             "produced_by": {"version": "2.5.4", "host": "cluster-1"}},
+            {"name": "simulate", "status": "ok",
+             "produced_by": {"version": "2.5.4", "host": "cluster-1"}},
+        ],
+        "options": {"setup": {"padding_nm": 1.0}},
+    }, indent=2))
+
+    fmdx = FastMDXplora(system="x.pdb", output_dir=tmp_path)
+    fmdx.results.append(PhaseResult(
+        name="analysis", status="ok",
+        produced_by={"version": __version__, "host": "workstation-2"}))
+    fmdx._write_manifest()
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    by_name = {p["name"]: p for p in manifest["phases"]}
+
+    assert by_name["setup"]["produced_by"]["version"] == "2.5.4"
+    assert by_name["setup"]["produced_by"]["host"] == "cluster-1"
+    assert by_name["analysis"]["produced_by"]["version"] == __version__
+    assert manifest["versions_seen"] == ["2.5.4", __version__]
+    assert "more than one" in manifest["version_note"]
+
+
+def test_one_version_needs_no_note(tmp_path: Path) -> None:
+    """The note is for mixed manifests. A single-version run stays clean."""
+    fmdx = FastMDXplora(system="x.pdb", output_dir=tmp_path)
+    fmdx.results.append(PhaseResult(name="setup", status="ok"))
+    fmdx._write_manifest()
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+
+    assert "versions_seen" not in manifest
+    assert "version_note" not in manifest
+
+
+def test_a_phase_recorded_before_this_field_stays_unlabelled(tmp_path: Path) -> None:
+    """An old record has no provenance and must not be given ours."""
+    (tmp_path / "manifest.json").write_text(json.dumps({
+        "phases": [{"name": "setup", "status": "ok"}],
+    }, indent=2))
+
+    fmdx = FastMDXplora(system="x.pdb", output_dir=tmp_path)
+    fmdx.results.append(PhaseResult(name="analysis", status="ok"))
+    fmdx._write_manifest()
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    setup = next(p for p in manifest["phases"] if p["name"] == "setup")
+
+    assert "produced_by" not in setup
+
+
+def test_an_unreadable_manifest_does_not_stop_the_phase_recording(tmp_path: Path) -> None:
+    """The `except (OSError, JSONDecodeError)` branch, which had no test.
+
+    A truncated write leaves a file that is present and unparseable. The
+    phase that just ran must still be recorded.
+    """
+    (tmp_path / "manifest.json").write_text('{"phases": [{"name": "setup"')
+
+    fmdx = FastMDXplora(system="x.pdb", output_dir=tmp_path)
+    fmdx.results.append(PhaseResult(name="analysis", status="ok"))
+    fmdx._write_manifest()
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+
+    assert [p["name"] for p in manifest["phases"]] == ["analysis"]
+
+
+def test_a_manifest_that_is_not_an_object_is_ignored(tmp_path: Path) -> None:
+    """Valid JSON, wrong shape. `previous` must stay a dict."""
+    (tmp_path / "manifest.json").write_text('["not", "a", "manifest"]')
+
+    fmdx = FastMDXplora(system="x.pdb", output_dir=tmp_path)
+    fmdx.results.append(PhaseResult(name="analysis", status="ok"))
+    fmdx._write_manifest()
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+
+    assert [p["name"] for p in manifest["phases"]] == ["analysis"]
+
+
+# ---------------------------------------------------------------------------
+# Study-level provenance reaching the records it exists for
+# ---------------------------------------------------------------------------
+def test_a_study_level_agent_reaches_the_manifest(tmp_path: Path) -> None:
+    """`agent:` at the top of a config has to survive to `manifest.json`.
+
+    It did not. `phase_options` keeps the four phase blocks and nothing
+    else, so the value had no channel from the config to a run, and
+    `_write_manifest` asked `resolve_agent_modes` about a dict of phase
+    blocks. `study` came back None every time, and the writer is guarded on
+    there being something to say -- so a study that named how it was
+    written recorded nothing about how it was written.
+    """
+    pdb = _make_pdb_stub(tmp_path)
+    config = {
+        "systems": [{"id": "s1", "system": str(pdb)}],
+        "agent": "assisted",
+        "agent_model": "anthropic/claude-sonnet-4-5-20250929",
+        **FAST_SIM,
+    }
+    fmdx = FastMDXplora(config_data=config, output_dir=tmp_path / "run")
+    fmdx.explore()
+
+    manifest = json.loads((fmdx.output_dir / "manifest.json").read_text())
+    assert manifest["agent"]["study"] == "assisted"
+    assert manifest["agent"]["checked"] == {phase: True for phase in PHASES}
+    # And which model: the resolved config kept it and the manifest did not.
+    assert manifest["agent"]["model"] == config["agent_model"]
+
+
+def test_a_model_named_without_a_mode_is_recorded_too(tmp_path: Path) -> None:
+    pdb = _make_pdb_stub(tmp_path)
+    config = {"systems": [{"id": "s1", "system": str(pdb)}],
+              "agent_model": "someprovider/some-model-2026-09-01", **FAST_SIM}
+    fmdx = FastMDXplora(config_data=config, output_dir=tmp_path / "run")
+    fmdx.explore()
+
+    manifest = json.loads((fmdx.output_dir / "manifest.json").read_text())
+    assert manifest["agent"] == {"model": "someprovider/some-model-2026-09-01"}
+
+
+def test_a_phase_agreeing_with_the_study_is_not_a_departure(
+    tmp_path: Path,
+) -> None:
+    """The second half of the same bug, and the more misleading half.
+
+    With `study` forced to None, a phase that repeated the study's own
+    value differed from it, so the manifest reported a departure the config
+    does not contain -- in the record whose entire purpose is to say which
+    part of a study to distrust.
+    """
+    pdb = _make_pdb_stub(tmp_path)
+    config = {
+        "systems": [{"id": "s1", "system": str(pdb)}],
+        "agent": "assisted",
+        "setup": {"agent": "assisted"},
+        **FAST_SIM,
+    }
+    fmdx = FastMDXplora(config_data=config, output_dir=tmp_path / "run")
+    fmdx.explore()
+
+    manifest = json.loads((fmdx.output_dir / "manifest.json").read_text())
+    assert "departures" not in manifest["agent"]
+
+
+def test_a_real_departure_is_still_named(tmp_path: Path) -> None:
+    pdb = _make_pdb_stub(tmp_path)
+    config = {
+        "systems": [{"id": "s1", "system": str(pdb)}],
+        "agent": "assisted",
+        "analysis": {"agent": "unvalidated"},
+        **FAST_SIM,
+    }
+    fmdx = FastMDXplora(config_data=config, output_dir=tmp_path / "run")
+    fmdx.explore()
+
+    manifest = json.loads((fmdx.output_dir / "manifest.json").read_text())
+    assert manifest["agent"]["departures"] == {"analysis": "unvalidated"}
+    assert manifest["agent"]["checked"]["analysis"] is False
+    assert manifest["agent"]["checked"]["simulation"] is True
+
+
+def test_the_resolved_config_says_how_the_study_was_written(
+    tmp_path: Path,
+) -> None:
+    """Otherwise re-running an agent-written study produces a record
+    claiming a person wrote it."""
+    import yaml
+
+    pdb = _make_pdb_stub(tmp_path)
+    config = {
+        "systems": [{"id": "s1", "system": str(pdb)}],
+        "agent": "unvalidated",
+        "agent_model": "anthropic/claude-sonnet-4-5-20250929",
+        **FAST_SIM,
+    }
+    fmdx = FastMDXplora(config_data=config, output_dir=tmp_path / "run")
+    fmdx.explore()
+
+    resolved = yaml.safe_load(
+        (fmdx.output_dir / "resolved_config.yml").read_text())
+    assert resolved["agent"] == "unvalidated"
+    assert resolved["agent_model"] == "anthropic/claude-sonnet-4-5-20250929"
+
+    # And it is still a config the validator accepts.
+    from fastmdxplora.config import validate_config
+    validate_config(resolved, require_systems=True)
+
+
+def test_a_hand_written_study_records_no_agent_block(tmp_path: Path) -> None:
+    """Absent, not "none". Every study run before the field existed stays
+    truthful without being rewritten."""
+    pdb = _make_pdb_stub(tmp_path)
+    fmdx = FastMDXplora(system=str(pdb), output_dir=tmp_path / "run")
+    fmdx.explore(options=FAST_SIM)
+
+    manifest = json.loads((fmdx.output_dir / "manifest.json").read_text())
+    assert "agent" not in manifest
+
+
+def _ink(path: Path) -> int:
+    """Non-white pixels in a figure, as a proxy for what is drawn on it."""
+    import numpy as np
+    from PIL import Image
+
+    pixels = np.asarray(Image.open(path).convert("L"))
+    return int((pixels < 250).sum())
+
+
+def test_an_unvalidated_phase_stamps_the_figures_it_draws(
+    tmp_path: Path,
+) -> None:
+    """The claim `fastmdx agent --unvalidated` has been printing all along.
+
+    `marking.py` was complete and had no production callers, and
+    `save_figure`'s `mark` parameter had no caller passing it, so nothing
+    was stamped. The lower-left corner is where `stamp_figure` puts the
+    mark, so that is where the difference shows.
+    """
+    pdb = _make_pdb_stub(tmp_path)
+    shared = {
+        "systems": [{"id": "s1", "system": str(pdb)}],
+        "analysis": {"include": ["rmsd"]},
+        **FAST_SIM,
+    }
+
+    plain_dir = tmp_path / "plain"
+    FastMDXplora(config_data=dict(shared), output_dir=plain_dir).explore()
+
+    marked_dir = tmp_path / "marked"
+    FastMDXplora(
+        config_data={**shared, "agent": "unvalidated"},
+        output_dir=marked_dir,
+    ).explore()
+
+    plain = plain_dir / "analysis" / "rmsd" / "rmsd.png"
+    marked = marked_dir / "analysis" / "rmsd" / "rmsd.png"
+    assert plain.is_file() and marked.is_file()
+    assert _ink(marked) > _ink(plain), (
+        "an unvalidated phase's figure should carry the mark")
+
+
+def test_a_checked_study_leaves_its_figures_alone(tmp_path: Path) -> None:
+    """A mark that appears on everything stops being read, so `assisted`
+    -- which did go through the validator -- must not stamp."""
+    pdb = _make_pdb_stub(tmp_path)
+    shared = {
+        "systems": [{"id": "s1", "system": str(pdb)}],
+        "analysis": {"include": ["rmsd"]},
+        **FAST_SIM,
+    }
+
+    plain_dir = tmp_path / "plain"
+    FastMDXplora(config_data=dict(shared), output_dir=plain_dir).explore()
+
+    assisted_dir = tmp_path / "assisted"
+    FastMDXplora(
+        config_data={**shared, "agent": "assisted"},
+        output_dir=assisted_dir,
+    ).explore()
+
+    plain = plain_dir / "analysis" / "rmsd" / "rmsd.png"
+    assisted = assisted_dir / "analysis" / "rmsd" / "rmsd.png"
+    assert _ink(assisted) == _ink(plain)
+
+
+def test_only_the_unchecked_phase_is_marked(tmp_path: Path) -> None:
+    """The point of the per-phase setting: a trajectory from a validated
+    simulation is fine even when the analysis over it was not."""
+    from fastmdxplora.analysis.plotting import current_mark
+
+    pdb = _make_pdb_stub(tmp_path)
+    fmdx = FastMDXplora(
+        config_data={
+            "systems": [{"id": "s1", "system": str(pdb)}],
+            "agent": "assisted",
+            "analysis": {"agent": "unvalidated", "include": ["rmsd"]},
+            **FAST_SIM,
+        },
+        output_dir=tmp_path / "run",
+    )
+    fmdx.explore()
+
+    # Nothing is left set once the phases are done.
+    assert current_mark() == ""
+    manifest = json.loads((fmdx.output_dir / "manifest.json").read_text())
+    assert manifest["agent"]["checked"] == {
+        "setup": True, "simulation": True, "analysis": False, "report": True,
+    }
+
+
+def test_the_resolved_config_exists_before_the_first_phase_runs(tmp_path):
+    # It was written only after the phase loop, so a run in progress or one
+    # that was stopped had no resolved_config.yml: the one record of what
+    # a study was became available only once it was over, and the Agent,
+    # asked about a running study's settings, had nothing to read.
+    import inspect
+
+    from fastmdxplora import orchestrator
+
+    source = inspect.getsource(orchestrator.FastMDXplora)
+    loop = source.index("for phase in plan:")
+    first_write = source.index("self._write_resolved_config()")
+    assert first_write < loop, "the resolved config must be written before the loop"
+    # And still written at the end, so what actually ran is the final record.
+    assert source.count("self._write_resolved_config()") >= 2
+
+
+class TestAnOlderRunReanalysedKeepsItsVersion:
+    """A manifest written before phases recorded `produced_by`.
+
+    Re-analysing a 2.5.4 benchmark run under 2.5.7 left a manifest saying
+    2.5.7, `versions_seen` absent, and nothing anywhere saying the trajectory
+    came from 2.5.4: the phases carried no `produced_by`, and the top-level
+    version that did say it was overwritten.
+    """
+
+    def _older(self, tmp_path: Path, **extra) -> None:
+        (tmp_path / "manifest.json").write_text(json.dumps({
+            "tool": "FastMDXplora", "version": "2.5.4",
+            "phases": [{"name": "setup", "status": "ok"},
+                       {"name": "simulation", "status": "ok"},
+                       {"name": "analysis", "status": "ok"}],
+            "options": {}, **extra,
+        }, indent=2))
+
+    def _reanalyse(self, tmp_path: Path) -> dict:
+        from fastmdxplora import __version__
+
+        fmdx = FastMDXplora(system="x.pdb", output_dir=tmp_path)
+        fmdx.results.append(PhaseResult(
+            name="analysis", status="ok", produced_by={"version": __version__}))
+        fmdx._write_manifest()
+        return json.loads((tmp_path / "manifest.json").read_text())
+
+    def test_the_carried_phases_say_which_version_wrote_them(self, tmp_path) -> None:
+        from fastmdxplora import __version__
+
+        self._older(tmp_path)
+        manifest = self._reanalyse(tmp_path)
+        by_name = {p["name"]: p for p in manifest["phases"]}
+        for name in ("setup", "simulation"):
+            assert by_name[name]["produced_by"] == {"version": "2.5.4", "inferred": True}
+        assert by_name["analysis"]["produced_by"] == {"version": __version__}
+
+    def test_versions_seen_lists_both(self, tmp_path) -> None:
+        from fastmdxplora import __version__
+
+        self._older(tmp_path)
+        manifest = self._reanalyse(tmp_path)
+        assert manifest["versions_seen"] == ["2.5.4", __version__]
+        assert manifest["version"] == __version__
+
+    def test_a_version_seen_earlier_is_not_dropped(self, tmp_path) -> None:
+        """Seen once, kept, even after every phase it produced is re-run."""
+        from fastmdxplora import __version__
+
+        self._older(tmp_path, versions_seen=["2.5.3", "2.5.4"])
+        manifest = self._reanalyse(tmp_path)
+        assert manifest["versions_seen"] == ["2.5.3", "2.5.4", __version__]
+
+    def test_a_recorded_version_is_never_replaced_by_an_inferred_one(
+            self, tmp_path) -> None:
+        (tmp_path / "manifest.json").write_text(json.dumps({
+            "tool": "FastMDXplora", "version": "2.5.6",
+            "phases": [{"name": "setup", "status": "ok",
+                        "produced_by": {"version": "2.5.5", "host": "h"}}],
+            "options": {},
+        }))
+        manifest = self._reanalyse(tmp_path)
+        setup = next(p for p in manifest["phases"] if p["name"] == "setup")
+        assert setup["produced_by"] == {"version": "2.5.5", "host": "h"}
+
+
+class TestTheStudyLogIsTheStudysOnly:
+    """The file log was attached when the object was made and never taken
+    off, so what the process logged after a study ended went into that
+    study's folder, and moving the folder broke logging for the rest of the
+    process."""
+
+    def _study(self, tmp_path: Path) -> FastMDXplora:
+        pdb = _make_pdb_stub(tmp_path)
+        return FastMDXplora(config=None, system=str(pdb), output_dir=tmp_path / "run",
+                            options=FAST_SIM)
+
+    def test_it_is_detached_when_the_study_ends(self, tmp_path: Path) -> None:
+        from fastmdxplora.utils.logging import file_logger_path, get_logger
+
+        fmdx = self._study(tmp_path)
+        fmdx.explore(include=["setup"])
+        assert file_logger_path() is None
+        get_logger().warning("after the study: not its business")
+        log = (fmdx.output_dir / "fastmdxplora.log").read_text(encoding="utf-8")
+        assert "not its business" not in log
+
+    def test_a_second_call_logs_to_it_again(self, tmp_path: Path) -> None:
+        from fastmdxplora.utils.logging import file_logger_path
+
+        fmdx = self._study(tmp_path)
+        fmdx.explore(include=["setup"])
+        log = fmdx.output_dir / "fastmdxplora.log"
+        before = log.read_text(encoding="utf-8")
+        fmdx.explore(include=["simulation"], force=True)
+        assert file_logger_path() is None
+        added = log.read_text(encoding="utf-8")[len(before):]
+        assert "simulation" in added.lower()
+
+    def test_moved_after_it_ended_nothing_breaks(self, tmp_path: Path, capsys) -> None:
+        import shutil
+
+        from fastmdxplora.utils.logging import get_logger
+
+        fmdx = self._study(tmp_path)
+        fmdx.explore(include=["setup"])
+        shutil.move(str(fmdx.output_dir), str(tmp_path / "moved"))
+        get_logger().warning("the process carries on")
+        assert "Logging error" not in capsys.readouterr().err

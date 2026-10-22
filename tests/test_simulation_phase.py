@@ -49,7 +49,24 @@ def setup_outputs(tmp_path: Path):
     (setup_dir / "state.xml").write_text("<State />")
     # Minimal PDB so OpenMM's PDBFile parser (in mock) accepts it
     (setup_dir / "topology.pdb").write_text(
+        # A tripeptide rather than a lone residue: one amino acid is
+        # simultaneously N- and C-terminal, which AMBER has no template for.
+        # These fixtures test pipeline mechanics, not force-field edge cases.
         "ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N\n"
+        "ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      3  C   ALA A   1       2.009   1.420   0.000  1.00  0.00           C\n"
+        "ATOM      4  O   ALA A   1       1.251   2.390   0.000  1.00  0.00           O\n"
+        "ATOM      5  CB  ALA A   1       1.988  -0.773  -1.199  1.00  0.00           C\n"
+        "ATOM      6  N   GLY A   2       3.332   1.549   0.000  1.00  0.00           N\n"
+        "ATOM      7  CA  GLY A   2       3.972   2.849   0.000  1.00  0.00           C\n"
+        "ATOM      8  C   GLY A   2       5.486   2.705   0.000  1.00  0.00           C\n"
+        "ATOM      9  O   GLY A   2       6.008   1.593   0.000  1.00  0.00           O\n"
+        "ATOM     10  N   ALA A   3       6.171   3.845   0.000  1.00  0.00           N\n"
+        "ATOM     11  CA  ALA A   3       7.623   3.845   0.000  1.00  0.00           C\n"
+        "ATOM     12  C   ALA A   3       8.174   5.265   0.000  1.00  0.00           C\n"
+        "ATOM     13  O   ALA A   3       7.416   6.235   0.000  1.00  0.00           O\n"
+        "ATOM     14  CB  ALA A   3       8.153   3.072  -1.199  1.00  0.00           C\n"
+        "ATOM     15  OXT ALA A   3       9.400   5.400   0.000  1.00  0.00           O\n"
         "END\n"
     )
     return setup_dir.parent  # the project root
@@ -92,8 +109,8 @@ class TestPlanStages:
         # 10 ns @ 2 fs = 5,000,000 steps of production
         assert plan["production_steps"] == 5_000_000
         # Equilibration: fixed defaults regardless of production length
-        assert plan["nvt_steps"] == _runner.DEFAULT_NVT_STEPS    # 250k = 500 ps
-        assert plan["npt_steps"] == _runner.DEFAULT_NPT_STEPS    # 500k = 1 ns
+        assert plan["nvt_steps"] == 250_000    # 500 ps
+        assert plan["npt_steps"] == 500_000    # 1 ns
 
     def test_long_production_does_not_balloon_equilibration(self):
         """For a 1000 ns production, equilibration stays at the fixed defaults.
@@ -106,8 +123,8 @@ class TestPlanStages:
             nvt_steps=None, npt_steps=None, production_steps=None,
         )
         assert plan["production_steps"] == 500_000_000     # 1000 ns
-        assert plan["nvt_steps"] == _runner.DEFAULT_NVT_STEPS   # still 500 ps
-        assert plan["npt_steps"] == _runner.DEFAULT_NPT_STEPS   # still 1 ns
+        assert plan["nvt_steps"] == 250_000   # still 500 ps
+        assert plan["npt_steps"] == 500_000   # still 1 ns
 
     def test_ns_flavored_equilibration_kwargs(self):
         """nvt_duration_ns / npt_duration_ns let users specify equilibration in ns."""
@@ -131,16 +148,19 @@ class TestPlanStages:
         )
         assert plan["nvt_steps"] == 42
         # Other stages still come from their respective sources
-        assert plan["npt_steps"] == _runner.DEFAULT_NPT_STEPS
+        assert plan["npt_steps"] == 500_000
         assert plan["production_steps"] == 5_000_000
 
-    def test_zero_duration_falls_through_to_defaults(self):
+    def test_zero_duration_runs_no_production(self):
+        # `duration_ns` is the production length, so zero equilibrates and
+        # stops. It used to fall through to the 2 ns default while the cost
+        # estimate counted no production.
         plan = _runner.plan_stages(
             duration_ns=0.0, timestep_fs=2.0,
             nvt_steps=None, npt_steps=None, production_steps=None,
         )
         assert plan["nvt_steps"] == 250_000
-        assert plan["production_steps"] == 1_000_000
+        assert plan["production_steps"] == 0
 
 
 class TestTrajectoryInterval:
@@ -238,27 +258,30 @@ class TestPlatformSelection:
 # ===========================================================================
 class TestPipelineGracefulDegradation:
     def test_missing_setup_outputs_writes_manifest(self, tmp_path: Path):
-        """No setup/system.xml -> graceful skip with informative note."""
+        """No setup/system.xml -> fail with an informative note."""
         orch = MagicMock()
         orch.output_dir = tmp_path
         orch._presenter = None
         out = tmp_path / "simulation"
         out.mkdir()
 
-        artifacts = _pipeline.run(orchestrator=orch, output_dir=out)
+        with patch.object(_pipeline, "missing_dependencies", return_value=[]):
+            with pytest.raises(RuntimeError, match="setup outputs are missing"):
+                _pipeline.run(orchestrator=orch, output_dir=out)
 
-        assert "simulation_parameters.json" in artifacts
+        assert (out / "simulation_parameters.json").exists()
         manifest = json.loads((out / "simulation_parameters.json").read_text(encoding="utf-8"))
         joined_notes = " ".join(manifest["notes"])
         assert "Setup outputs not found" in joined_notes
 
     @pytest.mark.skipif(HAS_OPENMM, reason="run only when OpenMM is absent")
     def test_openmm_missing_skips_with_note(self, stub_orchestrator, tmp_path: Path):
-        """Without OpenMM, the phase skips and notes the missing dep."""
+        """Without OpenMM, the phase fails with installation guidance."""
         out = stub_orchestrator.output_dir / "simulation"
         out.mkdir()
-        artifacts = _pipeline.run(orchestrator=stub_orchestrator, output_dir=out)
-        assert "simulation_parameters.json" in artifacts
+        with pytest.raises(RuntimeError, match="conda install -c conda-forge"):
+            _pipeline.run(orchestrator=stub_orchestrator, output_dir=out)
+        assert (out / "simulation_parameters.json").exists()
         # Real DCD should NOT exist
         assert not (out / "production.dcd").exists()
         manifest = json.loads((out / "simulation_parameters.json").read_text(encoding="utf-8"))
@@ -290,7 +313,7 @@ class TestPipelineCallsRunner:
                   fake_result.final_state, fake_result.energy_csv, fake_result.log_file):
             p.write_text("stub")
 
-        with patch.object(_pipeline, "run_simulation", return_value=fake_result, create=True) as m:
+        with patch.object(_pipeline, "run_simulation", return_value=fake_result, create=True):
             # Force the import inside the try block to succeed
             import sys
             from types import ModuleType
@@ -475,10 +498,11 @@ class TestDefaults:
         assert d["npt_steps"] is None
 
     def test_runner_step_defaults(self):
-        # These are the default simulation-length values
-        assert _runner.DEFAULT_NVT_STEPS == 250_000
-        assert _runner.DEFAULT_NPT_STEPS == 500_000
-        assert _runner.DEFAULT_PRODUCTION_STEPS == 1_000_000
+        # The default stage lengths, as times (simulation/lengths.py)
+        from fastmdxplora.simulation import lengths
+
+        assert (lengths.DEFAULT_NVT_NS, lengths.DEFAULT_NPT_NS,
+                lengths.DEFAULT_PRODUCTION_NS) == (0.5, 1.0, 2.0)
         assert _runner.DEFAULT_TIMESTEP_FS == 2.0
         assert _runner.DEFAULT_TEMPERATURE_K == 300.0
 
@@ -486,14 +510,30 @@ class TestDefaults:
         assert _runner.DEFAULT_PRESSURE_BAR == 1.0
         assert _runner.DEFAULT_BAROSTAT_FREQUENCY == 25
 
-    def test_gentle_preset_expands_to_safe_smoke_settings(self):
-        params = _pipeline._resolve_params({"preset": "gentle", "platform": "CPU"})
-        assert params["timestep_fs"] == 0.5
-        assert params["temperature_K"] == 100.0
-        assert params["friction_per_ps"] == 5.0
-        assert params["npt_steps"] == 0
-        assert params["production_steps"] == 1000
-        assert params["platform"] == "CPU"
+    def test_there_is_no_preset(self) -> None:
+        """A `gentle` preset dropped the temperature to 100 K along with
+        shortening the run. That is not a smoke test, it is different physics:
+        water is ice at 100 K, and a run that survives there says nothing
+        about whether the system is stable at 300 K -- which is the question a
+        smoke test is asked.
+
+        Shortening a run at the conditions it will actually use is simpler and
+        more informative, and is what the documentation teaches.
+        """
+        from fastmdxplora.config.schema import PHASE_SCHEMAS
+
+        assert PHASE_SCHEMAS["simulation"].get("preset") is None
+
+    def test_nothing_still_reads_one(self) -> None:
+        import inspect
+
+        from fastmdxplora.simulation import pipeline
+        from fastmdxplora.utils import presenter
+
+        for module in (pipeline, presenter):
+            source = inspect.getsource(module)
+            assert "_SIM_PRESETS" not in source
+            assert 'options.get("preset")' not in source
 
 
 # ===========================================================================
@@ -641,3 +681,95 @@ def _build_fake_omm() -> dict:
         "Simulation": fake_simulation_cls,
         "PDBFile": fake_pdbfile_cls,
     }
+
+
+class TestSimulatingFromASystemPreparedElsewhere:
+    """A run ordinarily prepares its own system into ``setup/`` beside its
+    results. ``prepared_from`` points somewhere else instead: a run that
+    already prepared this molecule.
+
+    Useful on its own -- a reference system carried from a cluster, or one
+    prepared once by hand and reused -- and it is what lets a set of runs
+    share a preparation rather than each solvating separately.
+    """
+
+    @staticmethod
+    def _orchestrator(output_dir):
+        class _Stub:
+            pass
+
+        stub = _Stub()
+        stub.output_dir = Path(output_dir)
+        return stub
+
+    def test_the_setting_is_declared_where_settings_are_declared(self) -> None:
+        from fastmdxplora.config.schema import PHASE_SCHEMAS
+
+        field = PHASE_SCHEMAS["simulation"].get("prepared_from")
+        assert field is not None
+        assert field.default is None, "a run prepares its own unless told otherwise"
+
+    def test_so_the_command_line_has_it_without_being_told(self) -> None:
+        """The flags are generated from the schema, which is the point of
+        generating them."""
+        from fastmdxplora.cli.main import _PHASE_SPEC
+
+        table, _prefix = _PHASE_SPEC["simulate"]
+        assert "prepared_from" in {dest for _flag, dest, _kw in table}
+
+    def test_without_it_a_run_reads_its_own_setup(self, tmp_path) -> None:
+        where, named = _pipeline._where_the_system_was_prepared(
+            self._orchestrator(tmp_path), None)
+        assert where == tmp_path / "setup"
+        assert named is False
+
+    def test_with_it_the_run_reads_what_it_was_pointed_at(self, tmp_path) -> None:
+        elsewhere = tmp_path / "reference" / "setup"
+        where, named = _pipeline._where_the_system_was_prepared(
+            self._orchestrator(tmp_path), str(elsewhere))
+        assert where == elsewhere
+        assert named is True
+
+    def test_a_relative_path_is_relative_to_where_you_typed_it(self) -> None:
+        """Not to the output directory, which is somewhere the person running
+        the command has not necessarily looked."""
+        where, _named = _pipeline._where_the_system_was_prepared(
+            self._orchestrator("/somewhere/else"), "runs/reference/setup")
+        assert where == Path.cwd() / "runs/reference/setup"
+
+    def test_a_path_that_holds_no_system_is_refused_as_a_wrong_path(
+        self, tmp_path
+    ) -> None:
+        """Rather than as a setup phase that has not run yet. It was named
+        explicitly, so 'run setup first' would send somebody to fix something
+        that is not broken.
+
+        The likeliest mistake is naming the run directory instead of the
+        setup directory inside it, so the message says which is wanted.
+        """
+        empty = tmp_path / "not-a-setup-directory"
+        empty.mkdir()
+        with pytest.raises(RuntimeError) as raised:
+            _pipeline.run(orchestrator=self._orchestrator(tmp_path),
+                          output_dir=tmp_path / "simulation",
+                          prepared_from=str(empty))
+        assert "prepared_from" in str(raised.value)
+        assert "setup directory" in str(raised.value)
+
+    def test_a_missing_setup_still_says_to_run_setup(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The other message is still the right one when nothing was named.
+
+        With the backends declared present, because a missing one is reported
+        first and is the more useful thing to say -- so on a machine without
+        OpenMM this test would be reading that message instead, and passing or
+        failing on what happens to be installed rather than on the code. It
+        did: green on a laptop with OpenMM, red in CI without it.
+        """
+        monkeypatch.setattr(_pipeline, "missing_dependencies", lambda: [])
+        (tmp_path / "simulation").mkdir()
+        with pytest.raises(RuntimeError) as raised:
+            _pipeline.run(orchestrator=self._orchestrator(tmp_path),
+                          output_dir=tmp_path / "simulation")
+        assert "Run the setup phase first" in str(raised.value)

@@ -63,6 +63,9 @@ from fastmdxplora.analysis.orchestrator import (
 # Concrete analyses register themselves at import time. Each module
 # imported below adds its class to the registry. The order determines the
 # canonical execution order when ``include`` / ``exclude`` are not passed.
+from fastmdxplora.analysis import pmf as _pmf  # noqa: F401, E402
+from fastmdxplora.analysis import metad_surface as _metad_surface  # noqa: F401, E402
+from fastmdxplora.analysis import steered_work as _steered_work  # noqa: F401, E402
 from fastmdxplora.analysis import rmsd as _rmsd  # noqa: F401, E402
 from fastmdxplora.analysis import rmsf as _rmsf  # noqa: F401, E402
 from fastmdxplora.analysis import rg as _rg  # noqa: F401, E402
@@ -71,13 +74,49 @@ from fastmdxplora.analysis import ss as _ss  # noqa: F401, E402
 from fastmdxplora.analysis import sasa as _sasa  # noqa: F401, E402
 from fastmdxplora.analysis import dihedrals as _dihedrals  # noqa: F401, E402
 from fastmdxplora.analysis import qvalue as _qvalue  # noqa: F401, E402
+from fastmdxplora.analysis import (  # noqa: F401, E402
+    order_parameters as _order_parameters,
+)
+from fastmdxplora.analysis import (  # noqa: F401, E402
+    bfactor_comparison as _bfactor_comparison,
+)
+from fastmdxplora.analysis import (  # noqa: F401, E402
+    thermodynamics as _thermodynamics,
+)
+from fastmdxplora.analysis import rdf as _rdf  # noqa: F401, E402
+# Geometry measured straight off the coordinates. The first counts within a
+# shell and so carries the same box requirement as `rdf`; the other three
+# need only atoms and masses.
+from fastmdxplora.analysis import (  # noqa: F401, E402
+    coordination_number as _coordination_number,
+)
+from fastmdxplora.analysis import end_to_end as _end_to_end  # noqa: F401, E402
+from fastmdxplora.analysis import (  # noqa: F401, E402
+    moments_of_inertia as _moments_of_inertia,
+)
+from fastmdxplora.analysis import (  # noqa: F401, E402
+    pair_distance as _pair_distance,
+)
+# The bilayer's own structure: area per lipid, thickness, chain order. Run
+# only where there is a bilayer.
+from fastmdxplora.analysis import (  # noqa: F401, E402
+    area_per_lipid as _area_per_lipid,
+)
+from fastmdxplora.analysis import (  # noqa: F401, E402
+    bilayer_thickness as _bilayer_thickness,
+)
+from fastmdxplora.analysis import lipid_order as _lipid_order  # noqa: F401, E402
 from fastmdxplora.analysis import cluster as _cluster  # noqa: F401, E402
 from fastmdxplora.analysis import dimred as _dimred  # noqa: F401, E402
+# Needs an explicitly solvated system, so it is not ligand-gated -- a water
+# site around a protein is a finding whether or not anything is bound.
+from fastmdxplora.analysis import water_sites as _water_sites  # noqa: F401, E402
 # Ligand-aware analyses (run automatically only when a ligand is present).
 from fastmdxplora.analysis import ligand_rmsd as _ligand_rmsd  # noqa: F401, E402
 from fastmdxplora.analysis import ligand_rmsf as _ligand_rmsf  # noqa: F401, E402
 from fastmdxplora.analysis import contacts as _contacts  # noqa: F401, E402
 from fastmdxplora.analysis import pl_hbonds as _pl_hbonds  # noqa: F401, E402
+from fastmdxplora.analysis import pl_interactions as _pl_interactions  # noqa: F401, E402
 
 
 def __getattr__(name: str):
@@ -102,3 +141,5 @@ __all__ = [
     "register_analysis",
     "run",
 ]
+
+from fastmdxplora.analysis.joining import join_segments, survey_segments  # noqa: E402,F401

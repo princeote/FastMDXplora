@@ -1,13 +1,22 @@
 """Project bundle: zip the entire study into a shareable archive.
 
 Produces a single ``project_bundle.zip`` containing every artifact written
-during the run: setup, simulation, analysis, report, and the top-level
-manifest. The bundle is suitable for attaching to a publication's
-supplementary materials or sharing with a collaborator.
+during the run: setup, simulation, analysis and report, without the
+Viewer's and the live view's scratch (`fastmdxplora.study_files`). The bundle is
+suitable for attaching to a publication's supplementary materials or sharing
+with a collaborator.
+
+The top-level ``manifest.json`` and ``resolved_config.yml`` are added by the
+orchestrator once every phase has finished, because they do not exist while
+this runs. Until they were, the archive went out with thirteen megabytes of
+results and no record of what produced them -- and this docstring said
+otherwise.
 """
 
 from __future__ import annotations
 
+from fastmdxplora.replaced import PREVIOUS
+from fastmdxplora.study_files import is_scratch
 from fastmdxplora.utils.logging import get_logger
 import zipfile
 from pathlib import Path
@@ -20,8 +29,10 @@ logger = get_logger("report.bundle")
 
 
 # Paths inside the project root that should be excluded from the bundle
+# The study's carrying-on lock (simulation/resume.py) is held while the
+# report is made; on Windows a locked file cannot be read, even here.
 EXCLUDE_NAMES: frozenset[str] = frozenset(
-    {"project_bundle.zip", "fastmdxplora.log", ".DS_Store"}
+    {"project_bundle.zip", "fastmdxplora.log", ".DS_Store", ".fastmdxplora-carrying-on"}
 )
 EXCLUDE_DIR_NAMES: frozenset[str] = frozenset(
     {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".cache", ".ipynb_checkpoints"}
@@ -48,6 +59,18 @@ def _iter_project_files(root: Path, bundle_path: Path) -> list[Path]:
         if p.name in EXCLUDE_NAMES:
             continue
         if any(part in EXCLUDE_DIR_NAMES for part in p.relative_to(root).parts[:-1]):
+            continue
+        rel = p.relative_to(root)
+        # What a phase run again replaced (`fastmdxplora.replaced`): kept in
+        # the study's folder, not in the archive of what the report describes.
+        # Nor the windows a study of windows ran again, nor a data deposit,
+        # itself an archive of the study.
+        if rel.parts[0] in (PREVIOUS, "superseded", "deposit"):
+            continue
+        # The Viewer's and the live view's scratch, written again when
+        # needed: trypsin's bundle carried the 200 snapshots the live view
+        # keeps, 52 MB of PDB beside a 7.8 MB trajectory.
+        if is_scratch(rel.as_posix()):
             continue
         if p.name.endswith(EXCLUDE_SUFFIXES):
             continue

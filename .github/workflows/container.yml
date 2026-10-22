@@ -1,0 +1,224 @@
+name: Container
+
+# Built here because the machines that need this image cannot reach
+# conda-forge to build it themselves, and building it on a laptop means
+# building for the wrong architecture. A runner is x86-64 Linux with a
+# network, which is exactly what a cluster is and exactly what a laptop is
+# not.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Experiments only: build this version as a 14-day artifact. To ship a .sif to a release, leave this empty and use release_tag."
+        required: false
+        default: ""
+      cuda_version:
+        description: "CUDA to build against; must be one the target driver supports"
+        required: false
+        default: "12.6"
+      release_tag:
+        description: "The shipping box: attach the image to this existing tag's release (e.g. v2.5.2), building from the tag's own source. The first 2.5.2 delivery attempt went into `version` instead and parked 1.26 GB as an expiring artifact."
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: Build the Apptainer image
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # The default token in this repository is read-only, which publish.yml
+    # already knew -- its jobs request id-token for trusted publishing. This
+    # job attaches an asset to a release, and that is a contents write. The
+    # v2.5.2 build learned it the hard way: the image built, the conda gate
+    # passed, and delivery was refused with a 403 at the very last step.
+    permissions:
+      contents: write
+    # The Docker job builds the same version, once this one has shown the
+    # definition installs and passes its checks.
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A re-run of a tag's own workflow is frozen to the workflow as it
+          # stood at the tag -- fixes on main cannot rescue it. A dispatched
+          # run executes main's workflow but can build the tag's source, so
+          # a release whose original run failed at the last step is repaired
+          # from here without rewriting history. Empty means the usual ref.
+          ref: ${{ github.event.inputs.release_tag }}
+
+      - name: Decide which version goes in
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VER="${{ github.event.inputs.version }}"
+          elif [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            TAG="${{ github.event.inputs.release_tag }}"
+            VER="${TAG#v}"
+          else
+            VER="${GITHUB_REF_NAME#v}"
+          fi
+          echo "value=$VER" >> "$GITHUB_OUTPUT"
+          echo "building fastmdxplora $VER"
+
+      - name: Wait for the release to reach conda-forge
+        run: |
+          # The image installs from conda-forge, so it is the feedstock that
+          # has to have caught up -- not PyPI. That takes longer: the bot
+          # opens a version-bump pull request, its CI builds, somebody
+          # merges. An hour is normal and it can be a day if the recipe needs
+          # a change.
+          #
+          # Which is the argument for a short wait rather than a long one. A
+          # poll only pays where the feedstock is nearly ready anyway; where
+          # it is not, an hour of waiting buys the same failure as ten
+          # minutes and spends fifty minutes of runner time getting there.
+          # Nobody is watching this log for the answer either -- the bot
+          # mails you when the pull request opens.
+          VER="${{ steps.version.outputs.value }}"
+          API="https://api.anaconda.org/package/conda-forge/fastmdxplora"
+          ATTEMPTS=10
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            if curl -sf "$API" | grep -q "\"$VER\""; then
+              echo "fastmdxplora $VER is on conda-forge"
+              exit 0
+            fi
+            if [ "$attempt" -lt "$ATTEMPTS" ]; then
+              echo "not there yet (attempt $attempt of $ATTEMPTS); waiting a minute"
+              sleep 60
+            fi
+          done
+          # Said on the run's summary page as well as in the log. A red cross
+          # is where somebody arrives; the log is where this would otherwise
+          # sit, under the waiting.
+          {
+            echo "### Image not built"
+            echo
+            echo "\`fastmdxplora $VER\` had not reached conda-forge ten minutes after"
+            echo "this ran. That is normal rather than wrong: the feedstock bot opens"
+            echo "a version-bump pull request and somebody merges it, which usually"
+            echo "takes longer than that."
+            echo
+            echo "Nothing is broken and nothing needs changing. Re-run this workflow"
+            echo "by hand once the feedstock has it:"
+            echo "<https://github.com/conda-forge/fastmdxplora-feedstock/pulls>"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::fastmdxplora $VER is not on conda-forge yet -- re-run this workflow once the feedstock has merged"
+          exit 1
+
+      - name: Install Apptainer
+        # Pinned from Apptainer's own GitHub release rather than the
+        # Launchpad PPA. The first v2.5.2 rescue run died right here when
+        # Launchpad truncated a chunked response mid-read -- a third-party
+        # outage sitting inside the release pipeline -- and the PPA also
+        # installs whatever version it serves that day, an unpinned input
+        # to an artifact that exists to be reproducible. Release assets
+        # ride the same infrastructure as the runner itself. Bumping the
+        # pin is a deliberate chore, which is the point.
+        env:
+          APPTAINER_VERSION: "1.5.3"
+        run: |
+          curl -fsSLO "https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/apptainer_${APPTAINER_VERSION}_amd64.deb"
+          sudo apt-get update
+          sudo apt-get install -y "./apptainer_${APPTAINER_VERSION}_amd64.deb"
+          apptainer --version
+
+      - name: Build
+        env:
+          FASTMDX_VERSION: ${{ steps.version.outputs.value }}
+          CUDA_VERSION: ${{ github.event.inputs.cuda_version || '12.6' }}
+        run: |
+          sed -i "s/FASTMDX_VERSION:-2.5.0/FASTMDX_VERSION:-$FASTMDX_VERSION/" \
+            container/fastmdx.def
+          sed -i "s/CUDA_VERSION:-12.6/CUDA_VERSION:-$CUDA_VERSION/" \
+            container/fastmdx.def
+          echo "building against CUDA $CUDA_VERSION"
+          apptainer build --fakeroot \
+            fastmdx-${FASTMDX_VERSION}.sif container/fastmdx.def
+
+      - name: Say what is in it
+        env:
+          FASTMDX_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          apptainer test fastmdx-${FASTMDX_VERSION}.sif
+          ls -lh fastmdx-${FASTMDX_VERSION}.sif
+
+      - name: Attach it to the release
+        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.release_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
+          files: fastmdx-${{ steps.version.outputs.value }}.sif
+          fail_on_unmatched_files: true
+
+      - name: Or keep it as an artifact
+        # Artifact upload never needed a repository write, which is why
+        # dispatch builds "always worked without settings" while release
+        # delivery did not -- they are different permissions.
+        if: "!startsWith(github.ref, 'refs/tags/') && github.event.inputs.release_tag == ''"
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastmdx-${{ steps.version.outputs.value }}-sif
+          path: fastmdx-${{ steps.version.outputs.value }}.sif
+          retention-days: 14
+
+  docker:
+    name: Build the Docker image
+    # For services that run FastMDXplora in containers, a hosted GUI among
+    # them. Built from fastmdx.def by container/docker_from_def.py, so the
+    # installation and its checks are the Apptainer image's own, and after
+    # the Apptainer build, so a definition that fails there is not built twice.
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    env:
+      FASTMDX_VERSION: ${{ needs.build.outputs.version }}
+      CUDA_VERSION: ${{ github.event.inputs.cuda_version || '12.6' }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag }}
+
+      - name: Write the Docker build from fastmdx.def
+        run: python3 container/docker_from_def.py build/docker
+
+      - name: Build
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "building $IMAGE:$FASTMDX_VERSION against CUDA $CUDA_VERSION"
+          docker build \
+            --build-arg FASTMDX_VERSION --build-arg CUDA_VERSION \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$FASTMDX_VERSION" \
+            -t "$IMAGE:$FASTMDX_VERSION" build/docker
+
+      - name: Say what is in it
+        run: |
+          docker run --rm --entrypoint bash "$IMAGE:$FASTMDX_VERSION" /opt/fastmdx/test.sh
+          docker run --rm "$IMAGE:$FASTMDX_VERSION" --version
+          docker image ls "$IMAGE"
+
+      - name: Publish it
+        # Only a release is published, as for the Apptainer image; a build
+        # by hand of some version is checked and thrown away.
+        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.release_tag != ''
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE:$FASTMDX_VERSION"
+
+      - name: Mark it the latest
+        # A new tag only. Repairing an older release's image must not make
+        # it the one people get by default.
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          docker tag "$IMAGE:$FASTMDX_VERSION" "$IMAGE:latest"
+          docker push "$IMAGE:latest"

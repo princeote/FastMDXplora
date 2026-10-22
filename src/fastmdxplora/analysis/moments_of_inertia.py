@@ -1,0 +1,303 @@
+"""The three principal moments of inertia, per frame.
+
+The mass-weighted second-moment tensor of the selected atoms about their
+centre of mass, diagonalised. Three numbers per frame, smallest first,
+in amu nm^2::
+
+    I_ab = sum_i m_i ( |r_i|^2 delta_ab  -  r_ia r_ib ),   r_i = x_i - R_cm
+
+They describe shape in a way the radius of gyration cannot. Rg collapses a
+conformation to one number, so a rod and a disc of the same extent report
+the same value; the three principal moments separate them -- a rod has one
+small moment and two large equal ones, a disc two small and one large.
+
+**Shape descriptors, from the gyration tensor.** The same atoms' gyration
+tensor, mass-weighted as the inertia tensor is, has eigenvalues
+lambda_1 <= lambda_2 <= lambda_3 (nm^2), whose sum is Rg^2::
+
+    S_ab = sum_i m_i r_ia r_ib / sum_i m_i
+
+From them, per frame, the descriptors of Theodorou and Suter
+(Macromolecules 18, 1206, 1985)::
+
+    asphericity                  b       = lambda_3 - (lambda_1 + lambda_2) / 2
+    acylindricity                c       = lambda_2 - lambda_1
+    relative shape anisotropy    kappa^2 = (b^2 + (3/4) c^2) / Rg^4
+                                         = 1 - 3 (l1 l2 + l2 l3 + l3 l1) / (l1 + l2 + l3)^2
+
+kappa^2 runs from 0 for a sphere, or any arrangement as symmetric as a cube,
+to 1 for atoms on a line; a flat disc gives 1/4. Written per frame to
+``moments_of_inertia_shape.dat``, with each one's mean after equilibration
+recorded by the statistics every per-frame series uses.
+
+**Mass-weighted, and refused without masses.** An inertia tensor is defined
+by mass; computed with every atom weighted equally it is a different tensor
+that happens to have the same units in the numerator. `rg` falls back to
+equal weighting because an unweighted radius of gyration is a real, if
+less conventional, quantity. There is no corresponding quantity here, so a
+topology carrying no elements is a refusal rather than a silent
+substitution.
+
+**Rotation-invariant, so alignment does not enter.** The eigenvalues of the
+tensor do not change when the molecule is rotated, which means this
+analysis neither needs a superposition nor is disturbed by one that ran
+before it -- unlike every distance measured against a reference. What does
+disturb it is a molecule broken across a periodic boundary: the two halves
+sit a box apart, the tensor describes that separation rather than the
+molecule, and the moments come out enormous. That is tested directly: a
+bond of the selection stretched past half the cell's narrowest width can
+only be a bond broken across the boundary. Comparing the selection's extent
+against the box instead marked whole proteins as broken in the
+dodecahedron setup builds by default, whose box vectors are all a box
+length long while its narrowest width is 0.707 of that (1AKE, 8.54 nm
+across, in a cell 10.39 nm long and 7.35 nm wide). A selection without
+bonds is compared by its extent against the narrowest width, and the
+finding says that is all it was.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import matplotlib.pyplot as plt
+import mdtraj as md
+import numpy as np
+
+from fastmdxplora.analysis.base import Analysis, narrowest_width
+from fastmdxplora.analysis.orchestrator import register_analysis
+from fastmdxplora.refusals import StudyError
+
+
+def _masses(topology) -> np.ndarray:
+    """Atomic masses in amu, or a refusal naming what is missing."""
+    masses = []
+    missing: set[str] = set()
+    for atom in topology.atoms:
+        element = getattr(atom, "element", None)
+        mass = getattr(element, "mass", None)
+        if not mass:
+            missing.add(atom.name)
+            continue
+        masses.append(float(mass))
+    if missing:
+        named = ", ".join(sorted(missing)[:8])
+        raise StudyError(
+            f"This topology carries no element for {len(missing)} atom "
+            f"name(s) -- {named}"
+            f"{' and others' if len(missing) > 8 else ''} -- so their masses "
+            "are unknown. A moment of inertia is defined by mass; weighting "
+            "every atom equally instead would produce a tensor with the same "
+            "units and a different meaning. A topology read from a PDB "
+            "usually carries elements; one built by hand often does not.",
+            code="analysis.data.absent",
+        )
+    return np.asarray(masses, dtype=np.float64)
+
+
+#: The shape descriptors: findings key, column in the shape table, unit.
+SHAPE_DESCRIPTORS = (
+    ("asphericity", "asphericity_nm2", "nm\u00b2"),
+    ("acylindricity", "acylindricity_nm2", "nm\u00b2"),
+    ("relative_shape_anisotropy", "relative_shape_anisotropy", ""),
+)
+
+
+def shape_descriptors(gyration: np.ndarray) -> np.ndarray:
+    """Asphericity, acylindricity and relative shape anisotropy per frame.
+
+    ``gyration`` is the gyration tensor per frame, shape (frames, 3, 3), in
+    nm^2. Returns (frames, 3): b and c in nm^2, and kappa^2, by Theodorou
+    and Suter's definitions from the ascending eigenvalues l1 <= l2 <= l3::
+
+        b = l3 - (l1 + l2) / 2,   c = l2 - l1,   kappa^2 = (b^2 + 3 c^2 / 4) / (l1 + l2 + l3)^2
+    """
+    eigen = np.linalg.eigvalsh(gyration)
+    l1, l2, l3 = eigen[:, 0], eigen[:, 1], eigen[:, 2]
+    asphericity = l3 - 0.5 * (l1 + l2)
+    acylindricity = l2 - l1
+    squared = (l1 + l2 + l3) ** 2
+    with np.errstate(invalid="ignore", divide="ignore"):
+        anisotropy = np.where(
+            squared > 0.0, (asphericity ** 2 + 0.75 * acylindricity ** 2) / squared, np.nan)
+    return np.column_stack([asphericity, acylindricity, anisotropy])
+
+
+class MomentsOfInertia(Analysis):
+    """Principal moments of inertia per frame, smallest first.
+
+    Parameters
+    ----------
+    selection : str, optional
+        MDTraj atom selection. Defaults to ``"protein"`` -- the moments of a
+        solvated box are dominated by the water and describe the box.
+    **kwargs
+        Standard base-class options.
+
+    Output
+    ------
+    ``moments_of_inertia.dat`` -- three columns, I1 <= I2 <= I3 in
+    amu nm^2, one row per frame. ``moments_of_inertia_shape.dat`` -- a
+    comma-separated table with a header, one row per frame:
+    ``asphericity_nm2``, ``acylindricity_nm2`` and
+    ``relative_shape_anisotropy``, from the gyration tensor as the module
+    describes. Each one's mean after equilibration is recorded in the
+    findings under ``asphericity``, ``acylindricity`` and
+    ``relative_shape_anisotropy``.
+    """
+
+    name = "moments_of_inertia"
+    description = "Principal moments of inertia"
+    time_series = True
+    #: Three numbers per frame, so there is no single scalar whose weighted
+    #: mean is the thing somebody wants; the base class leaves the
+    #: reweighted average out rather than picking one of the three.
+    reweightable = None
+    default_selection = "protein"
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+
+    def _note_if_the_molecule_may_be_broken(
+        self, traj: md.Trajectory, xyz: np.ndarray
+    ) -> None:
+        """Say when a bond of the selection is broken across the boundary."""
+        widths = narrowest_width(traj)
+        if widths is None:
+            return
+        narrowest = float(np.min(widths))
+        bonds = np.array([[a.index, b.index] for a, b in traj.topology.bonds],
+                         dtype=np.int64).reshape(-1, 2)
+        if len(bonds):
+            lengths = np.linalg.norm(xyz[:, bonds[:, 0]] - xyz[:, bonds[:, 1]], axis=2)
+            stretched = lengths > 0.5 * widths[:, None]
+            if not stretched.any():
+                return
+            frame, which = np.unravel_index(int(np.argmax(lengths)), lengths.shape)
+            first, second = (traj.topology.atom(int(i)) for i in bonds[which])
+            self.findings["not_a_measurement"] = (
+                f"In {int(stretched.any(axis=1).sum())} of {traj.n_frames} "
+                f"frames a bond of the selection is longer than half the "
+                f"cell's narrowest width ({0.5 * narrowest:.3f} nm): "
+                f"{first.residue}:{first.name} to {second.residue}:{second.name} "
+                f"spans {float(lengths[frame, which]):.3f} nm in frame "
+                f"{int(frame)}. A bond that long is a molecule wrapped across "
+                "a periodic boundary, and its inertia tensor describes the "
+                "separation of the two pieces rather than the molecule. "
+                "Image the trajectory so the solute is whole before reading "
+                "these moments."
+            )
+            return
+        extent = float(np.max(xyz.max(axis=1) - xyz.min(axis=1)))
+        if extent > 0.8 * narrowest:
+            self.findings["not_a_measurement"] = (
+                f"The selection spans {extent:.3f} nm in its widest frame, "
+                f"against a narrowest cell width of {narrowest:.3f} nm, and "
+                "its topology has no bonds to check whether it is whole. A "
+                "molecule wrapped across a periodic boundary looks like this, "
+                "and its inertia tensor describes the separation of the two "
+                "pieces rather than the molecule. Image the trajectory so the "
+                "solute is whole before reading these moments."
+            )
+
+    def _record_what_the_mean_is_worth(self, traj: md.Trajectory) -> None:
+        """Each shape descriptor's mean after equilibration, by the
+        statistics every per-frame series uses; and where the molecule is
+        broken across the box, that said in the mean's record, which is
+        where the report, the GUI and the Agent read it."""
+        super()._record_what_the_mean_is_worth(traj)
+        from fastmdxplora.analysis.base import _frame_interval_ns
+        from fastmdxplora.statistics import mean_record
+
+        shape = getattr(self, "_shape", None)
+        reason = self.findings.get("not_a_measurement")
+        if shape is not None and len(shape) == traj.n_frames:
+            for column, (key, _name, unit) in enumerate(SHAPE_DESCRIPTORS):
+                record = mean_record(shape[:, column],
+                                     frame_interval_ns=_frame_interval_ns(traj))
+                record["unit"] = unit
+                self.findings[key] = record
+                if reason:
+                    self._withhold_the_error(traj, reason, record=record,
+                                             because="molecule broken across the box")
+        if reason:
+            self._withhold_the_error(traj, reason,
+                                     because="molecule broken across the box")
+
+    def save_data(self, result: Any, path: Path) -> Path:
+        """The moments as before, and the shape descriptors beside them."""
+        written = super().save_data(result, path)
+        shape = getattr(self, "_shape", None)
+        if shape is not None:
+            import pandas as pd
+
+            pd.DataFrame(shape, columns=[name for _key, name, _unit in SHAPE_DESCRIPTORS]
+                         ).to_csv(path.parent / f"{self.name}_shape.dat", index=False)
+        return written
+
+    def compute(self, traj: md.Trajectory) -> np.ndarray:
+        atom_idx = self.select_atoms(traj)
+        sub = traj.atom_slice(atom_idx) if len(atom_idx) < traj.n_atoms else traj
+
+        if sub.n_atoms < 3:
+            raise StudyError(
+                f"Selection {self.selection!r} matched {sub.n_atoms} atom(s). "
+                "Three principal moments need at least three atoms; with "
+                "fewer the tensor is singular and two of the three are zero "
+                "by construction rather than by shape.",
+                code="analysis.selection.arity",
+            )
+
+        masses = _masses(sub.topology)
+        xyz = sub.xyz.astype(np.float64)
+        self._note_if_the_molecule_may_be_broken(sub, xyz)
+
+        total = masses.sum()
+        centre = (xyz * masses[None, :, None]).sum(axis=1) / total
+        r = xyz - centre[:, None, :]
+
+        # I_ab = sum_i m_i ( |r_i|^2 delta_ab - r_ia r_ib ), per frame.
+        squared = (r ** 2).sum(axis=2)                       # (frames, atoms)
+        trace = (masses[None, :] * squared).sum(axis=1)      # (frames,)
+        outer = np.einsum("fia,fib,i->fab", r, r, masses)    # (frames, 3, 3)
+        tensor = np.eye(3)[None, :, :] * trace[:, None, None] - outer
+
+        # eigvalsh returns ascending eigenvalues for a symmetric matrix,
+        # which is the ordering I1 <= I2 <= I3 is quoted in.
+        moments = np.linalg.eigvalsh(tensor)
+        self._shape = shape_descriptors(outer / total)
+
+        self.findings["inertia"] = {
+            "atoms": int(sub.n_atoms),
+            "total_mass_amu": float(total),
+            "units": "amu nm^2",
+            "ordering": "ascending: I1 <= I2 <= I3",
+        }
+        return moments
+
+    def plot(self, result: np.ndarray, ax: plt.Axes) -> None:
+        x = (
+            self.frame_axis(self._traj_for_plot)[0]
+            if self._traj_for_plot is not None
+            else np.arange(result.shape[0])
+        )
+        for i, label in enumerate(("$I_1$", "$I_2$", "$I_3$")):
+            ax.plot(x, result[:, i], linewidth=1.3, label=label)
+        ax.legend(loc="best")
+
+    _traj_for_plot: md.Trajectory | None = None
+
+    def run(self, traj: md.Trajectory):
+        self._traj_for_plot = traj
+        return super().run(traj)
+
+    def default_xlabel(self) -> str | None:
+        if self._traj_for_plot is None:
+            return "Frame"
+        return self.frame_axis(self._traj_for_plot)[1]
+
+    def default_ylabel(self) -> str | None:
+        return "Moment of inertia (amu nm2)"
+
+
+register_analysis(MomentsOfInertia.name, MomentsOfInertia)

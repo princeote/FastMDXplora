@@ -44,6 +44,8 @@ except ImportError:
 
 __author__ = "Adekunle Aina, Derrick Kwan"
 __license__ = "MIT"
+#: The copyright as the licence gives it, for every page that shows one.
+__copyright__ = "2026, Adekunle Aina, Derrick Kwan, and FastMDXplora contributors"
 __expansion__ = "Fully Automated SysTem for Molecular Dynamics eXploration"
 __citation__ = (
     "Aina, A.; Kwan, D. FastMDAnalysis: Software for Automated Analysis of "
@@ -52,23 +54,52 @@ __citation__ = (
 )
 __doi__ = "10.1002/jcc.70350"
 
+#: The same reference as a BibTeX entry. Beside the prose one so the two
+#: cannot describe different papers: there were two copies of this, in the
+#: report and in the GUI, and a third was very nearly added before a test
+#: pointed out that the page was storing what it should have been given.
+__bibtex__ = """@article{aina2026fastmd,
+  author  = {Aina, Adekunle and Kwan, Derrick},
+  title   = {FastMDAnalysis: Software for Automated Analysis of Molecular
+             Dynamics Trajectories},
+  journal = {Journal of Computational Chemistry},
+  volume  = {47},
+  number  = {8},
+  pages   = {e70350},
+  year    = {2026},
+  doi     = {10.1002/jcc.70350},
+}"""
+
 # Canonical Python version range for the full conda install (setup +
-# simulation stages). MAX_PYTHON is the *exclusive* upper bound — 3.12.x
+# simulation stages). MAX_PYTHON is the *exclusive* upper bound, so 3.13.x
 # is the highest supported, matching `pyproject.toml`'s
-# ``requires-python = ">=3.9, <3.13"``. Update all three (this file,
-# pyproject, and the embedded env yaml in install.py) together when
+# ``requires-python = ">=3.10, <3.14"``. Update all three (this file,
+# pyproject, and environment.yml) together when
 # the OpenMM / PDBFixer compatibility window moves.
-MIN_PYTHON: tuple[int, int] = (3, 9)
-MAX_PYTHON: tuple[int, int] = (3, 13)
+MIN_PYTHON: tuple[int, int] = (3, 10)
+MAX_PYTHON: tuple[int, int] = (3, 14)
 
 
 def python_range_string() -> str:
-    """Human-readable supported Python range, e.g. ``"Python 3.9-3.12"``."""
+    """Human-readable supported Python range, e.g. ``"Python 3.10-3.13"``."""
     return (
         f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
         f"\u2013{MAX_PYTHON[0]}.{MAX_PYTHON[1] - 1}"
     )
 
+
+# `protein` covers every amino acid a force field writes, CYX and HIE among
+# them, from MDTraj's first import, whatever is imported first
+# (protein_names.py).
+from fastmdxplora.protein_names import recognise_from_the_first_import
+
+recognise_from_the_first_import()
+
+# Before anything imports the OpenFF toolkit, which decides once, on import,
+# whether AmberTools is there by looking on PATH: see own_programs.
+from fastmdxplora.own_programs import put_own_programs_on_path
+
+put_own_programs_on_path()
 
 from fastmdxplora.orchestrator import FastMDXplora
 
@@ -84,15 +115,21 @@ def __getattr__(name: str):
     raise AttributeError(name)
 
 
+from fastmdxplora.refusals import Refusal, StudyFailed, refusal_of
+
 __all__ = [
     "FastMDXplora",
     "AnalysisOrchestrator",
+    "Refusal",
+    "StudyFailed",
+    "refusal_of",
     "MIN_PYTHON",
     "MAX_PYTHON",
     "python_range_string",
     "__version__",
     "__author__",
     "__license__",
+    "__copyright__",
     "__expansion__",
     "__citation__",
     "__doi__",

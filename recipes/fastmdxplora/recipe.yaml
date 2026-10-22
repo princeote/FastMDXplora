@@ -1,0 +1,168 @@
+schema_version: 1
+
+# This is the reference copy. The package is built from the conda-forge
+# feedstock at https://github.com/conda-forge/fastmdxplora-feedstock, and the
+# two have to be kept level in both directions.
+#
+# Outward: a dependency added here has to reach the feedstock, and the
+# version-bump pull request the bot opens on release is where it goes. One
+# that reaches only this file gives a conda install that fails at the point of
+# use.
+#
+# Inward: the feedstock learns things this copy cannot -- what the conda-forge
+# solver does with a dependency, what its review asks for -- and those have to
+# come back. The import tests below and the disabled pip check were both
+# established there first, and a regeneration from a copy that had lost them
+# would reintroduce a build failure whose reason had been written down and
+# then discarded.
+
+context:
+  name: fastmdxplora
+  version: "2.6.0"
+
+package:
+  name: ${{ name|lower }}
+  version: ${{ version }}
+
+source:
+  url: https://pypi.org/packages/source/${{ name[0] }}/${{ name }}/${{ name }}-${{ version }}.tar.gz
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+
+build:
+  noarch: python
+  number: 0
+  script: ${{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
+  python:
+    entry_points:
+      - fastmdx = fastmdxplora.cli.main:main
+      - fastmdxplora = fastmdxplora.cli.main:main
+
+requirements:
+  host:
+    - python ${{ python_min }}.*
+    - pip
+    - setuptools >=77
+    - setuptools-scm >=8
+  run:
+    # Upper bound matches requires-python in pyproject.toml; the chemistry
+    # stack has no 3.14 builds yet either.
+    - python >=${{ python_min }},<3.14
+    - numpy >=2.0
+    - pyyaml >=6.0
+    - mdtraj >=1.9.7
+    - matplotlib-base >=3.5
+    - scipy >=1.7
+    - scikit-learn >=1.0
+    - pandas >=1.4
+    - python-pptx >=0.6.21
+    - pillow >=10.0
+    # The report as a page, in the GUI and as HTML: a dependency of the
+    # package, as in pyproject.toml.
+    - markdown >=3.4
+    # fastmdxplora accepts AMBER NetCDF trajectories. mdtraj can read them
+    # through scipy, but warns that this path is significantly slower and
+    # declares netcdf4 in its own metadata; conda-forge's mdtraj does not
+    # install it. Including it here gives the fast reader by default.
+    - netcdf4
+    # The setup and simulation phases need these, and they are only packaged
+    # for conda. Depending on them here is the point of the conda-forge
+    # distribution: one install command makes all four phases work, where the
+    # PyPI package covers analysis and reporting alone.
+    - openmm >=8.2
+    - pdbfixer
+    # Protein-ligand systems need small-molecule parameterization, and the
+    # chemistry a structure omits has to be read and its protonation settled
+    # in the complex. On PyPI these are the [ligand] extra; here they belong
+    # in the package, because one install command is the point.
+    - openff-toolkit >=0.16
+    # Every ligand takes AM1-BCC charges, and the toolkit computes them by
+    # calling AmberTools' sqm. openff-toolkit no longer brings AmberTools, so
+    # without this a ligand fails after its system has been solvated.
+    - ambertools
+    - openmmforcefields >=0.12
+    - rdkit >=2023.3
+    - propka >=3.5
+    # The report as a PDF, which is the form somebody sends on. On PyPI these
+    # are the [pdf] extra, because WeasyPrint there needs Pango and Cairo
+    # installed separately; the conda-forge package brings its own, so one
+    # install command gives the format without a system-library hunt.
+    - weasyprint >=60
+    # Enhanced sampling: metadynamics, umbrella sampling, steered MD. Not on
+    # PyPI at all, so this is the only distribution that can carry it, and a
+    # metadynamics run without it fails at the point of use.
+    - openmm-plumed >=1.0
+
+tests:
+  - python:
+      imports:
+        - fastmdxplora
+        - fastmdxplora.setup
+        - fastmdxplora.simulation
+        - fastmdxplora.analysis
+        - fastmdxplora.report
+        - fastmdxplora.gui
+        # If these fail the recipe has not delivered what it promises.
+        - openmm
+        - pdbfixer
+        # Declaring the small-molecule stack is not the same as it resolving.
+        # Importing it here means a broken solve fails the build rather than
+        # the first protein-ligand run a user attempts.
+        - openff.toolkit
+        - openmmforcefields
+        - rdkit
+        - propka
+      python_version:
+        - ${{ python_min }}.*
+        - "*"
+      # Disabled deliberately. AmberTools, a run dependency above, installs
+      # Python components (ndfes, edgembar, fetkutils) whose metadata
+      # declares numpy<2 while the environment provides numpy 2.x. Nothing
+      # in this package imports them, and pinning numpy<2 to satisfy
+      # metadata we do not use would be worse than not running the check.
+      # The import tests above already prove the stack resolves.
+      pip_check: false
+  - script:
+      - fastmdx --version
+      - fastmdx info
+      - fastmdxplora --version
+      # AmberTools has no module to import, and the toolkit loads without
+      # it, so the import tests cannot see it missing. This is what the
+      # toolkit asks before it will compute a ligand's AM1-BCC charges.
+      - python -c "from openff.toolkit.utils.toolkits import AmberToolsToolkitWrapper as T; assert T.is_available(), 'no AmberTools, so no ligand charges'"
+    requirements:
+      run:
+        - python ${{ python_min }}.*
+
+about:
+  homepage: https://github.com/aai-research-lab/FastMDXplora
+  summary: Software for Automated Molecular Dynamics Exploration
+  description: |
+    FastMDXplora runs a complete molecular dynamics study from a single
+    command. Given a protein structure, or just a PDB identifier, it performs
+    setup, simulation, analysis, and reporting, and returns publication-ready
+    results.
+
+    Setup repairs and solvates the structure. Simulation runs molecular
+    dynamics with OpenMM, including optional PLUMED enhanced sampling.
+    Analysis computes the standard structural and dynamic metrics, along with
+    protein-ligand measures when a ligand is present. Reporting packages the
+    results into a written report, a slide deck, and a shareable bundle. A
+    graphical interface is included for designing, starting, watching, and
+    reviewing a run.
+  # The package bundles the viewer build of Mol* (MIT; with React, rxjs and
+  # others, whose licences are MIT, Apache-2.0, ISC and 0BSD) for the
+  # molecular viewer in the graphical interface, and its fonts, Inter and
+  # JetBrains Mono (SIL OFL 1.1), so their licenses ship too.
+  license: MIT AND Apache-2.0 AND ISC AND 0BSD AND OFL-1.1
+  license_file:
+    - LICENSE
+    - src/fastmdxplora/gui/static/molstar/LICENSE
+    - src/fastmdxplora/gui/static/molstar/THIRD-PARTY-NOTICES.txt
+    - src/fastmdxplora/gui/static/fonts/OFL-Inter.txt
+    - src/fastmdxplora/gui/static/fonts/OFL-JetBrainsMono.txt
+  documentation: https://fastmdxplora.readthedocs.io/en/stable/
+  repository: https://github.com/aai-research-lab/FastMDXplora
+
+extra:
+  recipe-maintainers:
+    - ainaadekunle

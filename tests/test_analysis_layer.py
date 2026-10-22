@@ -511,3 +511,367 @@ def test_AnalysisOrchestrator_exposed_at_top_level():
     from fastmdxplora import AnalysisOrchestrator as AO
 
     assert AO is AnalysisOrchestrator
+
+
+class TestUnknownOptionsAreRefused:
+    """A setting the software did not apply must not look like one it did.
+
+    Every analysis ends its signature with ``**kwargs``, which the base class
+    stores in ``self.options`` and nothing reads. So a misspelled option was
+    accepted, ignored, and the run reported success: asking for
+    ``n_clusteres`` clustered at the default and said nothing about it.
+    """
+
+    def test_a_misspelled_option_stops_the_run(self, tmp_path) -> None:
+        import pytest
+        from fastmdxplora.analysis.orchestrator import AnalysisOrchestrator
+
+        with pytest.raises(ValueError, match="n_clusteres"):
+            AnalysisOrchestrator._reject_unknown_options(
+                "cluster", {"n_clusteres": 3})
+
+    def test_the_message_names_what_is_accepted(self) -> None:
+        import pytest
+        from fastmdxplora.analysis.orchestrator import AnalysisOrchestrator
+
+        with pytest.raises(ValueError, match="n_clusters"):
+            AnalysisOrchestrator._reject_unknown_options(
+                "cluster", {"n_clusteres": 3})
+
+    def test_a_real_option_passes(self) -> None:
+        from fastmdxplora.analysis.orchestrator import AnalysisOrchestrator
+
+        AnalysisOrchestrator._reject_unknown_options(
+            "cluster", {"n_clusters": 3, "linkage": "ward"})
+
+    def test_an_option_named_by_the_base_class_passes(self) -> None:
+        """selection and output_dir belong to every analysis."""
+        from fastmdxplora.analysis.orchestrator import AnalysisOrchestrator
+
+        AnalysisOrchestrator._reject_unknown_options(
+            "rmsd", {"ref": 0, "selection": "name CA", "title": "custom"})
+
+    def test_every_analysis_accepts_what_the_cli_can_send(self) -> None:
+        """The CLI builds option keys of its own; they must all be real.
+
+        --analyze-cluster-n-clusters becomes options['cluster']['n_clusters'],
+        and a rename that stopped matching would be silent again.
+        """
+        from fastmdxplora.analysis.orchestrator import AnalysisOrchestrator
+        from fastmdxplora.cli.main import _normalize_analysis_options
+
+        sent = _normalize_analysis_options({
+            "dimred_methods": ["pca"], "dimred_components": 2,
+            "cluster_methods": ["kmeans"], "cluster_n_clusters": 4,
+            "cluster_linkage": "ward",
+        })
+        for name, opts in sent["options"].items():
+            AnalysisOrchestrator._reject_unknown_options(name, opts)
+
+
+
+class TestAnalysesDescribeThemselves:
+    """What an analysis accepts is read from the analysis, not restated.
+
+    The constructor names its settings and gives their defaults; the docstring
+    says what each means and which values are allowed. Writing that out a
+    second time somewhere a form could read it would be one more thing to
+    update when an analysis gains an option -- and the copy that gets forgotten
+    is the one nobody is looking at.
+    """
+
+    def test_every_option_an_analysis_accepts_is_described(self) -> None:
+        """A setting nobody explained cannot be offered with a useful label."""
+        import fastmdxplora.analysis  # noqa: F401  (populates the registry)
+        from fastmdxplora.analysis.describe import undocumented_options
+
+        missing = undocumented_options()
+        assert not missing, (
+            "these settings are accepted but not explained in their own "
+            f"docstring, so nothing can label them: {missing}"
+        )
+
+    def test_the_description_matches_what_is_accepted(self) -> None:
+        """Describing an option the constructor rejects would be worse than
+        describing none: a form would offer a control that stops the run."""
+        import fastmdxplora.analysis  # noqa: F401
+        from fastmdxplora.analysis.describe import describe_all
+        from fastmdxplora.analysis.orchestrator import AnalysisOrchestrator
+
+        for name, options in describe_all().items():
+            AnalysisOrchestrator._reject_unknown_options(
+                name, {o.name: o.default for o in options}
+            )
+
+    def test_a_default_is_one_of_its_own_choices(self) -> None:
+        import fastmdxplora.analysis  # noqa: F401
+        from fastmdxplora.analysis.describe import describe_all
+
+        def offered(option) -> bool:
+            """Whether a default is among the values the option accepts.
+
+            An option taking several -- clustering's methods, the interaction
+            kinds -- has a default that is a set of them, and every member has
+            to be accepted rather than the tuple itself being a choice.
+            """
+            if isinstance(option.default, (list, tuple)):
+                return all(v in option.choices for v in option.default)
+            return option.default in option.choices
+
+        broken = [
+            f"{name}.{o.name}: {o.default!r} not in {o.choices}"
+            for name, options in describe_all().items()
+            for o in options
+            if o.choices and o.default is not None and not offered(o)
+        ]
+        assert not broken, broken
+
+    def test_choices_are_read_from_the_braced_part_only(self) -> None:
+        """The type line carries the default too, and it is quoted as well.
+
+        Reading the whole line offered 'average' twice for cluster linkage.
+        """
+        import fastmdxplora.analysis  # noqa: F401
+        from fastmdxplora.analysis.describe import describe_analysis
+
+        linkage = next(o for o in describe_analysis("cluster") if o.name == "linkage")
+        assert linkage.choices == ("ward", "complete", "average", "single")
+
+    def test_an_entry_naming_several_options_describes_each(self) -> None:
+        """The base class writes 'title, xlabel, ylabel : str' as one entry."""
+        import fastmdxplora.analysis  # noqa: F401
+        from fastmdxplora.analysis.describe import describe_analysis
+
+        described = {o.name: o.help for o in describe_analysis("rmsd")}
+        for shared in ("title", "xlabel", "ylabel"):
+            assert described[shared], f"{shared} was left unexplained"
+
+    def test_shared_settings_are_marked_as_the_base_class_s(self) -> None:
+        """So a form can group them apart from what makes an analysis itself."""
+        import fastmdxplora.analysis  # noqa: F401
+        from fastmdxplora.analysis.describe import describe_analysis
+
+        owners = {o.name: o.owner for o in describe_analysis("cluster")}
+        assert owners["n_clusters"] == "Cluster"
+        assert owners["figsize"] == "Analysis"
+
+
+class TestASettingThatDoesNothingIsNotOffered:
+    """Six analyses accepted a general atom selection and ignored it.
+
+    A protein-ligand measure works out both sides from the ligand's residue
+    name; dihedrals works from the backbone. Neither has anything to apply a
+    selection to, and the setting sat in the form looking like a control. A
+    measurement that looks restricted and is not is the same defect as a count
+    that looks complete and is not.
+    """
+
+    def test_an_analysis_says_whether_a_selection_applies(self) -> None:
+        import fastmdxplora.analysis  # noqa: F401
+        from fastmdxplora.analysis.orchestrator import get_analysis_class
+
+        assert get_analysis_class("rmsd").honours_selection
+        assert not get_analysis_class("pl_interactions").honours_selection
+        assert not get_analysis_class("dihedrals").honours_selection
+
+    def test_passing_one_where_it_does_nothing_is_refused(self) -> None:
+        import pytest
+
+        import fastmdxplora.analysis  # noqa: F401
+        from fastmdxplora.analysis.orchestrator import get_analysis_class
+
+        with pytest.raises(ValueError, match="would have no effect"):
+            get_analysis_class("pl_interactions")(
+                ligand_resname="LIG", selection="protein")
+
+    def test_the_orchestrator_stops_passing_it(self, tmp_path, monkeypatch) -> None:
+        """It sent the scope selection to every analysis, which was harmless
+        only because they ignored it -- which is why nobody noticed. Given a
+        selection, an analysis that honours it is handed it; one that works
+        out its own atoms is not."""
+        import mdtraj as md
+        import numpy as np
+
+        from fastmdxplora.analysis.orchestrator import AnalysisOrchestrator, get_analysis_class
+
+        topology = md.Topology()
+        chain = topology.add_chain()
+        for _ in range(4):
+            residue = topology.add_residue("ALA", chain)
+            for name, element in (("N", "nitrogen"), ("CA", "carbon"), ("C", "carbon"),
+                                  ("O", "oxygen")):
+                topology.add_atom(name, getattr(md.element, element), residue)
+        xyz = np.random.default_rng(0).normal(scale=0.4, size=(5, topology.n_atoms, 3))
+        md.Trajectory(xyz.astype(np.float32), topology).save_pdb(str(tmp_path / "t.pdb"))
+        md.Trajectory(xyz.astype(np.float32), topology).save_dcd(str(tmp_path / "t.dcd"))
+
+        handed = {}
+        for name in ("rmsd", "dihedrals"):
+            cls = get_analysis_class(name)
+            real = cls.__init__
+
+            def recording(self, *args, _name=name, _real=real, **kwargs):
+                handed[_name] = kwargs.get("selection")
+                _real(self, *args, **kwargs)
+
+            monkeypatch.setattr(cls, "__init__", recording)
+        AnalysisOrchestrator(trajectory=str(tmp_path / "t.dcd"), topology=str(tmp_path / "t.pdb"),
+                             output_dir=str(tmp_path / "analysis"),
+                             selection="name CA").run(include=["rmsd", "dihedrals"])
+        assert handed == {"rmsd": "name CA", "dihedrals": None}
+
+    def test_every_analysis_that_ignores_it_declares_so(self) -> None:
+        """Written as a property, because six were found by checking and the
+        seventh would be found the same way or not at all.
+
+        Read from the source on purpose. Showing it by behaviour would mean
+        running every analysis twice with two selections, most of them
+        needing a ligand, water or a biased run to have anything to say;
+        what is checked here is a declaration and its use agreeing, which
+        the text states directly."""
+        import inspect
+
+        import fastmdxplora.analysis  # noqa: F401
+        from fastmdxplora.analysis.orchestrator import (
+            available_analyses,
+            get_analysis_class,
+        )
+
+        undeclared = []
+        for name in available_analyses():
+            cls = get_analysis_class(name)
+            if cls.name != name:
+                continue
+            source = inspect.getsource(cls)
+            uses_it = "select_atoms" in source or "self.selection" in source
+            if not uses_it and cls.honours_selection:
+                undeclared.append(name)
+        assert not undeclared, (
+            f"these accept a selection and never use it: {undeclared}"
+        )
+
+    def test_and_the_form_does_not_offer_it(self) -> None:
+        from fastmdxplora.gui.schema_payload import schema_payload
+
+        payload = schema_payload()["analysis_options"]
+        if not payload["available"]:
+            import pytest
+
+            pytest.skip(payload["reason"])
+        for analysis in ("pl_interactions", "dihedrals", "pl_hbonds"):
+            names = {o["name"] for o in payload["analyses"][analysis]}
+            assert "selection" not in names, analysis
+        assert "selection" in {o["name"] for o in payload["analyses"]["rmsd"]}
+
+
+class TestTheManifestRecordsWhatTheRunLearned:
+    """Found by reading a real run's options.json: it held only what was set
+    before the analysis started.
+
+    The manifest was written before ``compute`` and never again, so everything
+    an analysis worked out about its own run -- how confidently it knew the
+    ligand's chemistry, which measurements it could not make and why, what
+    binding modes it found -- was thrown away. The interaction analysis exists
+    partly to record that its chemistry was resolved rather than guessed, and
+    that record was reaching nothing.
+    """
+
+    def test_the_manifest_is_written_after_compute(self, tmp_path) -> None:
+        # Written before compute, so an analysis that fails still leaves its
+        # settings behind, and again after, so what compute learned is kept.
+        import json
+
+        import mdtraj as md
+        import numpy as np
+        import pandas as pd
+
+        from fastmdxplora.analysis.base import Analysis
+
+        class Learns(Analysis):
+            name = "learns"
+            description = "records what it found"
+
+            def compute(self, traj):
+                self.findings["worked_out"] = 42
+                return pd.DataFrame({"frame": [0], "value": [1.0]})
+
+            def plot(self, result, ax):
+                ax.plot([0], [1])
+
+        class Fails(Learns):
+            name = "fails"
+
+            def compute(self, traj):
+                raise RuntimeError("compute failed")
+
+        topology = md.Topology()
+        topology.add_atom("CA", md.element.carbon, topology.add_residue("ALA", topology.add_chain()))
+        traj = md.Trajectory(np.zeros((1, 1, 3), dtype=np.float32), topology)
+        Learns(output_dir=str(tmp_path / "a")).run(traj)
+        failed = Fails(output_dir=str(tmp_path / "b")).run(traj)
+        learned = json.loads(next((tmp_path / "a").rglob("options.json")).read_text(encoding="utf-8"))
+        assert learned["findings"]["worked_out"] == 42
+        assert failed.status == "error"
+        assert next((tmp_path / "b").rglob("options.json")).is_file()
+
+    def test_what_compute_records_survives(self, tmp_path) -> None:
+        import json
+
+        import mdtraj as md
+        import numpy as np
+        import pandas as pd
+
+        from fastmdxplora.analysis.base import Analysis
+
+        class _Learns(Analysis):
+            name = "learns_something"
+            description = "records what it found"
+
+            def compute(self, traj):
+                self.options["found_during_compute"] = "a fact"
+                return pd.DataFrame({"frame": [0], "value": [1.0]})
+
+            def plot(self, result, ax):
+                ax.plot([0], [1])
+
+        top = md.Topology()
+        chain = top.add_chain()
+        residue = top.add_residue("ALA", chain, resSeq=1)
+        top.add_atom("CA", md.element.carbon, residue)
+        traj = md.Trajectory(
+            xyz=np.zeros((1, 1, 3), dtype=np.float32), topology=top)
+
+        _Learns(output_dir=str(tmp_path)).run(traj)
+        written = json.loads(
+            next(tmp_path.rglob("options.json")).read_text(encoding="utf-8"))
+        assert written["options"].get("found_during_compute") == "a fact"
+
+
+class TestTheRenamedAnalysisHasOneName:
+    """`contacts` was kept as an alias for `pl_contacts` so existing configs
+    would still run. Nobody has one: the software has not been released under
+    this name, and the alias meant the orchestrator ran the analysis twice --
+    once under each name, into the same directory.
+    """
+
+    def test_only_the_new_name_is_registered(self) -> None:
+        import fastmdxplora.analysis  # noqa: F401
+        from fastmdxplora.analysis.orchestrator import available_analyses
+
+        names = set(available_analyses())
+        assert "pl_contacts" in names
+        assert "contacts" not in names
+
+    def test_nothing_runs_twice(self) -> None:
+        """Every registered name maps to a distinct analysis, so a run of
+        everything runs each thing once."""
+        import fastmdxplora.analysis  # noqa: F401
+        from fastmdxplora.analysis.orchestrator import (
+            available_analyses,
+            get_analysis_class,
+        )
+
+        classes = [get_analysis_class(n) for n in available_analyses()]
+        assert len(classes) == len(set(classes)), (
+            "two names point at the same analysis, so it would run twice"
+        )

@@ -14,6 +14,10 @@ pip-wheel-metadata/
 
 # Versioning artifact from setuptools-scm
 src/fastmdxplora/_version.py
+
+# The demo study as scripts/make_demo.py packages it: published as a
+# download, never committed (fastmdxplora/demo)
+src/fastmdxplora/demo/3ptb/
 shim-package/src/fastmdx/_version.py
 
 # Test / coverage artifacts
@@ -50,6 +54,23 @@ site/
 
 # FastMDXplora run outputs (do not commit user data)
 fastmdxplora_output_*/
+.fastmdxplora-*
 local_pdbs/
 local_runs/
 private_reports/
+
+# The default output name is covered above, but --output takes any path and
+# the documented example is `runs/`. A trajectory is large, it is the user's
+# data, and `git add -A` during a run would commit a directory being written to.
+runs/
+run/
+
+# Release artifacts that live beside a working copy rather than in it.
+# A container image is 1.26 GB and GitHub refuses any file over 100 MB, so
+# `git add -A` in a directory where one has been downloaded produces a
+# commit that cannot be pushed and has to be unwound. Ignoring them here
+# costs nothing: they are attached to releases, not tracked in the tree.
+*.sif
+*.tgz
+*.tar.gz
+*.whl
